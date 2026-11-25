@@ -5,9 +5,10 @@
 | 步骤 | 内容 | 状态 | 文档 |
 |---|---|---|---|
 | 000 | 建立从零开发的仓库、设计基线及开发约定 | 已完成 | [000-bootstrap](000-bootstrap.md) |
-| 001A | 公共契约与运行时校验 | 源代码完成；依赖验证阻塞 | [001a-contracts](001a-contracts.md) |
-| 001A-R | 公共契约独立审核修订 | 源代码完成；依赖验证阻塞 | [001a-review](001a-review.md) |
-| 001B | 纯领域核心与确定性旅行原型 | Node smoke 通过；完整依赖测试阻塞 | [001b-domain](001b-domain.md) |
+| 001A | 公共契约与运行时校验 | 正式测试通过 | [001a-contracts](001a-contracts.md) |
+| 001A-R | 公共契约独立审核修订 | 正式测试通过 | [001a-review](001a-review.md) |
+| 001B | 纯领域核心与确定性旅行原型 | 正式测试及 Node smoke 通过 | [001b-domain](001b-domain.md) |
+| 001-V | 真实依赖锁文件及完整测试 | 完成 | [001-validation](001-validation.md) |
 | 002 | app-service 和持久化原型 | 待开发 | — |
 | 003 | 宿主、preload 与双 renderer 原型 | 待开发 | — |
 | 004 | 角色渲染及最小端到端闭环 | 待开发 | — |

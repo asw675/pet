@@ -15,7 +15,8 @@
     "#character-pack": "./src/character-pack.ts",
     "#gallery": "./src/gallery.ts",
     "#characters": "./src/characters.ts",
-    "#inventory": "./src/inventory.ts"
+    "#inventory": "./src/inventory.ts",
+    "#travel": "./src/travel.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",

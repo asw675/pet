@@ -4,18 +4,21 @@ import {
 } from '@pet-desktop/contracts';
 import type { CgAssetRef, DomainEvent } from '@pet-desktop/contracts';
 import type { EquipmentSlot } from '@pet-desktop/contracts/inventory';
+import { travelReportsQuerySchema } from '@pet-desktop/contracts/travel';
+import type { TripDepartureLoadout, TravelReportsQuery } from '@pet-desktop/contracts/travel';
+import { canonicalTripDepartureLoadout, validateTripDepartureLoadoutRecord } from '#trip-departure-storage';
 import { advanceTrip, MAX_TRIP_FACTS, MAX_TRIP_NODES } from '@pet-desktop/domain';
 import type { RewardDraft, TripCheckpoint, TripFact, TripSnapshot } from '@pet-desktop/domain';
 import type {
   AppRepository, AppTransaction, CgUnlock, CgUnlockInput, CommandOutcome, CommandReceipt, CommerceMaterialAmount, CommerceOperationRecord,
   InventoryItem, ItemInstanceRecord, OutboxRecord, PetEquipmentRecord,
-  HomeScheduleRecord, PetAcquisitionRecord, PetRecord, PreferencesRecord, RewardLine, SettlementRecord, SqliteConnection, TripCgAssetPin, TripRecord,
+  HomeScheduleRecord, PetAcquisitionRecord, PetRecord, PreferencesRecord, RewardLine, SettlementRecord, SqliteConnection, TripCgAssetPin, TripDepartureLoadoutRecord, TripRecord,
 } from './ports.js';
 
 const MAX_SAFE = Number.MAX_SAFE_INTEGER;
 const UINT32_MAX = 0xffff_ffff;
 const BUSY_TIMEOUT_MS = 5_000;
-const SCHEMA_VERSION = 5;
+const SCHEMA_VERSION = 6;
 const JSON_SCHEMA_VERSION = 1;
 const MIGRATION_001_JSON_SCHEMA_VERSION = 1;
 const MIGRATION_001_MAX_TRIP_FACTS = 14;
@@ -452,7 +455,7 @@ const migration005EffectsMatch = (operation: string) => `CASE ${operation}.opera
     AND i.retired=1 AND i.definition_version=${operation}.catalog_version AND i.enhancement=${operation}.from_enhancement)
     AND (SELECT count(*) FROM commerce_operation_materials m WHERE m.command_id=${operation}.command_id) BETWEEN 1 AND ${MIGRATION_005_MATERIAL_LIMIT}
   WHEN 'ITEM_USE' THEN 1 ELSE 0 END`;
-const MIGRATION_005 = `
+export const MIGRATION_005 = `
 CREATE TABLE item_instances (
   instance_id TEXT PRIMARY KEY NOT NULL CHECK (${idCheck('instance_id')}),
   definition_id TEXT NOT NULL CHECK (${idCheck('definition_id')}),
@@ -578,12 +581,158 @@ WHEN EXISTS (SELECT 1 FROM commerce_operations o WHERE o.command_id=OLD.command_
 BEGIN SELECT RAISE(ABORT, 'commerce receipt is immutable'); END;
 `;
 
+// A marked new trip has a deferred pointer back to its immutable loadout.
+// The loadout in turn references both the trip and its deferred command
+// receipt; COMMIT cannot leave any member of this authority chain missing.
+const MIGRATION_006_STAT_LIMIT = 1_000_000;
+const MIGRATION_006_SUPPLY_LIMIT = 8;
+const migration006StatsKeys = ['hp','atk','def','spd','luk'] as const;
+const migration006StatsColumns = (prefix: string, hpMin: number) => migration006StatsKeys.map(key =>
+  `${prefix}_${key} INTEGER CHECK (${prefix}_${key} BETWEEN ${key === 'hp' ? hpMin : 0} AND ${MIGRATION_006_STAT_LIMIT})`).join(',\n  ');
+const migration006StatsAllOrNone = (prefix: string) => `(${migration006StatsKeys.map(key => `${prefix}_${key} IS NULL`).join(' AND ')})
+  OR (${migration006StatsKeys.map(key => `${prefix}_${key} IS NOT NULL`).join(' AND ')})`;
+const migration006InitialDeparture = (trip: string) => `${trip}.departure_loadout_trip_id=${trip}.trip_id AND ${trip}.status='TRAVELING'
+  AND json_extract(${trip}.checkpoint_json,'$.phase')='OUTBOUND'
+  AND json_extract(${trip}.checkpoint_json,'$.sequence')=0 AND json_extract(${trip}.checkpoint_json,'$.logicalTime')=${trip}.start_at
+  AND NOT EXISTS (SELECT 1 FROM trip_events e WHERE e.trip_id=${trip}.trip_id)
+  AND NOT EXISTS (SELECT 1 FROM settlements s WHERE s.trip_id=${trip}.trip_id)`;
+const migration006GearMatches = (gear: string, trip: string) => `EXISTS (SELECT 1 FROM pet_equipment b JOIN item_instances i USING(instance_id)
+  WHERE b.pet_id=${trip}.pet_id AND b.slot=${gear}.slot AND i.instance_id=${gear}.instance_id AND i.retired=0
+    AND i.definition_id=${gear}.definition_id AND i.definition_version=${gear}.definition_version AND i.enhancement=${gear}.enhancement)`;
+const migration006ReceiptMatches = (receipt: string, loadout: string, trip: string) => `
+  ${migration006InitialDeparture(trip)} AND ${receipt}.created_at=${trip}.start_at
+  AND json_extract(${receipt}.fingerprint,'$.commandId')=${receipt}.command_id
+  AND json_extract(${receipt}.fingerprint,'$.payload.petId')=${trip}.pet_id
+  AND json_extract(${receipt}.fingerprint,'$.payload.routeId')=${trip}.route_id
+  AND json_type(${receipt}.outcome_json,'$.ok')='true'
+  AND json_type(${receipt}.outcome_json,'$.snapshot.revision')='integer'
+  AND EXISTS (SELECT 1 FROM preferences prefs WHERE prefs.singleton=1 AND prefs.logical_time=${receipt}.created_at
+    AND prefs.revision=json_extract(${receipt}.outcome_json,'$.snapshot.revision'))
+  AND (json_type(${receipt}.fingerprint,'$.expectedRevision') IS NULL OR
+    (json_type(${receipt}.fingerprint,'$.expectedRevision')='integer'
+      AND json_extract(${receipt}.outcome_json,'$.snapshot.revision')=json_extract(${receipt}.fingerprint,'$.expectedRevision')+1))
+  AND json_type(${receipt}.outcome_json,'$.snapshot.walletCoins')='integer'
+  AND EXISTS (SELECT 1 FROM wallet w WHERE w.currency='coin' AND w.balance=json_extract(${receipt}.outcome_json,'$.snapshot.walletCoins'))
+  AND EXISTS (SELECT 1 FROM pets p JOIN pet_states s USING(pet_id) WHERE p.pet_id=${trip}.pet_id AND s.presence='AWAY' AND s.activity IS NULL
+    AND s.energy10=${loadout}.energy_before10-${loadout}.energy_cost10
+    AND EXISTS (SELECT 1 FROM json_each(${receipt}.outcome_json,'$.snapshot.pets') entry
+      WHERE json_extract(entry.value,'$.petId')=p.pet_id AND json_extract(entry.value,'$.characterId')=p.character_id
+        AND json_extract(entry.value,'$.presence')='AWAY' AND json_extract(entry.value,'$.level')=${loadout}.level
+        AND json_extract(entry.value,'$.energy')=s.energy10/10.0
+        AND json_extract(entry.value,'$.trip.tripId')=${trip}.trip_id AND json_extract(entry.value,'$.trip.routeId')=${trip}.route_id
+        AND json_extract(entry.value,'$.trip.status')='TRAVELING'
+        AND json_extract(entry.value,'$.trip.expectedReturnAt')=${trip}.expected_return_at))
+  AND (SELECT count(*) FROM trip_departure_equipment g WHERE g.trip_id=${trip}.trip_id)
+    =(SELECT count(*) FROM pet_equipment e WHERE e.pet_id=${trip}.pet_id)
+  AND NOT EXISTS (SELECT 1 FROM trip_departure_equipment g WHERE g.trip_id=${trip}.trip_id AND NOT (${migration006GearMatches('g',trip)}))
+  AND CASE json_extract(${receipt}.fingerprint,'$.type')
+    WHEN 'TRIP_START_PREPARED' THEN json_type(${receipt}.fingerprint,'$.expectedRevision')='integer'
+      AND json_type(${receipt}.fingerprint,'$.payload.routeCatalogVersion')='integer'
+      AND json_extract(${receipt}.fingerprint,'$.payload.routeCatalogVersion')=${loadout}.route_catalog_version
+      AND json_type(${receipt}.fingerprint,'$.payload.selectedSupplies')='array'
+      AND json_array_length(${receipt}.fingerprint,'$.payload.selectedSupplies')=(SELECT count(*) FROM trip_departure_supplies c WHERE c.trip_id=${trip}.trip_id)
+      AND NOT EXISTS (SELECT 1 FROM trip_departure_supplies c WHERE c.trip_id=${trip}.trip_id
+        AND NOT EXISTS (SELECT 1 FROM json_each(${receipt}.fingerprint,'$.payload.selectedSupplies') selected
+          WHERE json_extract(selected.value,'$.itemId')=c.item_id AND json_extract(selected.value,'$.quantity')=c.quantity))
+    WHEN 'TRIP_START' THEN ${trip}.route_id='morning-dew-meadow'
+      AND NOT EXISTS (SELECT 1 FROM trip_departure_supplies c WHERE c.trip_id=${trip}.trip_id)
+    ELSE 0 END`;
+const MIGRATION_006 = `
+CREATE TABLE trip_departure_loadouts (
+  trip_id TEXT PRIMARY KEY NOT NULL REFERENCES trips(trip_id),
+  command_id TEXT NOT NULL UNIQUE CHECK (${idCheck('command_id')}),
+  route_catalog_version INTEGER NOT NULL CHECK (${positive('route_catalog_version')}),
+  item_catalog_version INTEGER NOT NULL CHECK (${positive('item_catalog_version')}),
+  level INTEGER NOT NULL CHECK (level BETWEEN 1 AND 20),
+  energy_cost10 INTEGER NOT NULL CHECK (energy_cost10 BETWEEN 1 AND 1000),
+  energy_before10 INTEGER NOT NULL CHECK (energy_before10 BETWEEN energy_cost10 AND 1000),
+  battle_power INTEGER NOT NULL CHECK (battle_power BETWEEN 1 AND 1000),
+  ${migration006StatsColumns('stats',1)},
+  FOREIGN KEY (command_id) REFERENCES commands(command_id) DEFERRABLE INITIALLY DEFERRED,
+  CHECK (${migration006StatsAllOrNone('stats')})
+) STRICT;
+ALTER TABLE trips ADD COLUMN departure_loadout_trip_id TEXT REFERENCES trip_departure_loadouts(trip_id)
+  DEFERRABLE INITIALLY DEFERRED CHECK (departure_loadout_trip_id IS NULL OR departure_loadout_trip_id=trip_id);
+CREATE INDEX settled_trip_history ON trips(actual_returned_at DESC,trip_id ASC) WHERE status='SETTLED';
+CREATE INDEX settled_pet_trip_history ON trips(pet_id,actual_returned_at DESC,trip_id ASC) WHERE status='SETTLED';
+CREATE TABLE trip_departure_supplies (
+  trip_id TEXT NOT NULL REFERENCES trip_departure_loadouts(trip_id),
+  item_id TEXT NOT NULL CHECK (${idCheck('item_id')}),
+  quantity INTEGER NOT NULL CHECK (quantity BETWEEN 1 AND 20),
+  PRIMARY KEY (trip_id,item_id)
+) STRICT;
+CREATE TABLE trip_departure_equipment (
+  trip_id TEXT NOT NULL REFERENCES trip_departure_loadouts(trip_id),
+  slot TEXT NOT NULL CHECK (slot IN ('WEAPON','ARMOR','ACCESSORY')),
+  instance_id TEXT NOT NULL REFERENCES item_instances(instance_id),
+  definition_id TEXT NOT NULL CHECK (${idCheck('definition_id')}),
+  definition_version INTEGER NOT NULL CHECK (${positive('definition_version')}),
+  enhancement INTEGER NOT NULL CHECK (enhancement BETWEEN 0 AND 5),
+  ${migration006StatsColumns('bonus',0)},
+  PRIMARY KEY (trip_id,slot), UNIQUE (trip_id,instance_id),
+  CHECK (${migration006StatsAllOrNone('bonus')})
+) STRICT;
+CREATE TRIGGER freeze_trip_departure_requirement BEFORE UPDATE ON trips
+WHEN OLD.departure_loadout_trip_id IS NOT NEW.departure_loadout_trip_id
+BEGIN SELECT RAISE(ABORT, 'trip departure loadout requirement is immutable'); END;
+CREATE TRIGGER prevent_marked_trip_replace BEFORE INSERT ON trips
+WHEN EXISTS (SELECT 1 FROM trips t WHERE t.trip_id=NEW.trip_id AND (t.departure_loadout_trip_id IS NOT NULL OR NEW.departure_loadout_trip_id IS NOT NULL))
+BEGIN SELECT RAISE(ABORT, 'marked departure trip cannot be replaced'); END;
+CREATE TRIGGER validate_new_departure_loadout BEFORE INSERT ON trip_departure_loadouts
+WHEN EXISTS (SELECT 1 FROM trip_departure_loadouts l WHERE l.trip_id=NEW.trip_id OR l.command_id=NEW.command_id)
+  OR EXISTS (SELECT 1 FROM commands c WHERE c.command_id=NEW.command_id)
+  OR NOT EXISTS (SELECT 1 FROM trips t JOIN pet_states s USING(pet_id) WHERE t.trip_id=NEW.trip_id
+    AND ${migration006InitialDeparture('t')}
+    AND json_extract(t.snapshot_json,'$.power')=NEW.battle_power AND s.presence='HOME' AND s.energy10=NEW.energy_before10)
+BEGIN SELECT RAISE(ABORT, 'loadout requires a new marked trip at departure'); END;
+CREATE TRIGGER freeze_departure_loadout BEFORE UPDATE ON trip_departure_loadouts
+BEGIN SELECT RAISE(ABORT, 'trip departure loadout is immutable'); END;
+CREATE TRIGGER preserve_departure_loadout BEFORE DELETE ON trip_departure_loadouts
+BEGIN SELECT RAISE(ABORT, 'trip departure loadout is immutable'); END;
+CREATE TRIGGER validate_departure_supply BEFORE INSERT ON trip_departure_supplies
+WHEN NOT EXISTS (SELECT 1 FROM trip_departure_loadouts l JOIN trips t USING(trip_id) JOIN pet_states s USING(pet_id)
+    WHERE l.trip_id=NEW.trip_id AND ${migration006InitialDeparture('t')} AND s.presence='HOME'
+      AND NOT EXISTS (SELECT 1 FROM commands c WHERE c.command_id=l.command_id))
+  OR EXISTS (SELECT 1 FROM trip_departure_supplies c WHERE c.trip_id=NEW.trip_id AND c.item_id=NEW.item_id)
+  OR (SELECT count(*) FROM trip_departure_supplies c WHERE c.trip_id=NEW.trip_id)>=${MIGRATION_006_SUPPLY_LIMIT}
+BEGIN SELECT RAISE(ABORT, 'invalid or immutable departure supply'); END;
+CREATE TRIGGER freeze_departure_supply BEFORE UPDATE ON trip_departure_supplies
+BEGIN SELECT RAISE(ABORT, 'departure supply is immutable'); END;
+CREATE TRIGGER preserve_departure_supply BEFORE DELETE ON trip_departure_supplies
+BEGIN SELECT RAISE(ABORT, 'departure supply is immutable'); END;
+CREATE TRIGGER validate_departure_equipment BEFORE INSERT ON trip_departure_equipment
+WHEN NOT EXISTS (SELECT 1 FROM trip_departure_loadouts l JOIN trips t USING(trip_id) JOIN pet_states s USING(pet_id)
+    WHERE l.trip_id=NEW.trip_id AND ${migration006InitialDeparture('t')} AND s.presence='HOME'
+      AND NOT EXISTS (SELECT 1 FROM commands c WHERE c.command_id=l.command_id) AND ${migration006GearMatches('NEW','t')})
+  OR EXISTS (SELECT 1 FROM trip_departure_equipment g WHERE g.trip_id=NEW.trip_id AND (g.slot=NEW.slot OR g.instance_id=NEW.instance_id))
+BEGIN SELECT RAISE(ABORT, 'invalid or immutable departure equipment'); END;
+CREATE TRIGGER freeze_departure_equipment BEFORE UPDATE ON trip_departure_equipment
+BEGIN SELECT RAISE(ABORT, 'departure equipment is immutable'); END;
+CREATE TRIGGER preserve_departure_equipment BEFORE DELETE ON trip_departure_equipment
+BEGIN SELECT RAISE(ABORT, 'departure equipment is immutable'); END;
+CREATE TRIGGER validate_successful_departure_receipt BEFORE INSERT ON commands
+WHEN (EXISTS (SELECT 1 FROM trip_departure_loadouts l WHERE l.command_id=NEW.command_id)
+  OR (json_extract(NEW.fingerprint,'$.type') IN ('TRIP_START','TRIP_START_PREPARED') AND json_type(NEW.outcome_json,'$.ok')='true'))
+  AND (EXISTS (SELECT 1 FROM commands c WHERE c.command_id=NEW.command_id)
+    OR NOT EXISTS (SELECT 1 FROM trip_departure_loadouts l JOIN trips t USING(trip_id) WHERE l.command_id=NEW.command_id
+      AND ${migration006ReceiptMatches('NEW','l','t')}))
+BEGIN SELECT RAISE(ABORT, 'trip departure requires exact immutable successful loadout and receipt'); END;
+CREATE TRIGGER freeze_departure_receipt BEFORE UPDATE ON commands
+WHEN EXISTS (SELECT 1 FROM trip_departure_loadouts l WHERE l.command_id=OLD.command_id)
+  OR (json_extract(NEW.fingerprint,'$.type') IN ('TRIP_START','TRIP_START_PREPARED') AND json_type(NEW.outcome_json,'$.ok')='true')
+BEGIN SELECT RAISE(ABORT, 'trip departure receipt is immutable'); END;
+CREATE TRIGGER preserve_departure_receipt BEFORE DELETE ON commands
+WHEN EXISTS (SELECT 1 FROM trip_departure_loadouts l WHERE l.command_id=OLD.command_id)
+BEGIN SELECT RAISE(ABORT, 'trip departure receipt is immutable'); END;
+`;
+
 const MIGRATIONS = Object.freeze([
   { version: 1, sql: MIGRATION_001 },
   { version: 2, sql: MIGRATION_002 },
   { version: 3, sql: MIGRATION_003 },
   { version: 4, sql: MIGRATION_004 },
   { version: 5, sql: MIGRATION_005 },
+  { version: 6, sql: MIGRATION_006 },
 ]);
 
 /** FNV-1a is a migration-change detector, not a security signature. */
@@ -1047,6 +1196,20 @@ function tripFromRow(value: unknown): TripRecord {
   return trip;
 }
 
+function departureStatsFromRow(row: ObjectMap, prefix: 'stats' | 'bonus') {
+  const keys = ['hp','atk','def','spd','luk'] as const;
+  const values = keys.map(key => row[`${prefix}_${key}`]);
+  if (values.every(value => value === null)) return null;
+  if (values.some(value => value === null)) throw new Error('Persisted departure stats are partially absent');
+  return { hp: integer(values[0], `${prefix} HP`, prefix === 'stats' ? 1 : 0, MIGRATION_006_STAT_LIMIT),
+    atk: integer(values[1], `${prefix} ATK`, 0, MIGRATION_006_STAT_LIMIT), def: integer(values[2], `${prefix} DEF`, 0, MIGRATION_006_STAT_LIMIT),
+    spd: integer(values[3], `${prefix} SPD`, 0, MIGRATION_006_STAT_LIMIT), luk: integer(values[4], `${prefix} LUK`, 0, MIGRATION_006_STAT_LIMIT) };
+}
+
+function departureStatsParams(stats: TripDepartureLoadout['stats']): [number|null,number|null,number|null,number|null,number|null] {
+  return stats === null ? [null,null,null,null,null] : [stats.hp,stats.atk,stats.def,stats.spd,stats.luk];
+}
+
 function factFromRow(value: unknown): TripFact {
   const row = object(value, 'trip fact row'); jsonVersion(row);
   return validateFact({ eventId: row.event_id, tripId: row.trip_id, petId: row.pet_id,
@@ -1254,20 +1417,76 @@ class SQLiteTransaction implements AppTransaction {
     return this.db.prepare(`${TRIP_SELECT} ORDER BY t.start_at, t.pet_id, t.trip_id`).all().map(tripFromRow);
   }
 
+  listSettledTrips(rawQuery: TravelReportsQuery): { total: number; trips: TripRecord[] } {
+    const query = travelReportsQuerySchema.parse(rawQuery), db = this.db;
+    const parameters = query.petId === undefined ? [] : [query.petId];
+    const filter = query.petId === undefined ? "t.status='SETTLED'" : "t.status='SETTLED' AND t.pet_id=?";
+    const total = integer(object(db.prepare(`SELECT count(*) AS count FROM trips t WHERE ${filter}`).get(...parameters),
+      'settled trip count').count, 'settled trip count');
+    const trips = db.prepare(`${TRIP_SELECT} WHERE ${filter} ORDER BY t.actual_returned_at DESC,t.trip_id ASC LIMIT ? OFFSET ?`)
+      .all(...parameters,query.limit,query.offset).map(tripFromRow);
+    return { total,trips };
+  }
+
   getTrip(tripId: string): TripRecord | null {
     const value = this.db.prepare(`${TRIP_SELECT} WHERE t.trip_id = ?`).get(id(tripId));
     return value === undefined || value === null ? null : tripFromRow(value);
   }
 
-  insertTrip(record: TripRecord): void {
+  insertTrip(record: TripRecord, departureLoadoutRequired = false): void {
     const db = this.db;
     const { snapshot: s, checkpoint: c, status } = validateTrip(record);
     if (status !== 'TRAVELING' || c.phase !== 'OUTBOUND' || c.sequence !== 0) throw new Error('New trip must begin outbound');
+    const marker = boolean(departureLoadoutRequired, 'departure loadout required') ? s.tripId : null;
     db.prepare(`INSERT INTO trips (trip_id, pet_id, route_id, status, seed, snapshot_json, checkpoint_json,
-      json_schema_version, start_at, expected_return_at, actual_returned_at, next_due_at, rules_version, cg_pin_schema)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 2)`)
+      json_schema_version, start_at, expected_return_at, actual_returned_at, next_due_at, rules_version, cg_pin_schema, departure_loadout_trip_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 2, ?)`)
       .run(s.tripId, s.petId, s.routeId, status, s.seed, canonicalJson(s), canonicalJson(c), JSON_SCHEMA_VERSION,
-        s.startAt, s.expectedReturnAt, c.actualReturnedAt, c.nextDueAt, s.rulesVersion);
+        s.startAt, s.expectedReturnAt, c.actualReturnedAt, c.nextDueAt, s.rulesVersion,marker);
+  }
+
+  insertTripDepartureLoadout(value: TripDepartureLoadoutRecord): void {
+    const db = this.db, record = validateTripDepartureLoadoutRecord(value), loadout = record.loadout;
+    const trip = this.getTrip(record.tripId);
+    if (trip === null || loadout.battlePower !== trip.snapshot.power) throw new Error('Departure loadout contradicts its trip power');
+    const pet = this.getPet(trip.snapshot.petId);
+    if (pet === null || pet.presence !== 'HOME' || pet.energy10 < loadout.energyCost10) throw new Error('Departure loadout requires current HOME pet energy');
+    db.prepare(`INSERT INTO trip_departure_loadouts (trip_id,command_id,route_catalog_version,item_catalog_version,level,
+      energy_cost10,energy_before10,battle_power,stats_hp,stats_atk,stats_def,stats_spd,stats_luk) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+      .run(record.tripId,record.commandId,loadout.routeCatalogVersion,loadout.itemCatalogVersion,loadout.level,loadout.energyCost10,
+        pet.energy10,loadout.battlePower,...departureStatsParams(loadout.stats));
+    for (const supply of loadout.supplies) db.prepare('INSERT INTO trip_departure_supplies VALUES (?,?,?)')
+      .run(record.tripId,supply.itemId,supply.quantity);
+    for (const gear of loadout.equipment) db.prepare(`INSERT INTO trip_departure_equipment (trip_id,slot,instance_id,definition_id,
+      definition_version,enhancement,bonus_hp,bonus_atk,bonus_def,bonus_spd,bonus_luk) VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
+      .run(record.tripId,gear.slot,gear.instanceId,gear.definitionId,gear.definitionVersion,gear.enhancement,...departureStatsParams(gear.bonus));
+  }
+
+  getTripDepartureLoadout(tripId: string): TripDepartureLoadout | null {
+    const db = this.db, key = id(tripId), value = db.prepare(`SELECT l.*,t.departure_loadout_trip_id AS required_trip_id,
+      json_extract(t.snapshot_json,'$.power') AS trip_power FROM trip_departure_loadouts l JOIN trips t USING(trip_id) WHERE trip_id=?`).get(key);
+    if (value === undefined || value === null) return null;
+    const row = object(value,'trip departure loadout row');
+    const battlePower = integer(row.battle_power,'departure battle power',1,1000);
+    const energyCost10 = integer(row.energy_cost10,'departure energy cost',1,1000);
+    integer(row.energy_before10,'departure pre-cost energy',energyCost10,1000);
+    id(row.command_id);
+    if (row.required_trip_id !== key || battlePower !== integer(row.trip_power,'trip snapshot departure power',1,1000)) {
+      throw new Error('Persisted departure loadout contradicts its trip identity or power');
+    }
+    const supplies = db.prepare('SELECT item_id,quantity FROM trip_departure_supplies WHERE trip_id=? ORDER BY item_id').all(key).map(raw => {
+      const supply = object(raw,'departure supply row');
+      return { itemId:id(supply.item_id),quantity:integer(supply.quantity,'departure supply quantity',1,20) };
+    });
+    const equipment = db.prepare('SELECT * FROM trip_departure_equipment WHERE trip_id=? ORDER BY slot').all(key).map(raw => {
+      const gear = object(raw,'departure equipment row');
+      return { slot:equipmentSlot(gear.slot),instanceId:id(gear.instance_id),definitionId:id(gear.definition_id),
+        definitionVersion:integer(gear.definition_version,'departure equipment version',1),enhancement:integer(gear.enhancement,'departure enhancement',0,5),
+        bonus:departureStatsFromRow(gear,'bonus') };
+    });
+    return canonicalTripDepartureLoadout({ routeCatalogVersion:integer(row.route_catalog_version,'departure route catalog version',1),
+      itemCatalogVersion:integer(row.item_catalog_version,'departure item catalog version',1),level:integer(row.level,'departure level',1,20),
+      energyCost10,supplies,stats:departureStatsFromRow(row,'stats'),battlePower,equipment });
   }
 
   updateTrip(record: TripRecord): void {
@@ -1784,6 +2003,7 @@ function migrate(db: SqliteConnection, persistent: boolean, beforeMigration?: (f
         rewards: rowCount(db, 'SELECT count(*) AS count FROM reward_ledger'),
         receipts: rowCount(db, 'SELECT count(*) AS count FROM commands'),
       } : null;
+      const oldDepartureTripCount = migration.version === 6 ? rowCount(db,'SELECT count(*) AS count FROM trips') : null;
       db.exec(migration.sql);
       if (oldCounts !== null && (oldCounts.trips !== rowCount(db, 'SELECT count(*) AS count FROM trips')
         || oldCounts.unlocks !== rowCount(db, 'SELECT count(*) AS count FROM cg_unlocks')
@@ -1805,6 +2025,12 @@ function migrate(db: SqliteConnection, persistent: boolean, beforeMigration?: (f
         || ['item_instances','pet_equipment','commerce_operations','commerce_operation_materials','commerce_operation_instances']
           .some(table => rowCount(db,`SELECT count(*) AS count FROM ${table}`) !== 0))) {
         throw new Error('Commerce migration changed old stacks or reward history or invented instances and operations');
+      }
+      if (oldDepartureTripCount !== null && (oldDepartureTripCount !== rowCount(db,'SELECT count(*) AS count FROM trips')
+        || oldDepartureTripCount !== rowCount(db,'SELECT count(*) AS count FROM trips WHERE departure_loadout_trip_id IS NULL')
+        || ['trip_departure_loadouts','trip_departure_supplies','trip_departure_equipment']
+          .some(table => rowCount(db,`SELECT count(*) AS count FROM ${table}`) !== 0))) {
+        throw new Error('Departure migration changed legacy trips or invented frozen loadouts');
       }
       db.prepare('INSERT INTO schema_migrations (version, checksum, applied_at) VALUES (?, ?, ?)')
         .run(migration.version, migrationChecksum(migration.sql), Date.now());

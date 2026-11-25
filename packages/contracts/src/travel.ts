@@ -43,6 +43,7 @@ const reason = z.discriminatedUnion('code', [
   z.strictObject({ code: z.literal('ROUTE_NOT_FOUND'), routeId: id }),
   z.strictObject({ code: z.literal('PET_NOT_HOME'), presence }),
   z.strictObject({ code: z.literal('ACTIVE_TRIP') }),
+  z.strictObject({ code: z.literal('PET_BUSY'), activity: z.enum(['CHAT', 'DRAG']) }),
   z.strictObject({ code: z.literal('PET_UNHEALTHY'), healthStatus: health, healthPoints10: score10 }),
   z.strictObject({ code: z.literal('LEVEL_TOO_LOW'), requiredLevel: level, level }),
   z.strictObject({ code: z.literal('ENERGY_TOO_LOW'), required10: score10, available10: score10 }),

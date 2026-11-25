@@ -10,6 +10,8 @@ import { findBuiltinCg } from '@pet-desktop/domain/cg-catalog';
 import { CHARACTER_CATALOG_VERSION } from '@pet-desktop/domain/character-catalog';
 import { HOME_RULES, advanceHomeState } from '@pet-desktop/domain/home-simulation';
 import { ITEM_CATALOG_VERSION } from '@pet-desktop/domain/item-catalog';
+import { ROUTE_CATALOG_VERSION } from '@pet-desktop/domain/route-catalog';
+import { cumulativeXpAtLevel } from '@pet-desktop/domain/progression';
 
 const initialTime = 1_800_000_000_000;
 const minutes = (n) => n * 60_000;
@@ -91,6 +93,27 @@ function readInventory(service, legacyOffset) {
   expect(result.ok).toBe(true);
   expect(result.inventory.revision).toBe(result.snapshot.revision);
   expect(result.inventory.walletCoins).toBe(result.snapshot.walletCoins);
+  return result;
+}
+
+function readTravelCatalog(service) {
+  const result = service.handleRequest({ schemaVersion: 1, requestId: 'travel-catalog-query', method: 'travel/catalog', payload: {} });
+  expect(result.ok).toBe(true);
+  expect(result.travelCatalog.revision).toBe(result.snapshot.revision);
+  return result;
+}
+
+function readTravelPreview(service, payload) {
+  const result = service.handleRequest({ schemaVersion: 1, requestId: 'travel-preview-query', method: 'travel/preview', payload });
+  expect(result.ok).toBe(true);
+  expect(result.travelPreview.revision).toBe(result.snapshot.revision);
+  return result;
+}
+
+function readTravelReports(service, payload = { offset: 0, limit: 20 }) {
+  const result = service.handleRequest({ schemaVersion: 1, requestId: 'travel-reports-query', method: 'travel/reports', payload });
+  expect(result.ok).toBe(true);
+  expect(result.travelReports.revision).toBe(result.snapshot.revision);
   return result;
 }
 
@@ -350,7 +373,7 @@ describe.skipIf(!supported)('application service + real SQLite persisted integra
     const second = expectSuccess(f.request(instance.service, f.command('TRIP_START', { petId, routeId: DEMO_ROUTE.routeId })));
     const secondTripId = second.pets.find((pet) => pet.petId === petId).trip.tripId;
     f.advance(initialTime + minutes(32));
-    const collectedAgain = readGallery(instance.service, { petId });
+    const collectedAgain = readGallery(instance.service, { petId, filter: 'UNLOCKED' });
     expect(collectedAgain.gallery.rows).toHaveLength(1);
     expect(collectedAgain.gallery.rows[0]).toEqual(afterRestart.gallery.rows[0]);
     expect(instance.repo.transaction((tx) => tx.listRewards(secondTripId).filter((line) => line.kind === 'CG'))).toHaveLength(1);
@@ -393,11 +416,14 @@ describe.skipIf(!supported)('application service + real SQLite persisted integra
     expect(instance.repo.transaction((tx) => tx.getPetAcquisition(petId))).toBeNull();
     expect(readCharacters(instance.service).characters.rows.find(row => row.characterId === 'star-singer')?.instances)
       .toEqual([{ petId, nickname: '星咏', origin: 'LEGACY', acquiredAt: null }]);
-    const settled = readGallery(instance.service, { petId });
+    const settled = readGallery(instance.service, { petId, filter: 'UNLOCKED' });
     expect(settled.snapshot.walletCoins).toBe(8);
     expect(settled.gallery.rows).toHaveLength(1);
     expect(settled.gallery.rows[0]).toMatchObject({ petId, cgId: 'morning-dew', variant: 'default', title: '历史纪念画面',
       sourceTripId: tripId, unlockStatus: 'UNLOCKED', assetRef: { state: 'LEGACY_UNVERSIONED' }, viewedAt: null });
+    const legacyReport = readTravelReports(instance.service, { petId, offset: 0, limit: 20 }).travelReports.rows[0];
+    expect(legacyReport).toMatchObject({ tripId, loadout: null, departurePower: snapshot.power, actualReturnedAt: snapshot.expectedReturnAt });
+    expect(instance.repo.transaction(tx => tx.getTripDepartureLoadout(tripId))).toBeNull();
     const keys = { petId, cgId: 'morning-dew', variant: 'default' };
     expectSuccess(f.request(instance.service, f.command('CG_SET_FAVORITE', { ...keys, favorite: true })));
     const entry = findBuiltinCg('star-singer', 'morning-dew');
@@ -655,7 +681,7 @@ describe.skipIf(!supported)('persisted HOME recovery and bounded interactions', 
     instance.close();
     const upgraded = new DatabaseSync(f.dbPath, { readOnly: true });
     try {
-      expect(upgraded.prepare('PRAGMA user_version').get().user_version).toBe(5);
+      expect(upgraded.prepare('PRAGMA user_version').get().user_version).toBe(6);
       expect(upgraded.prepare('SELECT fingerprint,outcome_json,created_at FROM commands WHERE command_id=?').get(oldCommand.commandId))
         .toEqual({ fingerprint, outcome_json: outcome, created_at: initialTime });
       expect(upgraded.prepare('SELECT acquired_at FROM pet_acquisitions WHERE pet_id=?').get(petId).acquired_at)
@@ -895,6 +921,154 @@ describe.skipIf(!supported)('shared equipment economy in actual SQLite', () => {
     expect(afterPurchases.stacks.find(row => row.itemId === 'healing-potion')).toEqual({ itemId: 'healing-potion', quantity: 1, definitionState: 'AVAILABLE' });
     expect(afterPurchases.legacyStackTotal).toBe(261);
     expect(instance.repo.transaction(tx => tx.listInventory().length)).toBe(265); // all 261 + four compatible stacks, no truncation
+    instance.close();
+  });
+});
+
+describe.skipIf(!supported)('prepared travel and historical reports in actual SQLite', () => {
+  const version = ROUTE_CATALOG_VERSION;
+  const payload = (petId, routeId, selectedSupplies = []) => ({ petId, routeId, routeCatalogVersion: version, selectedSupplies });
+
+  it('prepares and settles all three versioned routes, charges exact supplies, rolls back failures, and freezes complete equipment after it changes away', () => {
+    const f = fixture();
+    let failDeparture = false;
+    let instance = f.open(repo => ({
+      close: () => repo.close(),
+      transaction: action => repo.transaction(tx => action(new Proxy(tx, {
+        get(target,key) {
+          if (key === 'appendOutbox' && failDeparture) return event => {
+            if (event.type === 'TripStarted') throw new Error('injected prepared departure failure');
+            return target.appendOutbox(event);
+          };
+          const value = Reflect.get(target,key);
+          return typeof value === 'function' ? value.bind(target) : value;
+        },
+      }))),
+    }));
+    const petId = 'pet-1';
+    const catalog = readTravelCatalog(instance.service).travelCatalog;
+    expect(catalog.routes.map(route => route.routeId)).toEqual([DEMO_ROUTE.routeId,'mist-forest','starfall-ruins']);
+    expect(catalog.supplyStock).toEqual([{ itemId:'healing-potion', quantity:0 },{ itemId:'ration',quantity:0 }]);
+    const depart = (intent,id) => {
+      const quote = readTravelPreview(instance.service,intent);
+      expect(quote.travelPreview.eligible).toBe(true);
+      const raw = f.command('TRIP_START_PREPARED',intent,id,quote.snapshot.revision);
+      return { raw, snapshot:expectSuccess(f.request(instance.service,raw)) };
+    };
+    const commerce = (type,body,id) => f.command(type,{...body,catalogVersion:ITEM_CATALOG_VERSION},id,instance.service.getSnapshot().revision);
+    const buy = (offerId,quantity,id) => expectSuccess(f.request(instance.service,commerce('SHOP_PURCHASE',{offerId,quantity},id)));
+
+    const early = readTravelPreview(instance.service,payload(petId,'mist-forest'));
+    expect(early.travelPreview.reasons.map(reason=>reason.code)).toEqual(expect.arrayContaining(['LEVEL_TOO_LOW','MISSING_REQUIRED_SUPPLY','SUPPLY_OUT_OF_STOCK']));
+    expect(f.request(instance.service,f.command('TRIP_START_PREPARED',payload(petId,'mist-forest'),'blocked-forest',early.snapshot.revision)))
+      .toMatchObject({ok:false,error:{code:'BUSINESS_RULE'}});
+    const first = depart(payload(petId,DEMO_ROUTE.routeId),'prepared-meadow');
+    const firstId = first.snapshot.pets[0].trip.tripId;
+    expect(first.snapshot.pets[0].energy).toBe(85);
+    const meadowLoadout = instance.repo.transaction(tx=>tx.getTripDepartureLoadout(firstId));
+    expect(meadowLoadout).toMatchObject({ energyCost10:150, level:1, battlePower:30, supplies:[], equipment:[] });
+    f.advance(initialTime + minutes(15));
+    const meadowReport = readTravelReports(instance.service).travelReports.rows[0];
+    expect(meadowReport).toMatchObject({tripId:firstId,loadout:meadowLoadout,actualReturnedAt:initialTime+minutes(15)});
+    expect(instance.service.getSnapshot().walletCoins).toBe(8);
+    buy('shop-ration',1,'forest-ration');
+    // Synthetic high-level fixtures avoid replaying dozens of identical low-
+    // level trips just to exercise later entry gates. Actual trip/economy
+    // state changes below all go through the production service and SQLite.
+    instance.repo.transaction(tx=>tx.savePet({...tx.getPet(petId),xp:cumulativeXpAtLevel(4)}));
+    const forestIntent = payload(petId,'mist-forest',[{itemId:'ration',quantity:1}]);
+    const forestPreview = readTravelPreview(instance.service,forestIntent);
+    expect(forestPreview.travelPreview).toMatchObject({eligible:true,energyCost10:300,durationMs:minutes(60),supplyConsumption:[{itemId:'ration',quantity:1}]});
+    const forestCommand = f.command('TRIP_START_PREPARED',forestIntent,'prepared-forest',forestPreview.snapshot.revision);
+    const durable = () => instance.repo.transaction(tx=>({pet:tx.getPet(petId),home:tx.getHomeSchedule(petId),trips:tx.listTrips(),
+      supplies:tx.listInventory(),preferences:tx.getPreferences(),receipt:tx.getCommandReceipt(forestCommand.commandId),outbox:tx.listOutbox(0,100)}));
+    const before = durable();
+    failDeparture = true;
+    expect(f.request(instance.service,forestCommand)).toMatchObject({ok:false,error:{code:'INTERNAL_ERROR'}});
+    expect(durable()).toEqual(before);
+    failDeparture = false;
+    const forest = expectSuccess(f.request(instance.service,forestCommand));
+    const forestId = forest.pets[0].trip.tripId;
+    expect(forest.pets[0]).toMatchObject({presence:'AWAY',energy:55,trip:{routeId:'mist-forest',expectedReturnAt:initialTime+minutes(75)}});
+    expect(instance.repo.transaction(tx=>tx.listInventory().find(row=>row.itemId==='ration').quantity)).toBe(0);
+    const forestLoadout = instance.repo.transaction(tx=>tx.getTripDepartureLoadout(forestId));
+    expect(forestLoadout).toMatchObject({energyCost10:300,level:4,supplies:[{itemId:'ration',quantity:1}]});
+    expect(expectSuccess(f.request(instance.service,forestCommand))).toEqual(forest);
+    expect(readTravelReports(instance.service).travelReports.total).toBe(1); // active forest excluded
+    f.advance(initialTime + minutes(75));
+    const forestReport = readTravelReports(instance.service).travelReports.rows[0];
+    expect(forestReport).toMatchObject({tripId:forestId,loadout:forestLoadout,routeId:'mist-forest'});
+    expect(forestReport.facts.at(-1).type).toBe('TRIP_RETURNED');
+
+    // Rest naturally before the energy-50 route and set its fixture level.
+    const ruinsStartAt = initialTime + minutes(255);
+    f.advance(ruinsStartAt);
+    instance.service.getSnapshot();
+    instance.repo.transaction(tx=>tx.savePet({...tx.getPet(petId),xp:cumulativeXpAtLevel(10)}));
+    expect(instance.service.getSnapshot().pets[0].energy).toBe(100);
+    buy('shop-ration',2,'ruins-rations');
+    buy('shop-healing-potion',1,'ruins-medicine');
+    buy('shop-apprentice-staff',1,'ruins-staff');
+    const staff = instance.repo.transaction(tx=>tx.getCommerceOperation('ruins-staff').instanceIds[0]);
+    expectSuccess(f.request(instance.service,commerce('EQUIPMENT_EQUIP',{petId,slot:'WEAPON',instanceId:staff},'equip-ruins-staff')));
+    const beforeRuins = readInventory(instance.service).inventory.pets[0];
+    const ruins = depart(payload(petId,'starfall-ruins',[{itemId:'ration',quantity:2},{itemId:'healing-potion',quantity:1}]),'prepared-ruins');
+    const ruinsId = ruins.snapshot.pets[0].trip.tripId;
+    expect(ruins.snapshot.pets[0]).toMatchObject({presence:'AWAY',energy:50,trip:{routeId:'starfall-ruins',expectedReturnAt:ruinsStartAt+minutes(240)}});
+    const frozen = instance.repo.transaction(tx=>({trip:tx.getTrip(ruinsId).snapshot,loadout:tx.getTripDepartureLoadout(ruinsId)}));
+    expect(frozen.loadout).toMatchObject({level:10,battlePower:beforeRuins.battlePower,stats:beforeRuins.stats,energyCost10:500,
+      supplies:[{itemId:'healing-potion',quantity:1},{itemId:'ration',quantity:2}],
+      equipment:[{slot:'WEAPON',instanceId:staff,definitionId:'apprentice-staff',definitionVersion:1,enhancement:0,bonus:{atk:4}}]});
+    expect(frozen.trip.power).toBe(frozen.loadout.battlePower);
+    expect(instance.repo.transaction(tx=>tx.listInventory().filter(row=>row.itemId==='ration'||row.itemId==='healing-potion')))
+      .toEqual([{itemId:'healing-potion',quantity:0},{itemId:'ration',quantity:0}]);
+    const busy = readTravelPreview(instance.service,payload(petId,'starfall-ruins',[{itemId:'ration',quantity:2},{itemId:'healing-potion',quantity:1}]));
+    expect(busy.travelPreview.eligible).toBe(false);
+    expect(busy.travelPreview.reasons.map(reason=>reason.code)).toEqual(expect.arrayContaining(['PET_NOT_HOME','ACTIVE_TRIP','SUPPLY_OUT_OF_STOCK']));
+    expectSuccess(f.request(instance.service,commerce('EQUIPMENT_UNEQUIP',{petId,slot:'WEAPON'},'ruins-release-in-flight')));
+    expectSuccess(f.request(instance.service,commerce('EQUIPMENT_SALVAGE',{instanceId:staff,expectedEnhancement:0},'ruins-salvage-in-flight')));
+    expect(instance.repo.transaction(tx=>tx.getItemInstance(staff))).toBeNull();
+    expect(instance.repo.transaction(tx=>({trip:tx.getTrip(ruinsId).snapshot,loadout:tx.getTripDepartureLoadout(ruinsId)}))).toEqual(frozen);
+    instance.close();
+    instance=f.open();
+    expect(expectSuccess(f.request(instance.service,ruins.raw))).toEqual(ruins.snapshot);
+    expect(instance.repo.transaction(tx=>tx.getTripDepartureLoadout(ruinsId))).toEqual(frozen.loadout);
+    f.advance(ruinsStartAt+minutes(240));
+    const reports=readTravelReports(instance.service).travelReports;
+    expect(reports.total).toBe(3);
+    expect(reports.rows.map(report=>report.tripId)).toEqual([ruinsId,forestId,firstId]);
+    expect(reports.rows[0]).toMatchObject({tripId:ruinsId,loadout:frozen.loadout,departurePower:frozen.trip.power});
+    expect(reports.rows[0].facts).toEqual(instance.repo.transaction(tx=>tx.listTripFacts(ruinsId)));
+    expect(reports.rows[0].rewards).toEqual(instance.repo.transaction(tx=>tx.listRewards(ruinsId).map(({kind,targetId,amount})=>({kind,targetId,amount}))));
+    expect(readTravelReports(instance.service,{petId,offset:1,limit:1}).travelReports.rows).toEqual([reports.rows[1]]);
+    const read=f.command('TRIP_REPORT_READ',{petId,tripId:ruinsId},'ruins-report-read');
+    const marked=expectSuccess(f.request(instance.service,read));
+    const markedReport=readTravelReports(instance.service).travelReports.rows[0];
+    expect(markedReport).toEqual({...reports.rows[0],readAt:ruinsStartAt+minutes(240)});
+    instance.close(); instance=f.open();
+    expect(readTravelReports(instance.service).travelReports.rows[0]).toEqual(markedReport);
+    expect(expectSuccess(f.request(instance.service,read))).toEqual(marked);
+    expect(expectSuccess(f.request(instance.service,first.raw))).toEqual(first.snapshot);
+    instance.close();
+  });
+
+  it('uses actual return time and stable trip ID tie-break for two pets, with bounded filtered pages', () => {
+    const f=fixture(); const instance=f.open();
+    const trips=[];
+    // The still-supported legacy meadow intent also obtains a full v6 loadout.
+    for(const petId of ['pet-1','pet-2']) {
+      const start=expectSuccess(f.request(instance.service,f.command('TRIP_START',{petId,routeId:DEMO_ROUTE.routeId})));
+      trips.push(start.pets.find(pet=>pet.petId===petId).trip.tripId);
+    }
+    expect(readTravelReports(instance.service).travelReports.total).toBe(0);
+    f.advance(initialTime+minutes(15));
+    const all=readTravelReports(instance.service).travelReports;
+    expect(all.rows.map(report=>report.tripId)).toEqual([...trips].sort());
+    expect(all.rows.map(report=>report.actualReturnedAt)).toEqual([initialTime+minutes(15),initialTime+minutes(15)]);
+    expect(all.rows.every(report=>report.loadout!==null)).toBe(true);
+    expect(readTravelReports(instance.service,{offset:1,limit:1}).travelReports.rows).toEqual([all.rows[1]]);
+    expect(readTravelReports(instance.service,{petId:'pet-2',offset:0,limit:1}).travelReports.rows.map(report=>report.petId)).toEqual(['pet-2']);
+    expect(readTravelReports(instance.service,{offset:9999,limit:20}).travelReports).toMatchObject({total:2,offset:9999,rows:[]});
     instance.close();
   });
 });

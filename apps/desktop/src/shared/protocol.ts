@@ -1,6 +1,8 @@
 import { z } from 'zod';
 import { appSnapshotSchema, idSchema, ipcRequestSchema, ipcResultSchema, nonnegativeIntegerSchema } from '@pet-desktop/contracts';
-import type { AppBridge, AppSnapshot, CharactersIpcResult, GalleryIpcResult, GalleryQuery, InventoryIpcResult } from '@pet-desktop/contracts';
+import type { AppBridge, AppSnapshot, CharactersIpcResult, GalleryIpcResult, GalleryQuery, InventoryIpcResult,
+  TravelCatalogIpcResult, TravelPreviewIpcResult, TravelReportsIpcResult } from '@pet-desktop/contracts';
+import type { TripPreparationPayload, TravelReportsQuery } from '@pet-desktop/contracts/travel';
 
 export const DESKTOP_IPC = Object.freeze({
   request: 'pet-desktop:request:v1',
@@ -50,6 +52,9 @@ export interface ControlCenterBridge extends DesktopBridgeBase {
   listGallery(query: GalleryQuery): Promise<GalleryIpcResult>;
   listCharacters(): Promise<CharactersIpcResult>;
   listInventory(legacyOffset?: number): Promise<InventoryIpcResult>;
+  listTravelCatalog(): Promise<TravelCatalogIpcResult>;
+  previewTravel(input: TripPreparationPayload): Promise<TravelPreviewIpcResult>;
+  listTravelReports(query: TravelReportsQuery): Promise<TravelReportsIpcResult>;
 }
 export type DesktopBridge = PetDesktopBridge | ControlCenterBridge;
 

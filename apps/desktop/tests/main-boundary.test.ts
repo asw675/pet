@@ -106,6 +106,21 @@ describe('Main request routing', () => {
     await expect(routeRequest(center, sender(center), [query], forward, undefined)).resolves.toMatchObject({ ok: false, error: { code: 'INTERNAL_ERROR' } });
   });
 
+  it('requires the control center and a revision for prepared travel or historical report queries', async () => {
+    const payload = { petId: 'pet-a', routeId: 'meadow', routeCatalogVersion: 1, selectedSupplies: [] };
+    const requests: IpcRequest[] = [
+      { ...getSnapshot, method: 'travel/catalog', payload: {} },
+      { ...getSnapshot, method: 'travel/preview', payload },
+      { ...getSnapshot, method: 'travel/reports', payload: { offset: 0, limit: 10 } },
+      dispatch({ ...common, type: 'TRIP_START_PREPARED', payload }),
+    ];
+    const forward = relay();
+    for (const request of requests) await expect(routeRequest(pet, sender(pet), [request], forward, 1)).resolves.toMatchObject({ ok: false, error: { code: 'FORBIDDEN' } });
+    expect(forward).not.toHaveBeenCalled();
+    await expect(routeRequest(center, sender(center), [requests[3]], forward, undefined)).resolves.toMatchObject({ ok: true });
+    await expect(routeRequest(center, sender(center), [{ ...getSnapshot, method: 'command/dispatch', payload: { command: { commandId: common.commandId, issuedAt: 1, type: 'TRIP_START_PREPARED', payload } } }], forward, undefined)).resolves.toMatchObject({ ok: false, error: { code: 'INVALID_REQUEST' } });
+  });
+
   it('rejects a valid request ID paired with a success result for the wrong method', async () => {
     const query: IpcRequest = { ...getSnapshot, method: 'gallery/list', payload: { filter: 'ALL', offset: 0, limit: 12 } };
     await expect(routeRequest(center, sender(center), [query], relay(), undefined)).resolves.toMatchObject({ ok: false, error: { code: 'INTERNAL_ERROR' } });

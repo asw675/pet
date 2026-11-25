@@ -3,6 +3,7 @@ import {
   idSchema, ipcRequestSchema, timestampSchema,
 } from '@pet-desktop/contracts';
 import type { AppSnapshot, CharacterCatalogPage, DomainCommand, DomainEvent, GalleryPage, GalleryQuery, InventoryPage, IpcErrorCode, IpcResult, PetSnapshot } from '@pet-desktop/contracts';
+import type { TravelCatalog, TravelPreview, TravelReportsPage, TravelReportsQuery, TripPreparationPayload } from '@pet-desktop/contracts/travel';
 import {
   advanceTrip, createTripCheckpoint, createTripSnapshot, DEMO_ROUTE, recallTrip,
 } from '@pet-desktop/domain';
@@ -10,20 +11,23 @@ import type { RewardDraft, TripAdvanceResult, TripFact } from '@pet-desktop/doma
 import { CHARACTER_CATALOG_VERSION, evaluateCharacterAcquisition, normalizeCharacterNickname } from '@pet-desktop/domain/character-catalog';
 import { advanceHomeState, interactHome } from '@pet-desktop/domain/home-simulation';
 import type { HomeSimulationState } from '@pet-desktop/domain/home-simulation';
+import { ROUTE_CATALOG_VERSION } from '@pet-desktop/domain/route-catalog';
 import type {
   AppRepository, AppRuntime, AppTransaction, CommandOutcome, PetRecord, PreferencesRecord, RewardLine, TripRecord,
 } from './ports.js';
 import { freezeTripCgAssets, projectGallery, TRIP_CG_VARIANT as CG_VARIANT } from '#gallery-service';
 import { characterAcquisitionContext, createCharacterPet, createStarterPets, projectCharacterCatalog } from '#character-service';
 import { applyHomeState, hasVisibleHomeChange, initialHomeState, readHomeState, scheduleFromHome, transitionHomeState } from '#home-state-service';
-import { battleProjection, executeEconomyCommand, projectInventory } from '#economy-service';
-
-const DEPARTURE_ENERGY10 = 150;
+import { executeEconomyCommand, projectInventory } from '#economy-service';
+import { freezeDepartureLoadout, prepareTravel, projectTravelCatalog, projectTravelReports } from '#travel-service';
 
 type Failure = Extract<CommandOutcome, { ok: false }>;
 type GalleryOutcome = { ok: true; snapshot: AppSnapshot; gallery: GalleryPage } | Failure;
 type CharactersOutcome = { ok: true; snapshot: AppSnapshot; characters: CharacterCatalogPage };
 type InventoryOutcome = { ok: true; snapshot: AppSnapshot; inventory: InventoryPage };
+type TravelCatalogOutcome = { ok: true; snapshot: AppSnapshot; travelCatalog: TravelCatalog };
+type TravelPreviewOutcome = { ok: true; snapshot: AppSnapshot; travelPreview: TravelPreview } | Failure;
+type TravelReportsOutcome = { ok: true; snapshot: AppSnapshot; travelReports: TravelReportsPage } | Failure;
 
 function failure(code: IpcErrorCode, message: string, retryable = false): Failure {
   return { ok: false, error: { code, message, retryable } };
@@ -538,28 +542,43 @@ export class AppService {
           }
         }
         return;
-      case 'TRIP_START': {
-        if (command.payload.routeId !== DEMO_ROUTE.routeId) return failure('NOT_FOUND', 'The route does not exist.');
-        if (pet.presence !== 'HOME' || pet.healthStatus !== 'NORMAL' || pet.healthPoints10 <= 0
-          || pet.energy10 < DEPARTURE_ENERGY10) {
-          return failure('BUSINESS_RULE', 'A healthy pet at home needs at least 15 energy to travel.');
+      case 'TRIP_START':
+      case 'TRIP_START_PREPARED': {
+        // Legacy command receipts still use the original shape and the
+        // supply-free meadow. New authority writes (even through that old
+        // meadow intent) freeze the complete v6 departure loadout.
+        if (command.type === 'TRIP_START' && command.payload.routeId !== DEMO_ROUTE.routeId) {
+          return failure('NOT_FOUND', 'Use prepared departure for other routes.');
         }
-        if (pet.activity === 'CHAT') return failure('BUSINESS_RULE', 'Finish the current conversation before travelling.');
+        const input: TripPreparationPayload = command.type === 'TRIP_START_PREPARED' ? command.payload
+          : { petId: pet.petId, routeId: command.payload.routeId, routeCatalogVersion: ROUTE_CATALOG_VERSION, selectedSupplies: [] };
+        const { preview, route } = prepareTravel(tx, pet, input, preferences.revision);
+        if (!preview.eligible || route === null) {
+          if (preview.reasons.some(reason => reason.code === 'ROUTE_CATALOG_VERSION_MISMATCH')) {
+            return failure('REVISION_CONFLICT', 'The route catalog has changed. Refresh preparation and confirm again.', true);
+          }
+          if (preview.reasons.some(reason => reason.code === 'ROUTE_NOT_FOUND')) return failure('NOT_FOUND', 'The route does not exist.');
+          if (preview.reasons.some(reason => reason.code === 'PET_BUSY')) return failure('BUSINESS_RULE', 'Finish the current activity before travelling.');
+          return failure('BUSINESS_RULE', 'The selected route or supplies do not meet the current departure requirements.');
+        }
         // The visible projection is already current; recompute any fractions
         // not yet durably saved by its preceding read-only tick before leaving.
         const beforeDeparture = advanceHomeState(readHomeState(tx, pet, at), at);
-        // New trips freeze the current progression/equipment-derived power;
-        // replay continues to use the exact immutable power in old snapshots.
+        const loadout = freezeDepartureLoadout(tx, pet, preview);
+        // Neither equipment changes nor route catalog updates after departure
+        // can affect the already-frozen trip-v1 power/route inputs.
         const snapshot = createTripSnapshot({ tripId: this.runtime.createId('trip'), petId: pet.petId,
-          power: battleProjection(tx, pet).battlePower, seed: this.runtime.seed(), startAt: at, route: DEMO_ROUTE });
-        tx.insertTrip({ snapshot, checkpoint: createTripCheckpoint(snapshot), status: 'TRAVELING', reportReadAt: null });
+          power: loadout.battlePower, seed: this.runtime.seed(), startAt: at, route: route.route });
+        tx.insertTrip({ snapshot, checkpoint: createTripCheckpoint(snapshot), status: 'TRAVELING', reportReadAt: null }, true);
+        for (const supply of loadout.supplies) tx.addInventory(supply.itemId, -supply.quantity);
+        tx.insertTripDepartureLoadout({ tripId: snapshot.tripId, commandId: command.commandId, loadout });
         // Freeze the CG content identity in the same transaction as departure.
         // The trip snapshot and reward keys intentionally retain their existing
         // deterministic format; only its eventual first acquisition gains a
         // separately persisted historical asset reference.
         for (const pin of freezeTripCgAssets(pet, snapshot)) tx.insertTripCgAssetPin(pin);
         const offsite: PetRecord = { ...applyHomeState(pet, beforeDeparture), presence: 'AWAY', activity: null,
-          energy10: beforeDeparture.energy10 - DEPARTURE_ENERGY10 };
+          energy10: beforeDeparture.energy10 - loadout.energyCost10 };
         const awayHome = transitionHomeState(beforeDeparture, offsite, at);
         this.persistHomeProjection(state, pet, awayHome, true);
         this.event(state, 'TripStarted', snapshot.tripId, command.commandId, at,
@@ -663,6 +682,36 @@ export class AppService {
     });
   }
 
+  private getTravelCatalog(): TravelCatalogOutcome {
+    return this.repository.transaction((tx) => {
+      const state = this.state(tx);
+      this.advanceAll(state);
+      const snapshot = this.snapshot(state);
+      return { ok: true, snapshot, travelCatalog: projectTravelCatalog(tx, snapshot.revision) };
+    });
+  }
+
+  private getTravelPreview(input: TripPreparationPayload): TravelPreviewOutcome {
+    return this.repository.transaction((tx) => {
+      const state = this.state(tx);
+      this.advanceAll(state);
+      const pet = tx.getPet(input.petId);
+      if (!pet) return failure('NOT_FOUND', 'The pet does not exist.');
+      const snapshot = this.snapshot(state);
+      return { ok: true, snapshot, travelPreview: prepareTravel(tx, pet, input, snapshot.revision).preview };
+    });
+  }
+
+  private getTravelReports(query: TravelReportsQuery): TravelReportsOutcome {
+    return this.repository.transaction((tx) => {
+      const state = this.state(tx);
+      this.advanceAll(state);
+      if (query.petId !== undefined && tx.getPet(query.petId) === null) return failure('NOT_FOUND', 'The pet does not exist.');
+      const snapshot = this.snapshot(state);
+      return { ok: true, snapshot, travelReports: projectTravelReports(tx, query, snapshot.revision, trip => this.verifySettledReport(state, trip)) };
+    });
+  }
+
   dispatch(command: DomainCommand): CommandOutcome {
     if (this.closed) return unavailable();
     const parsed = domainCommandSchema.safeParse(command);
@@ -718,6 +767,20 @@ export class AppService {
         const outcome = this.getInventory(parsed.data.payload.legacyOffset ?? 0);
         return { schemaVersion: CONTRACT_SCHEMA_VERSION, ok: true, requestId,
           snapshot: outcome.snapshot, inventory: outcome.inventory };
+      }
+      if (parsed.data.method === 'travel/catalog') {
+        const outcome = this.getTravelCatalog();
+        return { schemaVersion: CONTRACT_SCHEMA_VERSION, ok: true, requestId, snapshot: outcome.snapshot, travelCatalog: outcome.travelCatalog };
+      }
+      if (parsed.data.method === 'travel/preview') {
+        const outcome = this.getTravelPreview(parsed.data.payload);
+        return outcome.ok ? { schemaVersion: CONTRACT_SCHEMA_VERSION, ok: true, requestId,
+          snapshot: outcome.snapshot, travelPreview: outcome.travelPreview } : respondError(outcome);
+      }
+      if (parsed.data.method === 'travel/reports') {
+        const outcome = this.getTravelReports(parsed.data.payload);
+        return outcome.ok ? { schemaVersion: CONTRACT_SCHEMA_VERSION, ok: true, requestId,
+          snapshot: outcome.snapshot, travelReports: outcome.travelReports } : respondError(outcome);
       }
       const outcome = parsed.data.method === 'snapshot/get' ? { ok: true as const, snapshot: this.getSnapshot() }
         : this.dispatch(parsed.data.payload.command);

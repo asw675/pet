@@ -2,6 +2,9 @@ import type {
   Activity, AppSnapshot, CgAssetRef, DomainEvent, HealthStatus, IpcErrorCode, Mood, Presence, Visibility,
 } from '@pet-desktop/contracts';
 import type { EquipmentSlot } from '@pet-desktop/contracts/inventory';
+import type { TripDepartureLoadout, TravelReportsQuery } from '@pet-desktop/contracts/travel';
+import type { TripDepartureLoadoutRecord } from './trip-departure-storage.js';
+export type { TripDepartureLoadoutRecord } from './trip-departure-storage.js';
 import type { RewardDraft, TripCheckpoint, TripFact, TripSnapshot } from '@pet-desktop/domain';
 
 /** Storage numbers are fixed-point tenths. Renderer DTOs use 0–100. */
@@ -173,8 +176,13 @@ export interface AppTransaction {
   getHomeSchedule(petId: string): HomeScheduleRecord | null;
   saveHomeSchedule(record: HomeScheduleRecord): void;
   listTrips(): TripRecord[];
+  listSettledTrips(query: TravelReportsQuery): { total: number; trips: TripRecord[] };
   getTrip(tripId: string): TripRecord | null;
-  insertTrip(trip: TripRecord): void;
+  /** Authority sets the second argument for every new real departure; the
+   * default false remains solely for old low-level fixture/legacy APIs. */
+  insertTrip(trip: TripRecord, departureLoadoutRequired?: boolean): void;
+  insertTripDepartureLoadout(record: TripDepartureLoadoutRecord): void;
+  getTripDepartureLoadout(tripId: string): TripDepartureLoadout | null;
   updateTrip(trip: TripRecord): void;
   appendTripFacts(tripId: string, facts: readonly TripFact[]): void;
   listTripFacts(tripId: string): TripFact[];

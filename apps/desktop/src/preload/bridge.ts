@@ -1,11 +1,12 @@
 import {
   CONTRACT_SCHEMA_VERSION, appSnapshotSchema, charactersIpcResultSchema, galleryIpcResultSchema, inventoryIpcResultSchema, ipcRequestSchema,
-  resultMatchesMethod, snapshotIpcResultSchema,
+  resultMatchesMethod, snapshotIpcResultSchema, travelCatalogIpcResultSchema, travelPreviewIpcResultSchema, travelReportsIpcResultSchema,
 } from '@pet-desktop/contracts';
 import type {
   AppSnapshot, CharactersIpcResult, DomainCommand, GalleryIpcResult, GalleryQuery, IpcErrorCode, IpcRequest,
-  IpcResult, SnapshotIpcResult, InventoryIpcResult,
+  IpcResult, SnapshotIpcResult, InventoryIpcResult, TravelCatalogIpcResult, TravelPreviewIpcResult, TravelReportsIpcResult,
 } from '@pet-desktop/contracts';
+import type { TripPreparationPayload, TravelReportsQuery } from '@pet-desktop/contracts/travel';
 import {
   DESKTOP_IPC, hostActionResultSchema, petVisualReadySchema, serviceStatusSchema,
 } from '../shared/protocol.js';
@@ -94,6 +95,9 @@ const requestResultParsers = {
   'gallery/list': galleryIpcResultSchema,
   'characters/list': charactersIpcResultSchema,
   'inventory/list': inventoryIpcResultSchema,
+  'travel/catalog': travelCatalogIpcResultSchema,
+  'travel/preview': travelPreviewIpcResultSchema,
+  'travel/reports': travelReportsIpcResultSchema,
 } satisfies Record<IpcRequest['method'], Parser<IpcResult>>;
 
 /** Request and reply shapes are correlated by both id and closed request method.
@@ -101,6 +105,9 @@ const requestResultParsers = {
 function sendRequest(ipc: DesktopIpcPort, requestId: () => string, method: 'gallery/list', payload: unknown): Promise<GalleryIpcResult>;
 function sendRequest(ipc: DesktopIpcPort, requestId: () => string, method: 'characters/list', payload: unknown): Promise<CharactersIpcResult>;
 function sendRequest(ipc: DesktopIpcPort, requestId: () => string, method: 'inventory/list', payload: unknown): Promise<InventoryIpcResult>;
+function sendRequest(ipc: DesktopIpcPort, requestId: () => string, method: 'travel/catalog', payload: unknown): Promise<TravelCatalogIpcResult>;
+function sendRequest(ipc: DesktopIpcPort, requestId: () => string, method: 'travel/preview', payload: unknown): Promise<TravelPreviewIpcResult>;
+function sendRequest(ipc: DesktopIpcPort, requestId: () => string, method: 'travel/reports', payload: unknown): Promise<TravelReportsIpcResult>;
 function sendRequest(ipc: DesktopIpcPort, requestId: () => string, method: 'snapshot/get' | 'command/dispatch', payload: unknown): Promise<SnapshotIpcResult>;
 async function sendRequest(ipc: DesktopIpcPort, requestId: () => string, method: IpcRequest['method'], payload: unknown): Promise<IpcResult> {
   const id = requestId();
@@ -124,6 +131,15 @@ async function sendRequest(ipc: DesktopIpcPort, requestId: () => string, method:
       }
       if (request.method === 'inventory/list' && 'inventory' in result
         && result.inventory.legacyStackOffset !== (request.payload.legacyOffset ?? 0)) return failure(id, 'INTERNAL_ERROR', true);
+      if (request.method === 'travel/preview' && 'travelPreview' in result) {
+        const quote = result.travelPreview, intent = request.payload;
+        if (quote.petId !== intent.petId || quote.requestedRouteId !== intent.routeId
+          || quote.selectedSupplies.length !== intent.selectedSupplies.length
+          || quote.selectedSupplies.some((entry) => !intent.selectedSupplies.some((other) => other.itemId === entry.itemId && other.quantity === entry.quantity))) return failure(id, 'INTERNAL_ERROR', true);
+      }
+      if (request.method === 'travel/reports' && 'travelReports' in result
+        && (result.travelReports.offset !== request.payload.offset || result.travelReports.limit !== request.payload.limit
+          || result.travelReports.petId !== (request.payload.petId ?? null))) return failure(id, 'INTERNAL_ERROR', true);
       return result;
     }
     // The error code and retryability are contractual; free-text errors are not trusted.
@@ -205,5 +221,11 @@ export function createControlCenterBridge(ipc: DesktopIpcPort, requestId = newRe
       if (args.length > 1 || (args.length === 1 && typeof args[0] !== 'number')) return failure(requestId(), 'INVALID_REQUEST', false);
       return sendRequest(ipc, requestId, 'inventory/list', args.length === 0 ? {} : { legacyOffset: args[0] });
     },
+    async listTravelCatalog(...args: unknown[]): Promise<TravelCatalogIpcResult> {
+      if (args.length !== 0) return failure(requestId(), 'INVALID_REQUEST', false);
+      return sendRequest(ipc, requestId, 'travel/catalog', {});
+    },
+    previewTravel: (input: TripPreparationPayload) => sendRequest(ipc, requestId, 'travel/preview', input),
+    listTravelReports: (query: TravelReportsQuery) => sendRequest(ipc, requestId, 'travel/reports', query),
   });
 }

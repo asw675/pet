@@ -106,11 +106,14 @@ describe('role-specific preload bridges', () => {
     const pet = createPetBridge(ipc);
     const center = createControlCenterBridge(ipc);
     expect(Object.keys(pet).sort()).toEqual([...commonKeys, 'setInteractive', 'reportVisualReady'].sort());
-    expect(Object.keys(center).sort()).toEqual([...commonKeys, 'listGallery', 'listCharacters', 'listInventory'].sort());
+    expect(Object.keys(center).sort()).toEqual([...commonKeys, 'listGallery', 'listCharacters', 'listInventory', 'listTravelCatalog', 'previewTravel', 'listTravelReports'].sort());
     expect('reportVisualReady' in center).toBe(false);
     expect('listGallery' in pet).toBe(false);
     expect('listCharacters' in pet).toBe(false);
     expect('listInventory' in pet).toBe(false);
+    expect('listTravelCatalog' in pet).toBe(false);
+    expect('previewTravel' in pet).toBe(false);
+    expect('listTravelReports' in pet).toBe(false);
     expect(pet.role).toBe('pet');
     expect(center.role).toBe('control-center');
     expect(Object.isFrozen(pet)).toBe(true);
@@ -135,6 +138,23 @@ describe('role-specific preload bridges', () => {
     expect(await bridge.listInventory(128)).toMatchObject({ ok: true, inventory: { legacyStackOffset: 128 } });
     ipc.handle = () => inventorySuccess('request-7');
     expect(await bridge.listInventory(128)).toMatchObject({ ok: false, error: { code: 'INTERNAL_ERROR' } });
+  });
+
+  it('correlates travel catalog, preview and paged history to their exact methods and payloads', async () => {
+    const ipc = new FakeIpc(); const bridge = createControlCenterBridge(ipc, requestIds());
+    const route = { routeId: 'meadow', contentVersion: 1, title: '草原', description: '测试', risk: 'LOW', minLevel: 1,
+      recommendedMaxLevel: 5, energyCost10: 150, durationMs: 100, requiredSupplies: [], rewardItemIds: [], cgIds: [] };
+    ipc.handle = () => ({ schemaVersion: 1, ok: true, requestId: 'request-1', snapshot,
+      travelCatalog: { revision: snapshot.revision, routeCatalogVersion: 1, routes: [route], supplyStock: [] } });
+    expect(await bridge.listTravelCatalog()).toMatchObject({ ok: true, travelCatalog: { routeCatalogVersion: 1 } });
+    expect(await bridge.previewTravel({ petId: 'pet-1', routeId: 'meadow', routeCatalogVersion: 1, selectedSupplies: [] })).toMatchObject({ ok: false, error: { code: 'INTERNAL_ERROR' } });
+    ipc.handle = () => ({ schemaVersion: 1, ok: true, requestId: 'request-3', snapshot,
+      travelReports: { revision: snapshot.revision, petId: null, offset: 12, limit: 10, total: 0, rows: [] } });
+    expect(await bridge.listTravelReports({ offset: 12, limit: 10 })).toMatchObject({ ok: true, travelReports: { offset: 12 } });
+    ipc.handle = () => ({ schemaVersion: 1, ok: true, requestId: 'request-4', snapshot,
+      travelReports: { revision: snapshot.revision, petId: null, offset: 12, limit: 10, total: 0, rows: [] } });
+    expect(await bridge.listTravelReports({ offset: 0, limit: 10 })).toMatchObject({ ok: false, error: { code: 'INTERNAL_ERROR' } });
+    expect(await bridge.listTravelReports({ offset: 0, limit: 21 })).toMatchObject({ ok: false, error: { code: 'INVALID_REQUEST' } });
   });
 
   it('validates, wraps and correlates requests without changing the command ID', async () => {

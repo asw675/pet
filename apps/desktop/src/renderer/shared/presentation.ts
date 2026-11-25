@@ -13,7 +13,12 @@ export function petStatus(pet: PetSnapshot): string {
 }
 
 export function routeName(routeId: string): string {
-  return routeId === 'morning-dew-meadow' ? '晨露草甸' : routeId;
+  switch (routeId) {
+    case 'morning-dew-meadow': return '晨露草原';
+    case 'mist-forest': return '迷雾森林';
+    case 'starfall-ruins': return '星落遗迹';
+    default: return routeId;
+  }
 }
 
 export function formatRemaining(expectedReturnAt: number, now: number): string {

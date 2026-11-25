@@ -2,16 +2,19 @@ import { describe, expect, it } from 'vitest';
 import { CONTRACT_SCHEMA_VERSION, ipcResultSchema } from '@pet-desktop/contracts';
 import type { AppSnapshot, CharacterCatalogPage, DomainCommand, DomainEvent, GalleryPage, GalleryQuery, InventoryPage } from '@pet-desktop/contracts';
 import type { EquipmentSlot } from '@pet-desktop/contracts/inventory';
+import type { TravelCatalog, TravelPreview, TravelReportsPage, TravelReportsQuery, TripDepartureLoadout, TripPreparationPayload } from '@pet-desktop/contracts/travel';
 import { DEMO_ROUTE } from '@pet-desktop/domain';
 import { findBuiltinCg } from '@pet-desktop/domain/cg-catalog';
 import { CHARACTER_CATALOG_VERSION } from '@pet-desktop/domain/character-catalog';
 import { HOME_RULES, advanceHomeState } from '@pet-desktop/domain/home-simulation';
 import { ITEM_CATALOG_VERSION } from '@pet-desktop/domain/item-catalog';
+import { ROUTE_CATALOG_VERSION } from '@pet-desktop/domain/route-catalog';
+import { cumulativeXpAtLevel } from '@pet-desktop/domain/progression';
 import type { TripFact } from '@pet-desktop/domain';
 import { AppService } from '../src/app-service.js';
 import type {
   AppRepository, AppRuntime, AppTransaction, CgUnlock, CgUnlockInput, CommandOutcome, CommandReceipt,
-  CommerceOperationRecord, HomeScheduleRecord, InventoryItem, ItemInstanceRecord, OutboxRecord, PetAcquisitionRecord, PetEquipmentRecord, PetRecord, PreferencesRecord, RewardLine, SettlementRecord, TripCgAssetPin, TripRecord,
+  CommerceOperationRecord, HomeScheduleRecord, InventoryItem, ItemInstanceRecord, OutboxRecord, PetAcquisitionRecord, PetEquipmentRecord, PetRecord, PreferencesRecord, RewardLine, SettlementRecord, TripCgAssetPin, TripDepartureLoadoutRecord, TripRecord,
 } from '../src/ports.js';
 
 const MINUTE = 60_000;
@@ -28,6 +31,8 @@ interface MemoryState {
   acquisitions: PetAcquisitionRecord[];
   homeSchedules: HomeScheduleRecord[];
   trips: TripRecord[];
+  requiredDepartureLoadouts: string[];
+  departureLoadouts: TripDepartureLoadoutRecord[];
   facts: TripFact[];
   settlements: SettlementRecord[];
   rewards: RewardLine[];
@@ -44,7 +49,7 @@ interface MemoryState {
 }
 
 function emptyState(): MemoryState {
-  return { preferences: null, pets: [], acquisitions: [], homeSchedules: [], trips: [], facts: [], settlements: [], rewards: [],
+  return { preferences: null, pets: [], acquisitions: [], homeSchedules: [], trips: [], requiredDepartureLoadouts: [], departureLoadouts: [], facts: [], settlements: [], rewards: [],
     wallet: 0, inventory: [], itemInstances: [], retiredItemIds: [], equipment: [], commerceOperations: [],
     cgs: [], cgPins: [], receipts: [], outbox: [] };
 }
@@ -100,15 +105,30 @@ class MemoryRepository implements AppRepository, AppTransaction {
     else this.state.homeSchedules[index] = copy(record);
   }
   listTrips(): TripRecord[] { return copy(this.state.trips); }
+  listSettledTrips(query: TravelReportsQuery): { total: number; trips: TripRecord[] } {
+    const matches = this.state.trips.filter(trip => trip.status === 'SETTLED' && (query.petId === undefined || query.petId === trip.snapshot.petId))
+      .sort((a, b) => b.checkpoint.actualReturnedAt! - a.checkpoint.actualReturnedAt!
+        || (a.snapshot.tripId < b.snapshot.tripId ? -1 : a.snapshot.tripId > b.snapshot.tripId ? 1 : 0));
+    return { total: matches.length, trips: copy(matches.slice(query.offset, query.offset + query.limit)) };
+  }
   getTrip(tripId: string): TripRecord | null {
     return copy(this.state.trips.find((trip) => trip.snapshot.tripId === tripId) ?? null);
   }
-  insertTrip(trip: TripRecord): void {
+  insertTrip(trip: TripRecord, departureLoadoutRequired = false): void {
     if (this.getTrip(trip.snapshot.tripId) !== null) throw new Error('Duplicate trip');
     if (this.state.trips.some((entry) => entry.status === 'TRAVELING' && entry.snapshot.petId === trip.snapshot.petId)) {
       throw new Error('Duplicate active trip');
     }
     this.state.trips.push(copy(trip));
+    if (departureLoadoutRequired) this.state.requiredDepartureLoadouts.push(trip.snapshot.tripId);
+  }
+  insertTripDepartureLoadout(record: TripDepartureLoadoutRecord): void {
+    if (!this.state.requiredDepartureLoadouts.includes(record.tripId) || this.getTripDepartureLoadout(record.tripId) !== null
+      || this.state.departureLoadouts.some(row => row.commandId === record.commandId)) throw new Error('Invalid departure loadout identity');
+    this.state.departureLoadouts.push(copy(record));
+  }
+  getTripDepartureLoadout(tripId: string): TripDepartureLoadout | null {
+    return copy(this.state.departureLoadouts.find(row => row.tripId === tripId)?.loadout ?? null);
   }
   updateTrip(trip: TripRecord): void {
     const index = this.state.trips.findIndex((entry) => entry.snapshot.tripId === trip.snapshot.tripId);
@@ -308,6 +328,30 @@ function requestInventory(service: AppService, legacyOffset?: number): { snapsho
   expect(result.inventory.revision).toBe(result.snapshot.revision);
   expect(result.inventory.walletCoins).toBe(result.snapshot.walletCoins);
   return { snapshot: result.snapshot, inventory: result.inventory };
+}
+
+function requestTravelCatalog(service: AppService): { snapshot: AppSnapshot; catalog: TravelCatalog } {
+  const result = service.handleRequest({ schemaVersion: 1, requestId: 'travel-catalog', method: 'travel/catalog', payload: {} });
+  expect(ipcResultSchema.safeParse(result).success).toBe(true);
+  if (!result.ok || !('travelCatalog' in result)) throw new Error('Expected travel catalog');
+  expect(result.travelCatalog.revision).toBe(result.snapshot.revision);
+  return { snapshot: result.snapshot, catalog: result.travelCatalog };
+}
+
+function requestTravelPreview(service: AppService, payload: TripPreparationPayload): { snapshot: AppSnapshot; preview: TravelPreview } {
+  const result = service.handleRequest({ schemaVersion: 1, requestId: 'travel-preview', method: 'travel/preview', payload });
+  expect(ipcResultSchema.safeParse(result).success).toBe(true);
+  if (!result.ok || !('travelPreview' in result)) throw new Error('Expected travel preview');
+  expect(result.travelPreview.revision).toBe(result.snapshot.revision);
+  return { snapshot: result.snapshot, preview: result.travelPreview };
+}
+
+function requestTravelReports(service: AppService, payload: TravelReportsQuery = { offset: 0, limit: 20 }): { snapshot: AppSnapshot; reports: TravelReportsPage } {
+  const result = service.handleRequest({ schemaVersion: 1, requestId: 'travel-reports', method: 'travel/reports', payload });
+  expect(ipcResultSchema.safeParse(result).success).toBe(true);
+  if (!result.ok || !('travelReports' in result)) throw new Error('Expected travel reports');
+  expect(result.travelReports.revision).toBe(result.snapshot.revision);
+  return { snapshot: result.snapshot, reports: result.travelReports };
 }
 
 describe('application service request boundary', () => {
@@ -1157,5 +1201,125 @@ describe('authoritative shared inventory and independent equipment', () => {
       expect(page.stacks[0]).toEqual({ itemId: 'ration', quantity: 1, definitionState: 'AVAILABLE' });
       expect(page.stacks.filter(row => row.definitionState === 'LEGACY_UNKNOWN')).toHaveLength(Math.min(128, 256 - offset));
     }
+  });
+});
+
+describe('versioned travel preparation and immutable report projection', () => {
+  const version = ROUTE_CATALOG_VERSION;
+  const input = (petId: string, routeId: string, selectedSupplies: TripPreparationPayload['selectedSupplies'] = []): TripPreparationPayload =>
+    ({ petId, routeId, routeCatalogVersion: version, selectedSupplies });
+  const departPrepared = (service: AppService, id: string, prepared: TripPreparationPayload) => {
+    const quote = requestTravelPreview(service, prepared);
+    expect(quote.preview.eligible).toBe(true);
+    const raw = command(id, 'TRIP_START_PREPARED', prepared, { expectedRevision: quote.snapshot.revision });
+    return { raw, snapshot: success(service.dispatch(raw)) };
+  };
+
+  it('exposes three bounded routes and exact current supply stock without simulator definitions or legacy inventory leakage', () => {
+    const { service, repo } = fixture();
+    repo.addInventory('ration', 3);
+    for (let i = 0; i < 4_103; i++) repo.addInventory(`legacy-stack-${i}`, 1);
+    const { catalog } = requestTravelCatalog(service);
+    expect(catalog.routeCatalogVersion).toBe(version);
+    expect(catalog.routes.map(route => ({ routeId: route.routeId, energy: route.energyCost10, duration: route.durationMs, minLevel: route.minLevel }))).toEqual([
+      { routeId: DEMO_ROUTE.routeId, energy: 150, duration: 15 * MINUTE, minLevel: 1 },
+      { routeId: 'mist-forest', energy: 300, duration: 60 * MINUTE, minLevel: 4 },
+      { routeId: 'starfall-ruins', energy: 500, duration: 240 * MINUTE, minLevel: 10 },
+    ]);
+    expect(catalog.supplyStock).toEqual([{ itemId: 'healing-potion', quantity: 0 }, { itemId: 'ration', quantity: 3 }]);
+    expect(catalog.routes.every(route => !Object.hasOwn(route, 'route') && !Object.hasOwn(route, 'nodes') && !Object.hasOwn(route, 'seed'))).toBe(true);
+    expect(requestTravelPreview(service, input('pet-1', DEMO_ROUTE.routeId)).preview.eligible).toBe(true);
+  });
+
+  it('projects exact eligibility reasons and rejects equivalent stale or busy departures without debiting', () => {
+    const { service, repo } = fixture();
+    const forest = input('pet-1', 'mist-forest');
+    const quote = requestTravelPreview(service, forest);
+    expect(quote.preview.reasons.map(reason => reason.code)).toEqual(expect.arrayContaining([
+      'LEVEL_TOO_LOW', 'MISSING_REQUIRED_SUPPLY', 'SUPPLY_OUT_OF_STOCK',
+    ]));
+    const bad = command('underlevel-forest', 'TRIP_START_PREPARED', forest, { expectedRevision: quote.snapshot.revision });
+    expect(service.dispatch(bad)).toMatchObject({ ok: false, error: { code: 'BUSINESS_RULE' } });
+    expect(repo.state.trips).toEqual([]);
+    expect(repo.getPet('pet-1')!.energy10).toBe(1000);
+    expect(service.dispatch(command('no-prepared-revision', 'TRIP_START_PREPARED', input('pet-1', DEMO_ROUTE.routeId))))
+      .toMatchObject({ ok: false, error: { code: 'INVALID_REQUEST' } });
+    const staleInput = { ...input('pet-1', DEMO_ROUTE.routeId), routeCatalogVersion: 2 };
+    const stale = requestTravelPreview(service, staleInput);
+    expect(stale.preview).toMatchObject({ eligible: false, route: null, energyCost10: 0, durationMs: 0,
+      reasons: [{ code: 'ROUTE_CATALOG_VERSION_MISMATCH', expectedVersion: version, receivedVersion: 2 }] });
+    expect(service.dispatch(command('catalog-stale-depart', 'TRIP_START_PREPARED', staleInput, { expectedRevision: stale.snapshot.revision })))
+      .toMatchObject({ ok: false, error: { code: 'REVISION_CONFLICT' } });
+    const unavailable = requestTravelPreview(service, input('pet-1','missing-route'));
+    expect(unavailable.preview).toMatchObject({ route: null, reasons: [{ code: 'ROUTE_NOT_FOUND', routeId: 'missing-route' }] });
+    expect(service.handleRequest({ schemaVersion: 1, requestId: 'missing-pet-preview', method: 'travel/preview', payload: input('missing-pet',DEMO_ROUTE.routeId) }))
+      .toMatchObject({ ok: false, error: { code: 'NOT_FOUND' } });
+    for (const activity of ['CHAT', 'DRAG'] as const) {
+      repo.savePet({ ...repo.getPet('pet-1')!, activity });
+      const busy = requestTravelPreview(service, input('pet-1', DEMO_ROUTE.routeId));
+      expect(busy.preview).toMatchObject({ eligible: false, reasons: [{ code: 'PET_BUSY', activity }] });
+      expect(service.dispatch(command(`blocked-${activity.toLowerCase()}`, 'TRIP_START_PREPARED', input('pet-1', DEMO_ROUTE.routeId), { expectedRevision: busy.snapshot.revision })))
+        .toMatchObject({ ok: false, error: { code: 'BUSINESS_RULE' } });
+    }
+    expect(repo.state.trips).toEqual([]);
+    expect(repo.state.departureLoadouts).toEqual([]);
+  });
+
+  it('revalidates supply selection and actual stock at commit, with exact rollback and retry when departure persistence fails', () => {
+    const { service, repo } = fixture();
+    repo.savePet({ ...repo.getPet('pet-1')!, xp: cumulativeXpAtLevel(4) });
+    repo.addInventory('ration', 2);
+    const exact = input('pet-1', 'mist-forest', [{ itemId: 'ration', quantity: 1 }]);
+    const extra = requestTravelPreview(service, input('pet-1', 'mist-forest', [{ itemId: 'ration', quantity: 2 }]));
+    expect(extra.preview).toMatchObject({ eligible: false, supplyConsumption: [],
+      reasons: [expect.objectContaining({ code: 'EXCESS_SUPPLY' })] });
+    const unauthorized = requestTravelPreview(service, input('pet-1', 'mist-forest', [{ itemId: 'ration', quantity: 1 }, { itemId: 'healing-potion', quantity: 1 }]));
+    expect(unauthorized.preview.reasons).toContainEqual({ code: 'SUPPLY_NOT_ALLOWED', itemId: 'healing-potion', selectedQuantity: 1 });
+    const quote = requestTravelPreview(service, exact);
+    expect(quote.preview).toMatchObject({ eligible: true, energyCost10: 300, supplyConsumption: [{ itemId: 'ration', quantity: 1 }] });
+    const departure = command('forest-retry', 'TRIP_START_PREPARED', exact, { expectedRevision: quote.snapshot.revision });
+    const baseline = copy(repo.state);
+    repo.failOnEvent = 'TripStarted';
+    expect(service.dispatch(departure)).toMatchObject({ ok: false, error: { code: 'INTERNAL_ERROR' } });
+    expect(repo.state).toEqual(baseline);
+    repo.failOnEvent = null;
+    const started = success(service.dispatch(departure));
+    expect(started.pets[0]).toMatchObject({ energy: 70, presence: 'AWAY', trip: { routeId: 'mist-forest' } });
+    expect(repo.listInventory().find(row => row.itemId === 'ration')?.quantity).toBe(1);
+    const tripId = started.pets[0]!.trip!.tripId;
+    expect(repo.getTripDepartureLoadout(tripId)).toMatchObject({ energyCost10: 300, level: 4, supplies: [{ itemId: 'ration', quantity: 1 }] });
+    expect(success(service.dispatch(departure))).toEqual(started);
+    expect(repo.listInventory().find(row => row.itemId === 'ration')?.quantity).toBe(1);
+    const awayQuote = requestTravelPreview(service, exact);
+    expect(awayQuote.preview.reasons.map(reason => reason.code)).toEqual(expect.arrayContaining(['PET_NOT_HOME', 'ACTIVE_TRIP']));
+    expect(requestTravelReports(service).reports.rows).toHaveLength(0);
+  });
+
+  it('sorts paginated settled reports by actual return and preserves facts, ledger and the first frozen power/equipment', () => {
+    const { service, repo, runtime } = fixture();
+    repo.savePet({ ...repo.getPet('pet-2')!, xp: cumulativeXpAtLevel(4) });
+    repo.addInventory('ration', 1);
+    const first = departPrepared(service, 'meadow-prepared', input('pet-1', DEMO_ROUTE.routeId));
+    const second = departPrepared(service, 'forest-prepared', input('pet-2', 'mist-forest', [{ itemId: 'ration', quantity: 1 }]));
+    const firstId = first.snapshot.pets[0]!.trip!.tripId;
+    const secondId = second.snapshot.pets[1]!.trip!.tripId;
+    runtime.at = START + 60 * MINUTE;
+    const settled = requestTravelReports(service);
+    const reports = settled.reports;
+    expect(reports.total).toBe(2);
+    expect(reports.rows.map(report => report.tripId)).toEqual([secondId, firstId]);
+    expect(reports.rows.every(report => report.loadout !== null && report.facts.at(-1)?.type === 'TRIP_RETURNED')).toBe(true);
+    expect(requestTravelReports(service, { offset: 1, limit: 1 }).reports.rows).toEqual([reports.rows[1]]);
+    expect(requestTravelReports(service, { petId: 'pet-1', offset: 0, limit: 1 }).reports.rows).toEqual([reports.rows[1]]);
+    expect(requestTravelReports(service, { offset: 20, limit: 20 }).reports.rows).toEqual([]);
+    const raw = command('report-marked', 'TRIP_REPORT_READ', { petId: 'pet-1', tripId: firstId });
+    const marked = success(service.dispatch(raw));
+    const read = requestTravelReports(service, { petId: 'pet-1', offset: 0, limit: 1 }).reports.rows[0]!;
+    expect(read).toEqual({ ...reports.rows[1], readAt: runtime.at });
+    expect(success(service.dispatch(raw))).toEqual(marked);
+    expect(repo.getTripDepartureLoadout(firstId)).toEqual(read.loadout);
+    expect(repo.listRewards(firstId).map(({kind,targetId,amount}) => ({kind,targetId,amount}))).toEqual(read.rewards);
+    expect(service.handleRequest({ schemaVersion: 1, requestId: 'missing-pet-history', method: 'travel/reports', payload: { petId: 'absent', offset: 0, limit: 1 } }))
+      .toMatchObject({ ok: false, error: { code: 'NOT_FOUND' } });
   });
 });

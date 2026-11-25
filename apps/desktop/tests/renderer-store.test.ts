@@ -44,8 +44,12 @@ function testBridge() {
     schemaVersion: 1, ok: true, requestId: 'inventory-request', snapshot: snapshot(0),
     inventory: { revision: 0, catalogVersion: 1, walletCoins: 0, legacyStackOffset: 0, legacyStackTotal: 0, definitions: [], stacks: [], instances: [], offers: [], pets: [] },
   });
+  const listTravelCatalog = vi.fn<ControlCenterBridge['listTravelCatalog']>();
+  const previewTravel = vi.fn<ControlCenterBridge['previewTravel']>();
+  const listTravelReports = vi.fn<ControlCenterBridge['listTravelReports']>();
   const bridge: ControlCenterBridge = {
     role: 'control-center', getServiceStatus, getSnapshot, dispatch, listGallery, listCharacters, listInventory,
+    listTravelCatalog, previewTravel, listTravelReports,
     openControlCenter: () => Promise.resolve({ ok: true }),
     subscribeSnapshot: (listener) => {
       snapshots.add(listener);

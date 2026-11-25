@@ -9,7 +9,9 @@
 | 001A-R | 公共契约独立审核修订 | 正式测试通过 | [001a-review](001a-review.md) |
 | 001B | 纯领域核心与确定性旅行原型 | 正式测试及 Node smoke 通过 | [001b-domain](001b-domain.md) |
 | 001-V | 真实依赖锁文件及完整测试 | 完成 | [001-validation](001-validation.md) |
-| 002 | app-service 和持久化原型 | 待开发 | — |
+| 002A | SQLite 事务仓库、版本化迁移 | 开发机测试通过 | [002a-storage](002a-storage.md) |
+| 002B | 应用用例与原子结算 | 集成中 | — |
+| 002C | 独立子进程验证 | 集成中 | — |
 | 003 | 宿主、preload 与双 renderer 原型 | 待开发 | — |
 | 004 | 角色渲染及最小端到端闭环 | 待开发 | — |
 | 005 | Windows 安装包与真机 P0 验收 | 待开发 | — |

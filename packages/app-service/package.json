@@ -1,0 +1,19 @@
+{
+  "name": "@pet-desktop/app-service",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": "./src/index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@pet-desktop/contracts": "workspace:*",
+    "@pet-desktop/domain": "workspace:*"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3",
+    "vitest": "4.0.18"
+  }
+}

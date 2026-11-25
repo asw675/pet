@@ -1,0 +1,139 @@
+import type {
+  Activity, AppSnapshot, DomainEvent, HealthStatus, IpcErrorCode, Mood, Presence, Visibility,
+} from '@pet-desktop/contracts';
+import type { RewardDraft, TripCheckpoint, TripFact, TripSnapshot } from '@pet-desktop/domain';
+
+/** Storage numbers are fixed-point tenths. Renderer DTOs use 0–100. */
+export interface PetRecord {
+  petId: string;
+  characterId: string;
+  nickname: string;
+  power: number;
+  presence: Presence;
+  activity: Activity | null;
+  mood: Mood;
+  healthStatus: HealthStatus;
+  visibility: Visibility;
+  moodScore10: number;
+  healthPoints10: number;
+  energy10: number;
+  bond10: number;
+  xp: number;
+  revision: number;
+}
+
+export interface PreferencesRecord {
+  revision: number;
+  logicalTime: number;
+  primaryPetId: string | null;
+  doNotDisturb: boolean;
+  pausedRender: boolean;
+}
+
+export interface TripRecord {
+  snapshot: TripSnapshot;
+  checkpoint: TripCheckpoint;
+  status: 'TRAVELING' | 'SETTLED';
+  reportReadAt: number | null;
+}
+
+export type CommandOutcome =
+  | { ok: true; snapshot: AppSnapshot }
+  | { ok: false; error: { code: IpcErrorCode; message: string; retryable: boolean } };
+
+export interface CommandReceipt {
+  commandId: string;
+  /** Exact canonical serialization of a parsed, closed command. */
+  fingerprint: string;
+  outcome: CommandOutcome;
+  createdAt: number;
+}
+
+export interface RewardLine {
+  rewardKey: string;
+  sourceType: 'TRIP';
+  sourceId: string;
+  petId: string;
+  kind: 'XP' | 'COIN' | 'ITEM' | 'CG';
+  targetId: string;
+  amount: number;
+}
+
+export interface SettlementRecord {
+  tripId: string;
+  settledAt: number;
+  rewards: RewardDraft;
+}
+
+export interface InventoryItem {
+  itemId: string;
+  quantity: number;
+}
+
+export interface CgUnlock {
+  petId: string;
+  cgId: string;
+  variant: string;
+  sourceTripId: string;
+  unlockedAt: number;
+}
+
+export interface OutboxRecord {
+  seq: number;
+  event: DomainEvent;
+}
+
+/** No method is callable from a renderer. Only app-service owns this transaction. */
+export interface AppTransaction {
+  getPreferences(): PreferencesRecord | null;
+  savePreferences(record: PreferencesRecord): void;
+  listPets(): PetRecord[];
+  getPet(petId: string): PetRecord | null;
+  savePet(pet: PetRecord): void;
+  listTrips(): TripRecord[];
+  getTrip(tripId: string): TripRecord | null;
+  insertTrip(trip: TripRecord): void;
+  updateTrip(trip: TripRecord): void;
+  appendTripFacts(tripId: string, facts: readonly TripFact[]): void;
+  listTripFacts(tripId: string): TripFact[];
+  getSettlement(tripId: string): SettlementRecord | null;
+  insertSettlement(settlement: SettlementRecord): boolean;
+  insertReward(line: RewardLine): boolean;
+  listRewards(sourceId: string): RewardLine[];
+  getWalletCoins(): number;
+  setWalletCoins(coins: number): void;
+  listInventory(): InventoryItem[];
+  addInventory(itemId: string, quantity: number): void;
+  listCgUnlocks(petId: string): CgUnlock[];
+  unlockCg(unlock: CgUnlock): boolean;
+  getCommandReceipt(commandId: string): CommandReceipt | null;
+  hasCommandReceipts(): boolean;
+  saveCommandReceipt(receipt: CommandReceipt): void;
+  appendOutbox(event: DomainEvent): void;
+  listOutbox(afterSeq: number, limit: number): OutboxRecord[];
+}
+
+export interface AppRepository {
+  transaction<T>(action: (tx: AppTransaction) => T): T;
+  close(): void;
+}
+
+/** Narrow synchronous SQL interface; both candidate drivers are adapted here. */
+export type SqlValue = string | number | bigint | null | Uint8Array;
+export interface SqlStatement {
+  run(...params: SqlValue[]): { changes: number | bigint };
+  get(...params: SqlValue[]): unknown;
+  all(...params: SqlValue[]): unknown[];
+}
+
+export interface SqliteConnection {
+  exec(sql: string): void;
+  prepare(sql: string): SqlStatement;
+  close(): void;
+}
+
+export interface AppRuntime {
+  now(): number;
+  createId(kind: 'trip' | 'event' | 'request'): string;
+  seed(): number;
+}

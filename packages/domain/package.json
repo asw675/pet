@@ -6,7 +6,8 @@
   "exports": {
     ".": "./src/index.ts",
     "./cg-catalog": "./src/cg-catalog.ts",
-    "./character-catalog": "./src/character-catalog.ts"
+    "./character-catalog": "./src/character-catalog.ts",
+    "./home-simulation": "./src/home-simulation.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",

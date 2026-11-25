@@ -17,7 +17,8 @@
     "#gallery": "./src/gallery.ts",
     "#characters": "./src/characters.ts",
     "#inventory": "./src/inventory.ts",
-    "#travel": "./src/travel.ts"
+    "#travel": "./src/travel.ts",
+    "#events": "./src/events.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",

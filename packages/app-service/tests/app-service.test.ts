@@ -11,10 +11,14 @@ import { ITEM_CATALOG_VERSION } from '@pet-desktop/domain/item-catalog';
 import { ROUTE_CATALOG_VERSION } from '@pet-desktop/domain/route-catalog';
 import { cumulativeXpAtLevel } from '@pet-desktop/domain/progression';
 import type { TripFact } from '@pet-desktop/domain';
+import type { EventHistoryEntry, FrozenEventOccurrence } from '@pet-desktop/domain/event-engine';
+import type { EventListQuery } from '@pet-desktop/contracts/events';
+import type { EventPolicy } from '../src/event-service.js';
 import { AppService } from '../src/app-service.js';
 import type {
   AppRepository, AppRuntime, AppTransaction, CgUnlock, CgUnlockInput, CommandOutcome, CommandReceipt,
   CommerceOperationRecord, HomeScheduleRecord, InventoryItem, ItemInstanceRecord, OutboxRecord, PetAcquisitionRecord, PetEquipmentRecord, PetRecord, PreferencesRecord, RewardLine, SettlementRecord, TripCgAssetPin, TripDepartureLoadoutRecord, TripRecord,
+  EventCgUnlock, EventFinalizationRecord, EventOccurrenceRecord, EventTriggerReceipt,
 } from '../src/ports.js';
 
 const MINUTE = 60_000;
@@ -44,6 +48,9 @@ interface MemoryState {
   commerceOperations: CommerceOperationRecord[];
   cgs: CgUnlock[];
   cgPins: TripCgAssetPin[];
+  eventTriggers: EventTriggerReceipt[];
+  occurrences: EventOccurrenceRecord[];
+  eventCgs: EventCgUnlock[];
   receipts: CommandReceipt[];
   outbox: OutboxRecord[];
 }
@@ -51,7 +58,7 @@ interface MemoryState {
 function emptyState(): MemoryState {
   return { preferences: null, pets: [], acquisitions: [], homeSchedules: [], trips: [], requiredDepartureLoadouts: [], departureLoadouts: [], facts: [], settlements: [], rewards: [],
     wallet: 0, inventory: [], itemInstances: [], retiredItemIds: [], equipment: [], commerceOperations: [],
-    cgs: [], cgPins: [], receipts: [], outbox: [] };
+    cgs: [], cgPins: [], eventTriggers: [], occurrences: [], eventCgs: [], receipts: [], outbox: [] };
 }
 
 /** A transactional fake with value semantics, intentionally independent of SQL. */
@@ -218,12 +225,66 @@ class MemoryRepository implements AppRepository, AppTransaction {
     this.state.cgPins.push(copy(pin));
   }
   listTripCgAssetPins(tripId: string): TripCgAssetPin[] { return copy(this.state.cgPins.filter((pin) => pin.tripId === tripId)); }
+  getEventTriggerReceipt(key: string): EventTriggerReceipt | null {
+    return copy(this.state.eventTriggers.find(row => row.triggerKey === key) ?? null);
+  }
+  insertEventTriggerReceipt(record: EventTriggerReceipt): void {
+    if (this.getEventTriggerReceipt(record.triggerKey)) throw new Error('Duplicate event trigger');
+    this.state.eventTriggers.push(copy(record));
+  }
+  insertEventOccurrence(occurrence: FrozenEventOccurrence): void {
+    if (this.getEventOccurrence(occurrence.occurrenceId)) throw new Error('Duplicate event occurrence');
+    this.state.occurrences.push(copy({ occurrence, status: 'PENDING', resolvedAt: null, choiceId: null, resultText: null, rewards: [], commandId: null }));
+  }
+  getEventOccurrence(id: string): EventOccurrenceRecord | null {
+    return copy(this.state.occurrences.find(row => row.occurrence.occurrenceId === id) ?? null);
+  }
+  listEventHistory(petId: string, at: number): EventHistoryEntry[] {
+    return this.state.occurrences.filter(row => row.occurrence.petId === petId && row.occurrence.occurredAt <= at).map(row => {
+      const { occurrenceId, triggerKey, eventId, eventVersion, occurredAt } = row.occurrence;
+      const final = row.resolvedAt !== null && row.resolvedAt <= at;
+      return { occurrenceId, triggerKey, petId, eventId, eventVersion, occurredAt, status: final ? row.status : 'PENDING',
+        resolvedAt: final ? row.resolvedAt : null, choiceId: final ? row.choiceId : null };
+    });
+  }
+  countPendingEvents(petId?: string): number {
+    return this.state.occurrences.filter(row => row.status === 'PENDING' && (petId === undefined || row.occurrence.petId === petId)).length;
+  }
+  listDueEvents(at: number): EventOccurrenceRecord[] {
+    return copy(this.state.occurrences.filter(row => row.status === 'PENDING' && row.occurrence.deadlineAt !== null && row.occurrence.deadlineAt <= at)
+      .sort((a,b) => a.occurrence.deadlineAt! - b.occurrence.deadlineAt! || (a.occurrence.occurrenceId < b.occurrence.occurrenceId ? -1 : 1)));
+  }
+  listEvents(query: EventListQuery): { total: number; pendingTotal: number; events: EventOccurrenceRecord[] } {
+    const rows = this.state.occurrences.filter(row => (query.petId === undefined || row.occurrence.petId === query.petId)
+      && (query.filter === 'ALL' || (query.filter === 'PENDING') === (row.status === 'PENDING')))
+      .sort((a,b) => b.occurrence.occurredAt - a.occurrence.occurredAt || (a.occurrence.occurrenceId < b.occurrence.occurrenceId ? -1 : 1));
+    return { total: rows.length, pendingTotal: this.countPendingEvents(query.petId), events: copy(rows.slice(query.offset, query.offset+query.limit)) };
+  }
+  finalizeEventOccurrence(record: EventFinalizationRecord): boolean {
+    const existing = this.state.occurrences.find(row => row.occurrence.occurrenceId === record.occurrenceId);
+    if (!existing || existing.status !== 'PENDING') return false;
+    const { occurrenceId: _, ...fields } = record;
+    Object.assign(existing, copy(fields));
+    for (const reward of record.rewards) if (reward.kind === 'CG_UNLOCK' && reward.newlyUnlocked) {
+      const asset = existing.occurrence.asset;
+      if (asset?.state !== 'PINNED') throw new Error('Unpinned event CG');
+      const { cgId, variant, ...assetRef } = asset;
+      this.state.eventCgs.push(copy({ petId: existing.occurrence.petId, cgId, variant, sourceEventId: record.occurrenceId,
+        unlockedAt: record.resolvedAt, assetRef, historicalCharacterId: asset.characterId, historicalEventDefId: asset.eventDefId,
+        favorite: false, viewedAt: null }));
+    }
+    return true;
+  }
+  getEventCgUnlock(petId: string, cgId: string, variant: string): EventCgUnlock | null {
+    return copy(this.state.eventCgs.find(row => row.petId === petId && row.cgId === cgId && row.variant === variant) ?? null);
+  }
+  listEventCgUnlocks(petId: string): EventCgUnlock[] { return copy(this.state.eventCgs.filter(row => row.petId === petId)); }
   getCgUnlock(petId: string, cgId: string, variant: string): CgUnlock | null {
     return copy(this.state.cgs.find((cg) => cg.petId === petId && cg.cgId === cgId && cg.variant === variant) ?? null);
   }
   listCgUnlocks(petId: string): CgUnlock[] { return copy(this.state.cgs.filter((cg) => cg.petId === petId)); }
   unlockCg(unlock: CgUnlockInput): boolean {
-    if (this.getCgUnlock(unlock.petId, unlock.cgId, unlock.variant) !== null) return false;
+    if (this.getCgUnlock(unlock.petId, unlock.cgId, unlock.variant) !== null || this.getEventCgUnlock(unlock.petId, unlock.cgId, unlock.variant) !== null) return false;
     const pin = this.state.cgPins.find((entry) => entry.tripId === unlock.sourceTripId && entry.petId === unlock.petId
       && entry.cgId === unlock.cgId && entry.variant === unlock.variant);
     this.state.cgs.push(copy({ ...unlock, assetRef: pin?.assetRef ?? { state: 'LEGACY_UNVERSIONED' },
@@ -232,7 +293,7 @@ class MemoryRepository implements AppRepository, AppTransaction {
     return true;
   }
   setCgFavorite(petId: string, cgId: string, variant: string, favorite: boolean): boolean {
-    const existing = this.state.cgs.find((cg) => cg.petId === petId && cg.cgId === cgId && cg.variant === variant);
+    const existing = [...this.state.cgs, ...this.state.eventCgs].find((cg) => cg.petId === petId && cg.cgId === cgId && cg.variant === variant);
     if (!existing) throw new Error('Missing CG');
     if (existing.favorite === favorite) return false;
     existing.favorite = favorite;
@@ -240,7 +301,7 @@ class MemoryRepository implements AppRepository, AppTransaction {
   }
   markCgViewed(petId: string, cgId: string, variant: string, characterId: string, eventDefId: string,
     assetVersion: string, assetHash: string, viewedAt: number): boolean {
-    const existing = this.state.cgs.find((cg) => cg.petId === petId && cg.cgId === cgId && cg.variant === variant);
+    const existing = [...this.state.cgs, ...this.state.eventCgs].find((cg) => cg.petId === petId && cg.cgId === cgId && cg.variant === variant);
     const ref = existing?.assetRef;
     if (!existing || ref?.state !== 'PINNED' || ref.characterId !== characterId || ref.eventDefId !== eventDefId
       || ref.assetVersion !== assetVersion || ref.assetHash !== assetHash) throw new Error('Missing historical CG');
@@ -279,10 +340,10 @@ class FakeRuntime implements AppRuntime {
   }
 }
 
-function fixture() {
+function fixture(policy: EventPolicy = false) {
   const repo = new MemoryRepository();
   const runtime = new FakeRuntime();
-  const service = new AppService(repo, runtime);
+  const service = new AppService(repo, runtime, policy);
   return { repo, runtime, service };
 }
 
@@ -549,7 +610,7 @@ describe('deterministic, atomic offline settlement', () => {
           service.getSnapshot();
           service.close();
           repo = new MemoryRepository(repo.state);
-          service = new AppService(repo, runtime);
+          service = new AppService(repo, runtime, false);
         }
       }
       runtime.at = START + OFFLINE_72H;
@@ -566,7 +627,7 @@ describe('deterministic, atomic offline settlement', () => {
       const settled = copy(repo.state);
       service.getSnapshot();
       service.close();
-      service = new AppService(new MemoryRepository(settled), runtime);
+      service = new AppService(new MemoryRepository(settled), runtime, false);
       expect(service.getSnapshot().walletCoins).toBe(16);
       return repo.state;
     }
@@ -607,7 +668,7 @@ describe('deterministic, atomic offline settlement', () => {
       expect(repo.state).toEqual(before);
       service.close();
       const reopened = new MemoryRepository(repo.state);
-      expect(() => new AppService(reopened, runtime)).toThrow();
+      expect(() => new AppService(reopened, runtime, false)).toThrow();
       expect(reopened.state).toEqual(before);
     }
   });
@@ -627,7 +688,7 @@ describe('deterministic, atomic offline settlement', () => {
     expect(repo.getCommandReceipt('corrupt-report')).toBeNull();
     service.close();
     const reopened = new MemoryRepository(repo.state);
-    expect(() => new AppService(reopened, runtime)).toThrow();
+    expect(() => new AppService(reopened, runtime, false)).toThrow();
     expect(reopened.state).toEqual(before);
   });
 
@@ -639,7 +700,7 @@ describe('deterministic, atomic offline settlement', () => {
     service.close();
     runtime.at = START + OFFLINE_72H;
     const reopened = new MemoryRepository(repo.state);
-    const recovered = new AppService(reopened, runtime);
+    const recovered = new AppService(reopened, runtime, false);
     expect(reopened.getPet('pet-1')).toMatchObject({ presence: 'HOME', xp: 4 });
     expect(reopened.getSettlement(tripId)!.settledAt).toBe(START + 6 * MINUTE);
     expect(reopened.getPreferences()!.logicalTime).toBe(runtime.at);
@@ -691,9 +752,10 @@ describe('historical CG acquisition and gallery projection', () => {
   it('projects both pets with only locked metadata, has stable pagination, and filters on the authority', () => {
     const { service } = fixture();
     const { gallery } = requestGallery(service);
-    expect(gallery.total).toBe(2);
+    expect(gallery.total).toBe(4);
     expect(gallery.rows.map((row) => [row.petId, row.characterId, row.unlockStatus])).toEqual([
-      ['pet-1', 'star-singer', 'LOCKED'], ['pet-2', 'fluffy-ranger', 'LOCKED'],
+      ['pet-1', 'star-singer', 'LOCKED'], ['pet-1', 'star-singer', 'LOCKED'],
+      ['pet-2', 'fluffy-ranger', 'LOCKED'], ['pet-2', 'fluffy-ranger', 'LOCKED'],
     ]);
     for (const row of gallery.rows) {
       expect(Object.keys(row).sort()).toEqual([
@@ -701,9 +763,9 @@ describe('historical CG acquisition and gallery projection', () => {
       ].sort());
     }
     expect(requestGallery(service, { ...galleryQuery, offset: 1, limit: 1 }).gallery.rows).toEqual([gallery.rows[1]]);
-    expect(requestGallery(service, { ...galleryQuery, offset: 2, limit: 1 }).gallery.rows).toEqual([]);
+    expect(requestGallery(service, { ...galleryQuery, offset: 4, limit: 1 }).gallery.rows).toEqual([]);
     expect(requestGallery(service, { ...galleryQuery, petId: 'pet-2', characterId: 'fluffy-ranger', filter: 'LOCKED',
-      routeId: DEMO_ROUTE.routeId, eventDefId: 'dew-postcard', rarity: 'COMMON' }).gallery.rows).toEqual([gallery.rows[1]]);
+      routeId: DEMO_ROUTE.routeId, eventDefId: 'dew-postcard', rarity: 'COMMON' }).gallery.rows).toEqual([gallery.rows.find(row => row.petId === 'pet-2' && row.cgId === 'morning-dew')]);
     expect(requestGallery(service, { ...galleryQuery, petId: 'pet-2', characterId: 'star-singer' }).gallery.total).toBe(0);
     expect(requestGallery(service, { ...galleryQuery, filter: 'FAVORITES' }).gallery.total).toBe(0);
     expect(service.handleRequest({ schemaVersion: 1, requestId: 'bad-pet', method: 'gallery/list',
@@ -972,7 +1034,7 @@ describe('authoritative character catalog, acquisition and nickname', () => {
     legacy.pets[1]!.nickname = '历史角色';
     const reopened = new MemoryRepository(legacy);
     runtime.at += 100_000;
-    const service = new AppService(reopened, runtime);
+    const service = new AppService(reopened, runtime, false);
     const result = requestCharacters(service);
     expect(result.snapshot.pets.find(pet => pet.petId === 'pet-2')).toMatchObject({ characterId: 'retired-character', nickname: '历史角色' });
     expect(result.characters.rows.find(row => row.characterId === 'star-singer')?.instances)

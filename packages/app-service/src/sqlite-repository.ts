@@ -6,19 +6,23 @@ import type { CgAssetRef, DomainEvent } from '@pet-desktop/contracts';
 import type { EquipmentSlot } from '@pet-desktop/contracts/inventory';
 import { travelReportsQuerySchema } from '@pet-desktop/contracts/travel';
 import type { TripDepartureLoadout, TravelReportsQuery } from '@pet-desktop/contracts/travel';
+import { eventListQuerySchema } from '@pet-desktop/contracts/events';
+import type { EventListQuery, EventReward } from '@pet-desktop/contracts/events';
+import { EVENT_LIMITS, EVENT_TRIGGERS, resolveEventOccurrence, validateFrozenOccurrence } from '@pet-desktop/domain/event-engine';
+import type { EventEffectDraft, EventHistoryEntry, FrozenEventOccurrence } from '@pet-desktop/domain/event-engine';
 import { canonicalTripDepartureLoadout, validateTripDepartureLoadoutRecord } from '#trip-departure-storage';
 import { advanceTrip, MAX_TRIP_FACTS, MAX_TRIP_NODES } from '@pet-desktop/domain';
 import type { RewardDraft, TripCheckpoint, TripFact, TripSnapshot } from '@pet-desktop/domain';
 import type {
   AppRepository, AppTransaction, CgUnlock, CgUnlockInput, CommandOutcome, CommandReceipt, CommerceMaterialAmount, CommerceOperationRecord,
-  InventoryItem, ItemInstanceRecord, OutboxRecord, PetEquipmentRecord,
+  EventCgUnlock, EventFinalizationRecord, EventOccurrenceRecord, EventTriggerReceipt, InventoryItem, ItemInstanceRecord, OutboxRecord, PetEquipmentRecord,
   HomeScheduleRecord, PetAcquisitionRecord, PetRecord, PreferencesRecord, RewardLine, SettlementRecord, SqliteConnection, TripCgAssetPin, TripDepartureLoadoutRecord, TripRecord,
 } from './ports.js';
 
 const MAX_SAFE = Number.MAX_SAFE_INTEGER;
 const UINT32_MAX = 0xffff_ffff;
 const BUSY_TIMEOUT_MS = 5_000;
-const SCHEMA_VERSION = 6;
+const SCHEMA_VERSION = 7;
 const JSON_SCHEMA_VERSION = 1;
 const MIGRATION_001_JSON_SCHEMA_VERSION = 1;
 const MIGRATION_001_MAX_TRIP_FACTS = 14;
@@ -637,7 +641,7 @@ const migration006ReceiptMatches = (receipt: string, loadout: string, trip: stri
     WHEN 'TRIP_START' THEN ${trip}.route_id='morning-dew-meadow'
       AND NOT EXISTS (SELECT 1 FROM trip_departure_supplies c WHERE c.trip_id=${trip}.trip_id)
     ELSE 0 END`;
-const MIGRATION_006 = `
+export const MIGRATION_006 = `
 CREATE TABLE trip_departure_loadouts (
   trip_id TEXT PRIMARY KEY NOT NULL REFERENCES trips(trip_id),
   command_id TEXT NOT NULL UNIQUE CHECK (${idCheck('command_id')}),
@@ -726,6 +730,194 @@ WHEN EXISTS (SELECT 1 FROM trip_departure_loadouts l WHERE l.command_id=OLD.comm
 BEGIN SELECT RAISE(ABORT, 'trip departure receipt is immutable'); END;
 `;
 
+// Separate immutable occurrence and finalization rows make finalization a
+// compare-and-set insert. Deferred references forbid partial selection,
+// automatic resolution, effect evidence, acquisition or choice receipts.
+const MIGRATION_007 = `
+CREATE TABLE event_trigger_receipts (
+  trigger_key TEXT PRIMARY KEY NOT NULL CHECK(length(trigger_key) BETWEEN 1 AND 512 AND length(trim(trigger_key))>0),
+  pet_id TEXT NOT NULL REFERENCES pets(pet_id),
+  trigger_kind TEXT NOT NULL CHECK(trigger_kind IN ('HOME_DAILY','AFTER_INTERACTION','TRIP_RETURNED','BOND_MILESTONE')),
+  seed INTEGER NOT NULL CHECK(seed BETWEEN 1 AND ${UINT32_MAX}),
+  at INTEGER NOT NULL CHECK(${unsigned('at')}),
+  rng_state INTEGER NOT NULL CHECK(rng_state BETWEEN 1 AND ${UINT32_MAX}),
+  draw_count INTEGER NOT NULL CHECK(draw_count BETWEEN 0 AND 2),
+  source_trip_id TEXT REFERENCES trips(trip_id), route_id TEXT CHECK(${idCheck('route_id')}),
+  decision TEXT NOT NULL CHECK(decision IN ('NO_EVENT','OCCURRENCE')),
+  reason TEXT CHECK(reason IN ('NO_ELIGIBLE','CHANCE_MISS','TRIGGER_ALREADY_SEEN','TRIGGER_INELIGIBLE')),
+  occurrence_id TEXT UNIQUE REFERENCES event_occurrences(occurrence_id) DEFERRABLE INITIALLY DEFERRED,
+  CHECK((trigger_kind='TRIP_RETURNED' AND source_trip_id IS NOT NULL AND route_id IS NOT NULL)
+    OR (trigger_kind<>'TRIP_RETURNED' AND source_trip_id IS NULL AND route_id IS NULL)),
+  CHECK((decision='OCCURRENCE' AND reason IS NULL AND occurrence_id IS NOT NULL AND draw_count=2)
+    OR (decision='NO_EVENT' AND occurrence_id IS NULL AND reason IS NOT NULL
+      AND ((reason='CHANCE_MISS' AND draw_count=1) OR (reason<>'CHANCE_MISS' AND draw_count=0)))),
+  CHECK(draw_count<>0 OR seed=rng_state)
+) STRICT;
+CREATE UNIQUE INDEX one_trip_event_trigger ON event_trigger_receipts(source_trip_id) WHERE source_trip_id IS NOT NULL;
+CREATE UNIQUE INDEX one_daily_event_trigger ON event_trigger_receipts(pet_id,at/86400000) WHERE trigger_kind='HOME_DAILY';
+CREATE TABLE event_occurrences (
+  occurrence_id TEXT PRIMARY KEY NOT NULL CHECK(${idCheck('occurrence_id')}),
+  trigger_key TEXT NOT NULL UNIQUE REFERENCES event_trigger_receipts(trigger_key),
+  pet_id TEXT NOT NULL REFERENCES pets(pet_id),
+  event_id TEXT NOT NULL CHECK(${idCheck('event_id')}), event_version INTEGER NOT NULL CHECK(event_version BETWEEN 1 AND 1000000),
+  occurred_at INTEGER NOT NULL CHECK(${unsigned('occurred_at')}), deadline_at INTEGER CHECK(${unsigned('deadline_at')} AND deadline_at>occurred_at),
+  frozen_json TEXT NOT NULL CHECK(${jsonObject('frozen_json')}),
+  auto_finalization_id TEXT REFERENCES event_finalizations(occurrence_id) DEFERRABLE INITIALLY DEFERRED,
+  CHECK(json_extract(frozen_json,'$.schemaVersion') IS 1 AND json_extract(frozen_json,'$.rulesVersion') IS 'event-v1'
+    AND json_extract(frozen_json,'$.occurrenceId') IS occurrence_id AND json_extract(frozen_json,'$.triggerKey') IS trigger_key
+    AND json_extract(frozen_json,'$.petId') IS pet_id AND json_extract(frozen_json,'$.eventId') IS event_id
+    AND json_extract(frozen_json,'$.eventVersion') IS event_version AND json_extract(frozen_json,'$.occurredAt') IS occurred_at
+    AND json_extract(frozen_json,'$.deadlineAt') IS deadline_at AND json_type(frozen_json,'$.choices') IS 'array'
+    AND json_type(frozen_json,'$.effects') IS 'array'),
+  CHECK((deadline_at IS NULL AND auto_finalization_id IS occurrence_id AND json_array_length(frozen_json,'$.choices')=0)
+    OR (deadline_at IS NOT NULL AND auto_finalization_id IS NULL AND json_array_length(frozen_json,'$.choices') BETWEEN 2 AND 8))
+) STRICT;
+CREATE INDEX event_occurrence_history ON event_occurrences(occurred_at DESC,occurrence_id ASC);
+CREATE INDEX event_pet_history ON event_occurrences(pet_id,occurred_at DESC,occurrence_id ASC);
+CREATE INDEX event_occurrence_due ON event_occurrences(deadline_at,occurrence_id) WHERE deadline_at IS NOT NULL;
+CREATE TABLE event_finalizations (
+  occurrence_id TEXT PRIMARY KEY NOT NULL REFERENCES event_occurrences(occurrence_id),
+  status TEXT NOT NULL CHECK(status IN ('RESOLVED','EXPIRED')),
+  resolved_at INTEGER NOT NULL CHECK(${unsigned('resolved_at')}), choice_id TEXT CHECK(${idCheck('choice_id')}),
+  result_text TEXT NOT NULL CHECK(length(result_text) BETWEEN 1 AND 2048),
+  command_id TEXT UNIQUE REFERENCES commands(command_id) DEFERRABLE INITIALLY DEFERRED
+) STRICT;
+CREATE TABLE event_effects (
+  occurrence_id TEXT NOT NULL REFERENCES event_finalizations(occurrence_id) DEFERRABLE INITIALLY DEFERRED,
+  kind TEXT NOT NULL CHECK(kind IN ('MOOD_DELTA','BOND_DELTA','COIN','ITEM','CG_UNLOCK')),
+  target_id TEXT NOT NULL, variant TEXT CHECK(${idCheck('variant')}), amount INTEGER NOT NULL,
+  unlock_event_id TEXT UNIQUE REFERENCES event_cg_unlocks(source_event_id) DEFERRABLE INITIALLY DEFERRED,
+  PRIMARY KEY(occurrence_id,kind,target_id),
+  CHECK(CASE kind WHEN 'MOOD_DELTA' THEN target_id='' AND variant IS NULL AND amount BETWEEN -200 AND 200 AND unlock_event_id IS NULL
+    WHEN 'BOND_DELTA' THEN target_id='' AND variant IS NULL AND amount BETWEEN -200 AND 200 AND unlock_event_id IS NULL
+    WHEN 'COIN' THEN target_id='' AND variant IS NULL AND amount BETWEEN 1 AND 1000 AND unlock_event_id IS NULL
+    WHEN 'ITEM' THEN ${idCheck('target_id')} AND variant IS NULL AND amount BETWEEN 1 AND 100 AND unlock_event_id IS NULL
+    WHEN 'CG_UNLOCK' THEN ${idCheck('target_id')} AND variant IS NOT NULL AND ((amount=1 AND unlock_event_id IS occurrence_id) OR (amount=0 AND unlock_event_id IS NULL))
+    ELSE 0 END)
+) STRICT;
+CREATE TABLE event_cg_unlocks (
+  pet_id TEXT NOT NULL REFERENCES pets(pet_id), cg_id TEXT NOT NULL CHECK(${idCheck('cg_id')}), variant TEXT NOT NULL CHECK(${idCheck('variant')}),
+  source_event_id TEXT NOT NULL UNIQUE REFERENCES event_finalizations(occurrence_id), unlocked_at INTEGER NOT NULL CHECK(${unsigned('unlocked_at')}),
+  historical_character_id TEXT NOT NULL CHECK(${idCheck('historical_character_id')}), historical_event_def_id TEXT NOT NULL CHECK(${idCheck('historical_event_def_id')}),
+  asset_version TEXT NOT NULL CHECK(${migration002VersionCheck('asset_version')}), asset_hash TEXT NOT NULL CHECK(${migration002HashCheck('asset_hash')}),
+  favorite INTEGER NOT NULL DEFAULT 0 CHECK(favorite IN (0,1)), viewed_at INTEGER CHECK(${unsigned('viewed_at')} AND viewed_at>=unlocked_at),
+  PRIMARY KEY(pet_id,cg_id,variant)
+) STRICT;
+-- Resolve the available branches from the frozen definition, never today's
+-- catalog. Aggregate exact non-need effects; actual clamped need deltas may
+-- only move in the draft direction, up to its magnitude.
+CREATE VIEW event_frozen_effect_totals AS
+WITH branches AS (
+  SELECT occurrence_id,NULL AS choice_id,'[]' AS branch_effects FROM event_occurrences WHERE deadline_at IS NULL
+  UNION ALL SELECT o.occurrence_id,json_extract(c.value,'$.choiceId'),json_extract(c.value,'$.effects')
+    FROM event_occurrences o JOIN json_each(o.frozen_json,'$.choices') c
+), effects AS (
+  SELECT b.occurrence_id,b.choice_id,e.value AS effect FROM branches b JOIN event_occurrences o USING(occurrence_id) JOIN json_each(o.frozen_json,'$.effects') e
+  UNION ALL SELECT b.occurrence_id,b.choice_id,e.value FROM branches b JOIN json_each(b.branch_effects) e
+), lines AS (
+  SELECT e.occurrence_id,e.choice_id,json_extract(e.effect,'$.kind') AS kind,
+    CASE json_extract(e.effect,'$.kind') WHEN 'ITEM' THEN json_extract(e.effect,'$.itemId')
+      WHEN 'CG_UNLOCK' THEN json_extract(o.frozen_json,'$.asset.cgId') ELSE '' END AS target_id,
+    CASE json_extract(e.effect,'$.kind') WHEN 'ITEM' THEN json_extract(e.effect,'$.quantity') WHEN 'COIN' THEN json_extract(e.effect,'$.amount')
+      WHEN 'CG_UNLOCK' THEN 1 ELSE json_extract(e.effect,'$.delta10') END AS amount
+    FROM effects e JOIN event_occurrences o USING(occurrence_id)
+)
+SELECT occurrence_id,choice_id,kind,target_id,sum(amount) AS amount FROM lines GROUP BY occurrence_id,choice_id,kind,target_id;
+CREATE TRIGGER validate_event_trigger_receipt BEFORE INSERT ON event_trigger_receipts
+WHEN EXISTS(SELECT 1 FROM event_trigger_receipts r WHERE r.trigger_key=NEW.trigger_key OR r.occurrence_id=NEW.occurrence_id
+    OR r.source_trip_id=NEW.source_trip_id OR (NEW.trigger_kind='HOME_DAILY' AND r.trigger_kind='HOME_DAILY' AND r.pet_id=NEW.pet_id AND r.at/86400000=NEW.at/86400000))
+  OR NOT EXISTS(SELECT 1 FROM preferences p WHERE p.singleton=1 AND p.logical_time>=NEW.at)
+  OR (NEW.source_trip_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM trips t WHERE t.trip_id=NEW.source_trip_id AND t.pet_id=NEW.pet_id
+    AND t.route_id=NEW.route_id AND t.status='SETTLED' AND t.actual_returned_at=NEW.at))
+BEGIN SELECT RAISE(ABORT,'invalid or duplicate immutable event trigger receipt'); END;
+CREATE TRIGGER freeze_event_trigger_receipt BEFORE UPDATE ON event_trigger_receipts BEGIN SELECT RAISE(ABORT,'event trigger receipt is immutable'); END;
+CREATE TRIGGER preserve_event_trigger_receipt BEFORE DELETE ON event_trigger_receipts BEGIN SELECT RAISE(ABORT,'event trigger receipt is immutable'); END;
+CREATE TRIGGER validate_event_occurrence BEFORE INSERT ON event_occurrences
+WHEN EXISTS(SELECT 1 FROM event_occurrences o WHERE o.occurrence_id=NEW.occurrence_id OR o.trigger_key=NEW.trigger_key)
+  OR NOT EXISTS(SELECT 1 FROM event_trigger_receipts r JOIN pets p USING(pet_id) JOIN pet_states s USING(pet_id)
+    WHERE r.trigger_key=NEW.trigger_key AND r.decision='OCCURRENCE' AND r.occurrence_id=NEW.occurrence_id AND r.pet_id=NEW.pet_id
+    AND r.at=NEW.occurred_at AND r.seed=json_extract(NEW.frozen_json,'$.seed') AND r.trigger_kind=json_extract(NEW.frozen_json,'$.trigger')
+    AND r.route_id IS json_extract(NEW.frozen_json,'$.routeId') AND r.source_trip_id IS json_extract(NEW.frozen_json,'$.sourceTripId')
+    AND p.character_id=json_extract(NEW.frozen_json,'$.characterId') AND s.presence='HOME')
+  OR (SELECT count(*) FROM event_occurrences o LEFT JOIN event_finalizations f USING(occurrence_id) WHERE o.pet_id=NEW.pet_id AND f.occurrence_id IS NULL)>=3
+BEGIN SELECT RAISE(ABORT,'event occurrence requires its exact selection receipt and pending capacity'); END;
+CREATE TRIGGER freeze_event_occurrence BEFORE UPDATE ON event_occurrences BEGIN SELECT RAISE(ABORT,'frozen event occurrence is immutable'); END;
+CREATE TRIGGER preserve_event_occurrence BEFORE DELETE ON event_occurrences BEGIN SELECT RAISE(ABORT,'frozen event occurrence is immutable'); END;
+CREATE TRIGGER validate_new_event_effect BEFORE INSERT ON event_effects
+WHEN EXISTS(SELECT 1 FROM event_finalizations f WHERE f.occurrence_id=NEW.occurrence_id)
+  OR NOT EXISTS(SELECT 1 FROM event_occurrences o WHERE o.occurrence_id=NEW.occurrence_id)
+  OR EXISTS(SELECT 1 FROM event_effects e WHERE e.occurrence_id=NEW.occurrence_id AND e.kind=NEW.kind AND e.target_id=NEW.target_id)
+  OR (SELECT count(*) FROM event_effects e WHERE e.occurrence_id=NEW.occurrence_id)>=14
+BEGIN SELECT RAISE(ABORT,'invalid or immutable event effect evidence'); END;
+CREATE TRIGGER freeze_event_effect BEFORE UPDATE ON event_effects BEGIN SELECT RAISE(ABORT,'event effect evidence is immutable'); END;
+CREATE TRIGGER preserve_event_effect BEFORE DELETE ON event_effects BEGIN SELECT RAISE(ABORT,'event effect evidence is immutable'); END;
+CREATE TRIGGER validate_event_finalization BEFORE INSERT ON event_finalizations
+WHEN EXISTS(SELECT 1 FROM event_finalizations f WHERE f.occurrence_id=NEW.occurrence_id OR f.command_id=NEW.command_id)
+  OR EXISTS(SELECT 1 FROM commands c WHERE c.command_id=NEW.command_id)
+  OR NOT EXISTS(SELECT 1 FROM event_occurrences o JOIN preferences p ON p.singleton=1 WHERE o.occurrence_id=NEW.occurrence_id
+    AND NEW.resolved_at BETWEEN o.occurred_at AND p.logical_time
+    AND ((o.deadline_at IS NULL AND NEW.status='RESOLVED' AND NEW.choice_id IS NULL AND NEW.command_id IS NULL
+        AND NEW.resolved_at=o.occurred_at AND NEW.result_text=json_extract(o.frozen_json,'$.narrative.text'))
+      OR (o.deadline_at IS NOT NULL AND EXISTS(SELECT 1 FROM json_each(o.frozen_json,'$.choices') c
+        WHERE json_extract(c.value,'$.choiceId')=NEW.choice_id AND json_extract(c.value,'$.resultText')=NEW.result_text)
+        AND ((NEW.status='EXPIRED' AND NEW.command_id IS NULL AND NEW.resolved_at=o.deadline_at AND NEW.choice_id=json_extract(o.frozen_json,'$.defaultChoiceId'))
+          OR (NEW.status='RESOLVED' AND NEW.command_id IS NOT NULL AND NEW.resolved_at<o.deadline_at))))
+    AND NOT EXISTS(SELECT 1 FROM event_frozen_effect_totals d WHERE d.occurrence_id=o.occurrence_id AND d.choice_id IS NEW.choice_id AND d.amount<>0
+      AND NOT EXISTS(SELECT 1 FROM event_effects e WHERE e.occurrence_id=o.occurrence_id AND e.kind=d.kind AND e.target_id=d.target_id
+        AND CASE d.kind WHEN 'MOOD_DELTA' THEN e.amount BETWEEN min(0,d.amount) AND max(0,d.amount)
+          WHEN 'BOND_DELTA' THEN e.amount BETWEEN min(0,d.amount) AND max(0,d.amount)
+          WHEN 'CG_UNLOCK' THEN d.amount=1 AND json_extract(o.frozen_json,'$.asset.state')='PINNED'
+            AND e.variant=json_extract(o.frozen_json,'$.asset.variant') AND e.amount=CASE WHEN
+              EXISTS(SELECT 1 FROM cg_unlocks g WHERE g.pet_id=o.pet_id AND g.cg_id=e.target_id AND g.variant=e.variant)
+              OR EXISTS(SELECT 1 FROM event_cg_unlocks g WHERE g.pet_id=o.pet_id AND g.cg_id=e.target_id AND g.variant=e.variant) THEN 0 ELSE 1 END
+          ELSE e.amount=d.amount END))
+    AND NOT EXISTS(SELECT 1 FROM event_effects e WHERE e.occurrence_id=o.occurrence_id AND NOT EXISTS(
+      SELECT 1 FROM event_frozen_effect_totals d WHERE d.occurrence_id=o.occurrence_id AND d.choice_id IS NEW.choice_id AND d.kind=e.kind
+        AND d.target_id=e.target_id AND d.amount<>0)))
+BEGIN SELECT RAISE(ABORT,'event finalization requires its exact pending branch and effect evidence'); END;
+CREATE TRIGGER freeze_event_finalization BEFORE UPDATE ON event_finalizations BEGIN SELECT RAISE(ABORT,'event finalization is immutable'); END;
+CREATE TRIGGER preserve_event_finalization BEFORE DELETE ON event_finalizations BEGIN SELECT RAISE(ABORT,'event finalization is immutable'); END;
+CREATE TRIGGER validate_event_cg_acquisition BEFORE INSERT ON event_cg_unlocks
+WHEN NEW.favorite<>0 OR NEW.viewed_at IS NOT NULL OR EXISTS(SELECT 1 FROM event_cg_unlocks g WHERE g.source_event_id=NEW.source_event_id
+  OR (g.pet_id=NEW.pet_id AND g.cg_id=NEW.cg_id AND g.variant=NEW.variant))
+  OR EXISTS(SELECT 1 FROM cg_unlocks g WHERE g.pet_id=NEW.pet_id AND g.cg_id=NEW.cg_id AND g.variant=NEW.variant)
+  OR NOT EXISTS(SELECT 1 FROM event_occurrences o JOIN event_finalizations f USING(occurrence_id) JOIN event_effects e USING(occurrence_id)
+    WHERE o.occurrence_id=NEW.source_event_id AND o.pet_id=NEW.pet_id AND f.resolved_at=NEW.unlocked_at AND e.kind='CG_UNLOCK'
+    AND e.target_id=NEW.cg_id AND e.variant=NEW.variant AND e.amount=1 AND e.unlock_event_id=NEW.source_event_id
+    AND json_extract(o.frozen_json,'$.asset.state')='PINNED' AND json_extract(o.frozen_json,'$.asset.cgId')=NEW.cg_id
+    AND json_extract(o.frozen_json,'$.asset.variant')=NEW.variant AND json_extract(o.frozen_json,'$.asset.characterId')=NEW.historical_character_id
+    AND json_extract(o.frozen_json,'$.asset.eventDefId')=NEW.historical_event_def_id AND json_extract(o.frozen_json,'$.asset.assetVersion')=NEW.asset_version
+    AND json_extract(o.frozen_json,'$.asset.assetHash')=NEW.asset_hash)
+BEGIN SELECT RAISE(ABORT,'event CG requires exact finalized first-acquisition evidence'); END;
+CREATE TRIGGER event_cg_excludes_trip BEFORE INSERT ON cg_unlocks
+WHEN EXISTS(SELECT 1 FROM event_cg_unlocks g WHERE g.pet_id=NEW.pet_id AND g.cg_id=NEW.cg_id AND g.variant=NEW.variant)
+BEGIN SELECT RAISE(ABORT,'CG first acquisition already belongs to an event'); END;
+CREATE TRIGGER freeze_event_cg_acquisition BEFORE UPDATE ON event_cg_unlocks
+WHEN OLD.pet_id IS NOT NEW.pet_id OR OLD.cg_id IS NOT NEW.cg_id OR OLD.variant IS NOT NEW.variant OR OLD.source_event_id IS NOT NEW.source_event_id
+  OR OLD.unlocked_at IS NOT NEW.unlocked_at OR OLD.historical_character_id IS NOT NEW.historical_character_id OR OLD.historical_event_def_id IS NOT NEW.historical_event_def_id
+  OR OLD.asset_version IS NOT NEW.asset_version OR OLD.asset_hash IS NOT NEW.asset_hash OR (OLD.viewed_at IS NOT NULL AND OLD.viewed_at IS NOT NEW.viewed_at)
+BEGIN SELECT RAISE(ABORT,'event CG acquisition and first view are immutable'); END;
+CREATE TRIGGER preserve_event_cg_acquisition BEFORE DELETE ON event_cg_unlocks BEGIN SELECT RAISE(ABORT,'event CG acquisition is immutable'); END;
+CREATE TRIGGER validate_event_choice_receipt BEFORE INSERT ON commands
+WHEN (EXISTS(SELECT 1 FROM event_finalizations f WHERE f.command_id=NEW.command_id)
+  OR (json_extract(NEW.fingerprint,'$.type')='EVENT_CHOOSE' AND json_type(NEW.outcome_json,'$.ok')='true'))
+  AND (EXISTS(SELECT 1 FROM commands c WHERE c.command_id=NEW.command_id) OR NOT EXISTS(
+    SELECT 1 FROM event_finalizations f JOIN event_occurrences o USING(occurrence_id) WHERE f.command_id=NEW.command_id AND f.status='RESOLVED'
+      AND NEW.created_at=f.resolved_at AND json_extract(NEW.fingerprint,'$.type')='EVENT_CHOOSE' AND json_type(NEW.outcome_json,'$.ok')='true'
+      AND json_extract(NEW.fingerprint,'$.commandId')=NEW.command_id AND json_extract(NEW.fingerprint,'$.payload.petId')=o.pet_id
+      AND json_extract(NEW.fingerprint,'$.payload.occurrenceId')=f.occurrence_id AND json_extract(NEW.fingerprint,'$.payload.choiceId')=f.choice_id
+      AND json_type(NEW.fingerprint,'$.expectedRevision')='integer' AND json_extract(NEW.outcome_json,'$.snapshot.revision')=json_extract(NEW.fingerprint,'$.expectedRevision')+1
+      AND EXISTS(SELECT 1 FROM preferences p WHERE p.singleton=1 AND p.revision=json_extract(NEW.outcome_json,'$.snapshot.revision') AND p.logical_time=NEW.created_at)
+      AND EXISTS(SELECT 1 FROM wallet w WHERE w.balance=json_extract(NEW.outcome_json,'$.snapshot.walletCoins'))))
+BEGIN SELECT RAISE(ABORT,'event choice requires exact immutable finalization and successful receipt'); END;
+CREATE TRIGGER freeze_event_choice_receipt BEFORE UPDATE ON commands
+WHEN EXISTS(SELECT 1 FROM event_finalizations f WHERE f.command_id=OLD.command_id)
+  OR (json_extract(NEW.fingerprint,'$.type')='EVENT_CHOOSE' AND json_type(NEW.outcome_json,'$.ok')='true')
+BEGIN SELECT RAISE(ABORT,'event choice receipt is immutable'); END;
+CREATE TRIGGER preserve_event_choice_receipt BEFORE DELETE ON commands WHEN EXISTS(SELECT 1 FROM event_finalizations f WHERE f.command_id=OLD.command_id)
+BEGIN SELECT RAISE(ABORT,'event choice receipt is immutable'); END;
+`;
+
 const MIGRATIONS = Object.freeze([
   { version: 1, sql: MIGRATION_001 },
   { version: 2, sql: MIGRATION_002 },
@@ -733,6 +925,7 @@ const MIGRATIONS = Object.freeze([
   { version: 4, sql: MIGRATION_004 },
   { version: 5, sql: MIGRATION_005 },
   { version: 6, sql: MIGRATION_006 },
+  { version: 7, sql: MIGRATION_007 },
 ]);
 
 /** FNV-1a is a migration-change detector, not a security signature. */
@@ -822,6 +1015,100 @@ function canonicalJson(value: unknown): string {
 
 function sameJson(a: unknown, b: unknown): boolean {
   return canonicalJson(a) === canonicalJson(b);
+}
+
+const eventNoReasons = ['NO_ELIGIBLE','CHANCE_MISS','TRIGGER_ALREADY_SEEN','TRIGGER_INELIGIBLE'] as const;
+function eventTriggerKey(value: unknown): string {
+  const key=string(value,'event trigger key',EVENT_LIMITS.triggerKey);
+  if (!key.trim() || /[\u0000-\u001f\u007f]/u.test(key)) throw new Error('Invalid event trigger key');
+  return key;
+}
+function validateTriggerReceipt(value: unknown): EventTriggerReceipt {
+  const raw=object(value,'event trigger receipt');
+  const kind=enumeration(raw.kind,'event trigger decision',['NO_EVENT','OCCURRENCE']);
+  const data=closed(raw,'event trigger receipt',['triggerKey','petId','trigger','seed','at','rngState','drawCount','sourceTripId','routeId','kind',kind==='NO_EVENT'?'reason':'occurrenceId']);
+  const trigger=enumeration(data.trigger,'event trigger kind',EVENT_TRIGGERS),seed=integer(data.seed,'event seed',1,UINT32_MAX);
+  const drawCount=integer(data.drawCount,'event draw count',0,2) as 0|1|2;
+  const rngState=integer(data.rngState,'event RNG state',1,UINT32_MAX);
+  let expected=seed;
+  for(let n=0;n<drawCount;n++){let x=expected|0;x^=x<<13;x^=x>>>17;x^=x<<5;expected=x>>>0;}
+  if(rngState!==expected)throw new Error('Event RNG audit contradicts seed and draw count');
+  const common={triggerKey:eventTriggerKey(data.triggerKey),petId:id(data.petId),trigger,seed,at:integer(data.at,'event trigger time'),rngState,drawCount,
+    sourceTripId:data.sourceTripId===null?null:id(data.sourceTripId),routeId:data.routeId===null?null:id(data.routeId)};
+  if((trigger==='TRIP_RETURNED')!==(common.sourceTripId!==null)||(trigger==='TRIP_RETURNED')!==(common.routeId!==null))throw new Error('Event trigger provenance is invalid');
+  if(kind==='NO_EVENT'){
+    const reason=enumeration(data.reason,'event no-selection reason',eventNoReasons);
+    if(drawCount!==(reason==='CHANCE_MISS'?1:0))throw new Error('Event no-selection audit contradicts reason');
+    return {...common,kind,reason};
+  }
+  if(drawCount!==2)throw new Error('Selected event requires two RNG draws');
+  return {...common,kind,occurrenceId:id(data.occurrenceId)};
+}
+function eventReceiptFromRow(value: unknown): EventTriggerReceipt {
+  const row=object(value,'event trigger row');
+  if((row.decision==='NO_EVENT'&&row.occurrence_id!==null)||(row.decision==='OCCURRENCE'&&row.reason!==null))throw new Error('Corrupt event trigger receipt');
+  return validateTriggerReceipt({triggerKey:row.trigger_key,petId:row.pet_id,trigger:row.trigger_kind,seed:row.seed,at:row.at,
+    rngState:row.rng_state,drawCount:row.draw_count,sourceTripId:row.source_trip_id,routeId:row.route_id,kind:row.decision,
+    ...(row.decision==='NO_EVENT'?{reason:row.reason}:{occurrenceId:row.occurrence_id})});
+}
+function validateStoredFrozenOccurrence(value: unknown): FrozenEventOccurrence {
+  const occurrence=validateFrozenOccurrence(value);
+  if(occurrence.asset?.state==='PINNED'){
+    const {characterId,eventDefId,assetVersion,assetHash}=occurrence.asset;
+    cgAssetRefSchema.parse({state:'PINNED',characterId,eventDefId,assetVersion,assetHash});
+  }
+  return occurrence;
+}
+const eventEffectKinds=['MOOD_DELTA','BOND_DELTA','COIN','ITEM','CG_UNLOCK'] as const;
+function eventRewardFromRow(value: unknown): EventReward {
+  const row=object(value,'event effect row'),kind=enumeration(row.kind,'event effect kind',eventEffectKinds);
+  switch(kind){
+    case 'MOOD_DELTA':case 'BOND_DELTA':return {kind,delta10:integer(row.amount,'applied event need delta',-200,200)};
+    case 'COIN':return {kind,amount:integer(row.amount,'event coin reward',1,1000)};
+    case 'ITEM':return {kind,itemId:id(row.target_id),quantity:integer(row.amount,'event item reward',1,100)};
+    case 'CG_UNLOCK':return {kind,cgId:id(row.target_id),variant:id(row.variant),newlyUnlocked:sqlBoolean(row.amount,'event first CG acquisition')};
+  }
+}
+function validateEventRewards(value: unknown): EventReward[] {
+  const rewards=array(value,'event rewards',14).map(raw=>{
+    const entry=object(raw,'event reward'),kind=enumeration(entry.kind,'event reward kind',eventEffectKinds);
+    switch(kind){
+      case 'MOOD_DELTA':case 'BOND_DELTA':closed(entry,'event need reward',['kind','delta10']);return {kind,delta10:integer(entry.delta10,'event need delta',-200,200)};
+      case 'COIN':closed(entry,'event coin reward',['kind','amount']);return {kind,amount:integer(entry.amount,'event coin reward',1,1000)};
+      case 'ITEM':closed(entry,'event item reward',['kind','itemId','quantity']);return {kind,itemId:id(entry.itemId),quantity:integer(entry.quantity,'event item reward',1,100)};
+      case 'CG_UNLOCK':closed(entry,'event CG reward',['kind','cgId','variant','newlyUnlocked']);return {kind,cgId:id(entry.cgId),variant:id(entry.variant),newlyUnlocked:boolean(entry.newlyUnlocked,'CG first acquisition')};
+    }
+  }) satisfies EventReward[];
+  const keys=rewards.map(r=>r.kind==='ITEM'?`ITEM:${r.itemId}`:r.kind);
+  if(new Set(keys).size!==keys.length)throw new Error('Duplicate event reward identity');
+  return rewards.sort((a,b)=>eventEffectKinds.indexOf(a.kind)-eventEffectKinds.indexOf(b.kind)
+    || (a.kind==='ITEM'&&b.kind==='ITEM'?(a.itemId<b.itemId?-1:a.itemId>b.itemId?1:0):0));
+}
+function validateEventFinalization(value: unknown,occurrence: FrozenEventOccurrence): {record:EventFinalizationRecord;draft:EventEffectDraft} {
+  const data=closed(value,'event finalization',['occurrenceId','status','resolvedAt','choiceId','resultText','rewards','commandId']);
+  const record:EventFinalizationRecord={occurrenceId:id(data.occurrenceId),status:enumeration(data.status,'event final status',['RESOLVED','EXPIRED']),
+    resolvedAt:integer(data.resolvedAt,'event resolution time'),choiceId:data.choiceId===null?null:id(data.choiceId),
+    resultText:string(data.resultText,'event result text',2048),rewards:validateEventRewards(data.rewards),commandId:data.commandId===null?null:id(data.commandId)};
+  const common={occurrenceId:record.occurrenceId,petId:occurrence.petId,status:'PENDING' as const,at:record.resolvedAt};
+  const request=record.status==='EXPIRED'?{...common,kind:'EXPIRE' as const}:record.choiceId===null?{...common,kind:'AUTO' as const}
+    :{...common,kind:'CHOICE' as const,choiceId:record.choiceId};
+  const resolution=resolveEventOccurrence(occurrence,request);
+  if(!resolution.ok||resolution.status!==record.status||resolution.resolvedAt!==record.resolvedAt||resolution.choiceId!==record.choiceId
+    ||resolution.resultText!==record.resultText||(request.kind==='CHOICE')!==(record.commandId!==null))throw new Error('Event finalization contradicts its frozen branch');
+  const draft=resolution.effects;
+  for(const [kind,requested] of [['MOOD_DELTA',draft.moodDelta10],['BOND_DELTA',draft.bondDelta10]] as const){
+    const reward=record.rewards.find(r=>r.kind===kind);
+    if(requested===0?reward!==undefined:!reward||!('delta10' in reward)||reward.delta10<Math.min(0,requested)||reward.delta10>Math.max(0,requested)){
+      throw new Error('Event reward contradicts the frozen need delta');
+    }
+  }
+  const coin=record.rewards.find(r=>r.kind==='COIN');
+  if((coin?.amount??0)!==draft.coins)throw new Error('Event reward contradicts frozen coins');
+  const items=record.rewards.filter((r):r is Extract<EventReward,{kind:'ITEM'}>=>r.kind==='ITEM').map(({itemId,quantity})=>({itemId,quantity}));
+  if(!sameJson(items,draft.items))throw new Error('Event reward contradicts frozen items');
+  const cg=record.rewards.find(r=>r.kind==='CG_UNLOCK');
+  if(draft.cgUnlock===null?cg!==undefined:!cg||cg.cgId!==draft.cgUnlock.cgId||cg.variant!==draft.cgUnlock.variant)throw new Error('Event reward contradicts frozen CG');
+  return {record,draft};
 }
 
 function jsonVersion(row: ObjectMap): void {
@@ -1596,6 +1883,113 @@ class SQLiteTransaction implements AppTransaction {
       .all('TRIP', id(sourceId)).map(rewardFromRow);
   }
 
+  getEventTriggerReceipt(triggerKey: string): EventTriggerReceipt | null {
+    const row=this.db.prepare('SELECT * FROM event_trigger_receipts WHERE trigger_key=?').get(eventTriggerKey(triggerKey));
+    return row===undefined||row===null?null:eventReceiptFromRow(row);
+  }
+
+  insertEventTriggerReceipt(value: EventTriggerReceipt): void {
+    const record=validateTriggerReceipt(value);
+    this.db.prepare(`INSERT INTO event_trigger_receipts(trigger_key,pet_id,trigger_kind,seed,at,rng_state,draw_count,source_trip_id,route_id,decision,reason,occurrence_id)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`).run(record.triggerKey,record.petId,record.trigger,record.seed,record.at,record.rngState,record.drawCount,
+        record.sourceTripId,record.routeId,record.kind,record.kind==='NO_EVENT'?record.reason:null,record.kind==='OCCURRENCE'?record.occurrenceId:null);
+  }
+
+  insertEventOccurrence(value: FrozenEventOccurrence): void {
+    const occurrence=validateStoredFrozenOccurrence(value);
+    this.db.prepare(`INSERT INTO event_occurrences(occurrence_id,trigger_key,pet_id,event_id,event_version,occurred_at,deadline_at,frozen_json,auto_finalization_id)
+      VALUES(?,?,?,?,?,?,?,?,?)`).run(occurrence.occurrenceId,occurrence.triggerKey,occurrence.petId,occurrence.eventId,occurrence.eventVersion,
+        occurrence.occurredAt,occurrence.deadlineAt,canonicalJson(occurrence),occurrence.deadlineAt===null?occurrence.occurrenceId:null);
+  }
+
+  private eventOccurrenceFromRow(value: unknown): EventOccurrenceRecord {
+    const db=this.db,row=object(value,'event occurrence row'),occurrence=validateStoredFrozenOccurrence(parseJson(row.frozen_json,'frozen event JSON'));
+    if(row.occurrence_id!==occurrence.occurrenceId||row.trigger_key!==occurrence.triggerKey||row.pet_id!==occurrence.petId
+      ||row.event_id!==occurrence.eventId||row.event_version!==occurrence.eventVersion||row.occurred_at!==occurrence.occurredAt||row.deadline_at!==occurrence.deadlineAt
+      ||row.auto_finalization_id!==(occurrence.deadlineAt===null?occurrence.occurrenceId:null))throw new Error('Frozen event contradicts indexed identity');
+    const receipt=this.getEventTriggerReceipt(occurrence.triggerKey);
+    if(receipt===null||receipt.kind!=='OCCURRENCE'||receipt.occurrenceId!==occurrence.occurrenceId||receipt.petId!==occurrence.petId
+      ||receipt.trigger!==occurrence.trigger||receipt.seed!==occurrence.seed||receipt.at!==occurrence.occurredAt
+      ||receipt.sourceTripId!==occurrence.sourceTripId||receipt.routeId!==occurrence.routeId)throw new Error('Frozen event contradicts its trigger receipt');
+    const final=db.prepare('SELECT * FROM event_finalizations WHERE occurrence_id=?').get(occurrence.occurrenceId);
+    const effects=db.prepare('SELECT * FROM event_effects WHERE occurrence_id=? ORDER BY kind,target_id').all(occurrence.occurrenceId);
+    if(final===undefined||final===null){
+      if(effects.length!==0)throw new Error('Pending event has premature effect evidence');
+      return {occurrence,status:'PENDING',resolvedAt:null,choiceId:null,resultText:null,rewards:[],commandId:null};
+    }
+    const f=object(final,'event finalization row');
+    const {record}=validateEventFinalization({occurrenceId:f.occurrence_id,status:f.status,resolvedAt:f.resolved_at,choiceId:f.choice_id,
+      resultText:f.result_text,commandId:f.command_id,rewards:effects.map(eventRewardFromRow)},occurrence);
+    return {occurrence,status:record.status,resolvedAt:record.resolvedAt,choiceId:record.choiceId,resultText:record.resultText,rewards:record.rewards,commandId:record.commandId};
+  }
+
+  getEventOccurrence(occurrenceId: string): EventOccurrenceRecord | null {
+    const value=this.db.prepare('SELECT * FROM event_occurrences WHERE occurrence_id=?').get(id(occurrenceId));
+    return value===undefined||value===null?null:this.eventOccurrenceFromRow(value);
+  }
+
+  listEventHistory(petId: string, at: number): EventHistoryEntry[] {
+    const time=integer(at,'event history time');
+    const rows=this.db.prepare(`SELECT o.occurrence_id,o.trigger_key,o.pet_id,o.event_id,o.event_version,o.occurred_at,f.status,f.resolved_at,f.choice_id
+      FROM event_occurrences o LEFT JOIN event_finalizations f USING(occurrence_id) WHERE o.pet_id=? AND o.occurred_at<=?
+      ORDER BY o.occurred_at ASC,o.occurrence_id ASC LIMIT ?`).all(id(petId),time,EVENT_LIMITS.history+1);
+    if(rows.length>EVENT_LIMITS.history)throw new Error('Event history exceeds deterministic engine limit');
+    return rows.map(value=>{
+      const r=object(value,'event history row'),occurredAt=integer(r.occurred_at,'event history time',0,time);
+      const resolvedAt=r.resolved_at===null?null:integer(r.resolved_at,'event history resolution',occurredAt);
+      const pending=resolvedAt===null||resolvedAt>time;
+      return {occurrenceId:id(r.occurrence_id),triggerKey:eventTriggerKey(r.trigger_key),petId:id(r.pet_id),eventId:id(r.event_id),
+        eventVersion:integer(r.event_version,'event history version',1,EVENT_LIMITS.version),occurredAt,status:pending?'PENDING':enumeration(r.status,'event history status',['RESOLVED','EXPIRED']),
+        resolvedAt:pending?null:resolvedAt,choiceId:pending||r.choice_id===null?null:id(r.choice_id)};
+    });
+  }
+
+  countPendingEvents(petId?: string): number {
+    const parameters=petId===undefined?[]:[id(petId)];
+    return integer(object(this.db.prepare(`SELECT count(*) AS count FROM event_occurrences o LEFT JOIN event_finalizations f USING(occurrence_id)
+      WHERE f.occurrence_id IS NULL${petId===undefined?'':' AND o.pet_id=?'}`).get(...parameters),'pending event count').count,'pending event count');
+  }
+
+  listDueEvents(at: number): EventOccurrenceRecord[] {
+    return this.db.prepare(`SELECT o.* FROM event_occurrences o LEFT JOIN event_finalizations f USING(occurrence_id)
+      WHERE f.occurrence_id IS NULL AND o.deadline_at<=? ORDER BY o.deadline_at ASC,o.occurrence_id ASC`)
+      .all(integer(at,'event due query time')).map(row=>this.eventOccurrenceFromRow(row));
+  }
+
+  listEvents(raw: EventListQuery): {total:number;pendingTotal:number;events:EventOccurrenceRecord[]} {
+    const query=eventListQuerySchema.parse(raw),parameters=query.petId===undefined?[]:[query.petId];
+    const filter=`WHERE 1=1${query.petId===undefined?'':' AND o.pet_id=?'}${query.filter==='PENDING'?' AND f.occurrence_id IS NULL':query.filter==='HISTORY'?' AND f.occurrence_id IS NOT NULL':''}`;
+    const from='FROM event_occurrences o LEFT JOIN event_finalizations f USING(occurrence_id)';
+    const total=integer(object(this.db.prepare(`SELECT count(*) AS count ${from} ${filter}`).get(...parameters),'event page count').count,'event page count');
+    const events=this.db.prepare(`SELECT o.* ${from} ${filter} ORDER BY o.occurred_at DESC,o.occurrence_id ASC LIMIT ? OFFSET ?`)
+      .all(...parameters,query.limit,query.offset).map(row=>this.eventOccurrenceFromRow(row));
+    return {total,pendingTotal:this.countPendingEvents(query.petId),events};
+  }
+
+  finalizeEventOccurrence(value: EventFinalizationRecord): boolean {
+    const db=this.db,existing=this.getEventOccurrence(id(value.occurrenceId));
+    if(existing===null)throw new Error('Event finalization requires an existing occurrence');
+    if(existing.status!=='PENDING')return false;
+    const {record,draft}=validateEventFinalization(value,existing.occurrence),petId=existing.occurrence.petId;
+    const cg=record.rewards.find(r=>r.kind==='CG_UNLOCK');
+    if(cg&&(cg.newlyUnlocked!==(this.getCgUnlock(petId,cg.cgId,cg.variant)===null&&this.getEventCgUnlock(petId,cg.cgId,cg.variant)===null)))
+      throw new Error('Event CG reward contradicts first acquisition');
+    for(const reward of record.rewards){
+      const targetId=reward.kind==='ITEM'?reward.itemId:reward.kind==='CG_UNLOCK'?reward.cgId:'';
+      const amount=reward.kind==='ITEM'?reward.quantity:reward.kind==='COIN'?reward.amount:reward.kind==='CG_UNLOCK'?Number(reward.newlyUnlocked):reward.delta10;
+      db.prepare('INSERT INTO event_effects VALUES(?,?,?,?,?,?)').run(record.occurrenceId,reward.kind,targetId,reward.kind==='CG_UNLOCK'?reward.variant:null,
+        amount,reward.kind==='CG_UNLOCK'&&reward.newlyUnlocked?record.occurrenceId:null);
+    }
+    db.prepare('INSERT INTO event_finalizations VALUES(?,?,?,?,?,?)').run(record.occurrenceId,record.status,record.resolvedAt,record.choiceId,record.resultText,record.commandId);
+    if(cg?.newlyUnlocked){
+      const asset=draft.cgUnlock;
+      if(asset===null)throw new Error('Event CG reward has no pinned asset');
+      db.prepare(`INSERT INTO event_cg_unlocks(pet_id,cg_id,variant,source_event_id,unlocked_at,historical_character_id,historical_event_def_id,asset_version,asset_hash)
+        VALUES(?,?,?,?,?,?,?,?,?)`).run(petId,asset.cgId,asset.variant,record.occurrenceId,record.resolvedAt,asset.characterId,asset.eventDefId,asset.assetVersion,asset.assetHash);
+    }
+    return true;
+  }
+
   getWalletCoins(): number {
     const row = object(this.db.prepare('SELECT balance FROM wallet WHERE currency=?').get('coin'), 'wallet row');
     return integer(row.balance, 'coin balance');
@@ -1806,6 +2200,30 @@ class SQLiteTransaction implements AppTransaction {
       .map(value => this.checkedCgUnlock(value));
   }
 
+  private checkedEventCgUnlock(value: unknown): EventCgUnlock {
+    const row=object(value,'event CG unlock row'),petId=id(row.pet_id),cgId=id(row.cg_id),variant=id(row.variant),sourceEventId=id(row.source_event_id);
+    const unlockedAt=integer(row.unlocked_at,'event CG unlock time'),viewedAt=nullableInteger(row.viewed_at,'event CG first view time');
+    const historicalCharacterId=id(row.historical_character_id),historicalEventDefId=id(row.historical_event_def_id);
+    const ref=cgAssetRefSchema.parse({state:'PINNED',characterId:historicalCharacterId,eventDefId:historicalEventDefId,assetVersion:row.asset_version,assetHash:row.asset_hash});
+    const source=this.getEventOccurrence(sourceEventId),asset=source?.occurrence.asset;
+    if(ref.state!=='PINNED'||!source||source.status==='PENDING'||source.resolvedAt!==unlockedAt||source.occurrence.petId!==petId||asset?.state!=='PINNED'
+      ||asset.cgId!==cgId||asset.variant!==variant||asset.characterId!==historicalCharacterId||asset.eventDefId!==historicalEventDefId
+      ||asset.assetVersion!==ref.assetVersion||asset.assetHash!==ref.assetHash||(viewedAt!==null&&viewedAt<unlockedAt)
+      ||!source.rewards.some(r=>r.kind==='CG_UNLOCK'&&r.cgId===cgId&&r.variant===variant&&r.newlyUnlocked)
+      ||this.getCgUnlock(petId,cgId,variant)!==null)throw new Error('Event CG contradicts its first-acquisition frozen occurrence');
+    return {petId,cgId,variant,sourceEventId,unlockedAt,historicalCharacterId,historicalEventDefId,assetRef:ref,
+      favorite:sqlBoolean(row.favorite,'event CG favorite'),viewedAt};
+  }
+
+  getEventCgUnlock(petId: string,cgId: string,variant: string): EventCgUnlock | null {
+    const row=this.db.prepare('SELECT * FROM event_cg_unlocks WHERE pet_id=? AND cg_id=? AND variant=?').get(id(petId),id(cgId),id(variant));
+    return row===undefined||row===null?null:this.checkedEventCgUnlock(row);
+  }
+
+  listEventCgUnlocks(petId: string): EventCgUnlock[] {
+    return this.db.prepare('SELECT * FROM event_cg_unlocks WHERE pet_id=? ORDER BY cg_id,variant').all(id(petId)).map(row=>this.checkedEventCgUnlock(row));
+  }
+
   unlockCg(record: CgUnlockInput): boolean {
     const db = this.db, unlock = validateCgUnlockInput(record);
     const existing = this.getCgUnlock(unlock.petId, unlock.cgId, unlock.variant);
@@ -1828,7 +2246,7 @@ class SQLiteTransaction implements AppTransaction {
     if (pin !== null && pin.petId !== unlock.petId) throw new Error('Departure pin belongs to another pet');
     // A valid later acquisition cannot rewrite the first unlock, even if its
     // newer content version or availability differs from the first pin.
-    if (existing !== null) return false;
+    if (existing !== null || this.getEventCgUnlock(unlock.petId,unlock.cgId,unlock.variant)!==null) return false;
     const assetRef: CgAssetRef = pin?.assetRef ?? { state: 'LEGACY_UNVERSIONED' };
     const [assetVersion, assetHash] = cgVersionHash(assetRef);
     db.prepare(`INSERT INTO cg_unlocks (pet_id,cg_id,variant,source_trip_id,unlocked_at,asset_state,
@@ -1839,10 +2257,10 @@ class SQLiteTransaction implements AppTransaction {
   }
 
   setCgFavorite(petId: string, cgId: string, variant: string, favorite: boolean): boolean {
-    const unlock = this.getCgUnlock(petId, cgId, variant), next = boolean(favorite, 'CG favorite');
+    const tripUnlock=this.getCgUnlock(petId,cgId,variant),unlock=tripUnlock??this.getEventCgUnlock(petId,cgId,variant),next=boolean(favorite,'CG favorite');
     if (unlock === null) throw new Error('CG has not been unlocked');
     if (unlock.favorite === next) return false;
-    const result = this.db.prepare('UPDATE cg_unlocks SET favorite=? WHERE pet_id=? AND cg_id=? AND variant=?')
+    const result = this.db.prepare(`UPDATE ${tripUnlock===null?'event_cg_unlocks':'cg_unlocks'} SET favorite=? WHERE pet_id=? AND cg_id=? AND variant=?`)
       .run(Number(next), unlock.petId, unlock.cgId, unlock.variant);
     if (integer(result.changes, 'CG favorite change count') !== 1) throw new Error('CG favorite update failed');
     return true;
@@ -1850,14 +2268,14 @@ class SQLiteTransaction implements AppTransaction {
 
   markCgViewed(petId: string, cgId: string, variant: string, characterId: string, eventDefId: string,
     assetVersion: string, assetHash: string, viewedAt: number): boolean {
-    const unlock = this.getCgUnlock(petId, cgId, variant);
+    const tripUnlock=this.getCgUnlock(petId,cgId,variant),unlock=tripUnlock??this.getEventCgUnlock(petId,cgId,variant);
     const expectedRef = cgAssetRefSchema.parse({ state: 'PINNED', characterId, eventDefId, assetVersion, assetHash });
     const timestamp = integer(viewedAt, 'CG first view time');
     if (unlock === null) throw new Error('CG has not been unlocked');
     if (unlock.assetRef.state !== 'PINNED' || !sameJson(unlock.assetRef, expectedRef)) throw new Error('CG view requires its exact pinned asset identity');
     if (timestamp < unlock.unlockedAt) throw new Error('CG first view cannot precede unlock');
     if (unlock.viewedAt !== null) return false;
-    const result = this.db.prepare('UPDATE cg_unlocks SET viewed_at=? WHERE pet_id=? AND cg_id=? AND variant=? AND viewed_at IS NULL')
+    const result = this.db.prepare(`UPDATE ${tripUnlock===null?'event_cg_unlocks':'cg_unlocks'} SET viewed_at=? WHERE pet_id=? AND cg_id=? AND variant=? AND viewed_at IS NULL`)
       .run(timestamp, unlock.petId, unlock.cgId, unlock.variant);
     if (integer(result.changes, 'CG first view change count') !== 1) throw new Error('CG first view update failed');
     return true;
@@ -2004,6 +2422,7 @@ function migrate(db: SqliteConnection, persistent: boolean, beforeMigration?: (f
         receipts: rowCount(db, 'SELECT count(*) AS count FROM commands'),
       } : null;
       const oldDepartureTripCount = migration.version === 6 ? rowCount(db,'SELECT count(*) AS count FROM trips') : null;
+      const oldEventCounts=migration.version===7?Object.fromEntries(['pets','trips','cg_unlocks','commands','reward_ledger'].map(table=>[table,rowCount(db,`SELECT count(*) AS count FROM ${table}`)])):null;
       db.exec(migration.sql);
       if (oldCounts !== null && (oldCounts.trips !== rowCount(db, 'SELECT count(*) AS count FROM trips')
         || oldCounts.unlocks !== rowCount(db, 'SELECT count(*) AS count FROM cg_unlocks')
@@ -2031,6 +2450,10 @@ function migrate(db: SqliteConnection, persistent: boolean, beforeMigration?: (f
         || ['trip_departure_loadouts','trip_departure_supplies','trip_departure_equipment']
           .some(table => rowCount(db,`SELECT count(*) AS count FROM ${table}`) !== 0))) {
         throw new Error('Departure migration changed legacy trips or invented frozen loadouts');
+      }
+      if(oldEventCounts!==null&&(Object.entries(oldEventCounts).some(([table,count])=>rowCount(db,`SELECT count(*) AS count FROM ${table}`)!==count)
+        ||['event_trigger_receipts','event_occurrences','event_finalizations','event_effects','event_cg_unlocks'].some(table=>rowCount(db,`SELECT count(*) AS count FROM ${table}`)!==0))){
+        throw new Error('Event migration changed legacy history or invented narrative occurrences');
       }
       db.prepare('INSERT INTO schema_migrations (version, checksum, applied_at) VALUES (?, ?, ?)')
         .run(migration.version, migrationChecksum(migration.sql), Date.now());

@@ -1,7 +1,9 @@
 <script setup lang="ts">
 import { computed } from 'vue';
 import { RouterLink } from 'vue-router';
+import type { EventListQuery } from '@pet-desktop/contracts/events';
 import { useAppStore } from '../../shared/store';
+import { useEventProjection } from '../useEventProjection';
 import { useNow } from '../useNow';
 import Icon from '../components/Icon.vue';
 import PetCard from '../components/PetCard.vue';
@@ -15,6 +17,9 @@ const companions = computed(() => pets.value.filter((pet) => pet.petId !== prima
 const activeTrips = computed(() => pets.value.filter((pet) => pet.trip?.status === 'TRAVELING'));
 const settledTrips = computed(() => pets.value.filter((pet) => pet.trip?.status === 'SETTLED'));
 const now = useNow();
+const inboxQuery = computed<EventListQuery>(() => ({ filter: 'PENDING', offset: 0, limit: 1 }));
+const { page: inbox, pending: inboxPending, queryError: inboxError, reload: reloadInbox } =
+  useEventProjection(inboxQuery, () => {}, () => {}, { debounceMs: 250 });
 </script>
 
 <template>
@@ -37,7 +42,18 @@ const now = useNow();
         <div v-else class="panel empty-state compact-empty"><p>当前没有其他伙伴。</p></div>
       </section>
     </div>
-    <aside class="dashboard-aside" aria-label="旅行和桌面偏好">
+    <aside class="dashboard-aside" aria-label="故事、旅行和桌面偏好">
+      <section class="panel side-panel">
+        <header class="side-heading"><span class="panel-symbol accent-rose"><Icon name="spark" /></span><div><h2>伙伴的故事信箱</h2><p>真实待回应事件</p></div></header>
+        <div v-if="inbox" class="side-empty">
+          <template v-if="inbox.pendingTotal > 0"><strong>{{ inbox.pendingTotal }} 件故事等你回应</strong><p v-if="inbox.rows[0]">{{ inbox.rows[0].title }} · {{ pets.find(pet => pet.petId === inbox?.rows[0]?.petId)?.nickname ?? inbox.rows[0].characterId }}</p></template>
+          <p v-else>暂时没有待回应的故事。</p>
+        </div>
+        <p v-else class="side-empty">{{ inboxPending ? '正在读取信箱…' : inboxError ? '信箱状态尚未确认。' : '等待事件档案。' }}</p>
+        <p v-if="store.snapshot.doNotDisturb" class="small muted">勿扰模式下仅在此显示，不主动弹窗。</p>
+        <button v-if="inboxError" type="button" class="button button-secondary" :disabled="inboxPending || store.busy || store.loading" @click="reloadInbox">重新读取</button>
+        <RouterLink to="/events" class="panel-link">打开事件箱 <Icon name="arrow" /></RouterLink>
+      </section>
       <section class="panel side-panel">
         <header class="side-heading"><span class="panel-symbol"><Icon name="map" /></span><div><h2>旅途中</h2><p>正在进行的冒险</p></div></header>
         <div v-if="activeTrips.length" class="side-trips"><TripCard v-for="pet in activeTrips" :key="pet.petId" :pet="pet" :now="now" compact /></div>

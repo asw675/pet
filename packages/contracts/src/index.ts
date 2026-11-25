@@ -4,6 +4,7 @@ import { characterCatalogPageSchema, petAcquirePayloadSchema, petRenamePayloadSc
 import { equipmentEquipPayloadSchema, equipmentUnequipPayloadSchema, equipmentUpgradePayloadSchema,
   equipmentSalvagePayloadSchema, inventoryPageSchema, inventoryQuerySchema, itemUsePayloadSchema, shopPurchasePayloadSchema } from '#inventory';
 import { tripPreparationPayloadSchema, travelCatalogSchema, travelPreviewSchema, travelReportsPageSchema, travelReportsQuerySchema } from '#travel';
+import { eventChoosePayloadSchema, eventPageSchema, eventListQuerySchema } from '#events';
 
 /** Independent from the application, database and game-rule versions. */
 export const CONTRACT_SCHEMA_VERSION = 1 as const;
@@ -120,6 +121,7 @@ export const domainCommandSchema = z.discriminatedUnion('type', [
   z.strictObject({ ...commerceCommandFields, type: z.literal('EQUIPMENT_SALVAGE'), payload: equipmentSalvagePayloadSchema }),
   z.strictObject({ ...commerceCommandFields, type: z.literal('ITEM_USE'), payload: itemUsePayloadSchema }),
   z.strictObject({ ...commerceCommandFields, type: z.literal('TRIP_START_PREPARED'), payload: tripPreparationPayloadSchema }),
+  z.strictObject({ ...commerceCommandFields, type: z.literal('EVENT_CHOOSE'), payload: eventChoosePayloadSchema }),
   z.strictObject({
     ...commandFields,
     type: z.literal('PET_SELECT'),
@@ -226,6 +228,7 @@ export const ipcRequestSchema = z.discriminatedUnion('method', [
   z.strictObject({ ...requestFields, method: z.literal('travel/catalog'), payload: z.strictObject({}) }),
   z.strictObject({ ...requestFields, method: z.literal('travel/preview'), payload: tripPreparationPayloadSchema }),
   z.strictObject({ ...requestFields, method: z.literal('travel/reports'), payload: travelReportsQuerySchema }),
+  z.strictObject({ ...requestFields, method: z.literal('events/list'), payload: eventListQuerySchema }),
 ]);
 export type IpcRequest = z.infer<typeof ipcRequestSchema>;
 
@@ -284,6 +287,9 @@ const travelPreviewSuccessSchema = snapshotSuccessSchema.extend({ travelPreview:
 const travelReportsSuccessSchema = snapshotSuccessSchema.extend({ travelReports: travelReportsPageSchema })
   .refine((result) => result.travelReports.revision === result.snapshot.revision
     && result.travelReports.rows.every((report) => result.snapshot.pets.some((pet) => pet.petId === report.petId)), 'Travel reports must belong to current snapshot');
+const eventsSuccessSchema = snapshotSuccessSchema.extend({ events: eventPageSchema })
+  .refine((result) => result.events.revision === result.snapshot.revision && result.events.rows.every((event) =>
+    result.snapshot.pets.some((pet) => pet.petId === event.petId && pet.characterId === event.characterId)), 'Events must belong to current snapshot');
 
 // Old snapshot and persistent command result shape stays exactly as before.
 // The gallery query has a distinct closed success shape plus the same snapshot.
@@ -301,8 +307,10 @@ export const travelPreviewIpcResultSchema = z.union([travelPreviewSuccessSchema,
 export type TravelPreviewIpcResult = z.infer<typeof travelPreviewIpcResultSchema>;
 export const travelReportsIpcResultSchema = z.union([travelReportsSuccessSchema, errorResultSchema]);
 export type TravelReportsIpcResult = z.infer<typeof travelReportsIpcResultSchema>;
+export const eventsIpcResultSchema = z.union([eventsSuccessSchema, errorResultSchema]);
+export type EventsIpcResult = z.infer<typeof eventsIpcResultSchema>;
 export const ipcResultSchema = z.union([snapshotSuccessSchema, gallerySuccessSchema, charactersSuccessSchema, inventorySuccessSchema,
-  travelCatalogSuccessSchema, travelPreviewSuccessSchema, travelReportsSuccessSchema, errorResultSchema]);
+  travelCatalogSuccessSchema, travelPreviewSuccessSchema, travelReportsSuccessSchema, eventsSuccessSchema, errorResultSchema]);
 export type IpcResult = z.infer<typeof ipcResultSchema>;
 
 /** Request correlation includes its method, not merely an equal request ID. */
@@ -314,8 +322,9 @@ export function resultMatchesMethod(method: IpcRequest['method'], result: IpcRes
   if (method === 'travel/catalog') return 'travelCatalog' in result;
   if (method === 'travel/preview') return 'travelPreview' in result;
   if (method === 'travel/reports') return 'travelReports' in result;
+  if (method === 'events/list') return 'events' in result;
   return !('gallery' in result) && !('characters' in result) && !('inventory' in result)
-    && !('travelCatalog' in result) && !('travelPreview' in result) && !('travelReports' in result);
+    && !('travelCatalog' in result) && !('travelPreview' in result) && !('travelReports' in result) && !('events' in result);
 }
 
 /** Explicit renderer-facing API, independent of Electron and transport internals. */

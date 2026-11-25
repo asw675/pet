@@ -4,7 +4,8 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { describe, expect, it } from 'vitest';
 import { advanceTrip, createTripCheckpoint, createTripSnapshot, DEMO_ROUTE } from '@pet-desktop/domain';
-import { MIGRATION_001, MIGRATION_002, MIGRATION_003, MIGRATION_004, MIGRATION_005, SQLiteRepository } from '../src/sqlite-repository.ts';
+import { MIGRATION_001, MIGRATION_002, MIGRATION_003, MIGRATION_004, MIGRATION_005, MIGRATION_006, SQLiteRepository } from '../src/sqlite-repository.ts';
+import { selectEvent, resolveEventOccurrence } from '@pet-desktop/domain/event-engine';
 
 const START = 1_700_000_000_000;
 const pet = (petId = 'pet-a') => ({
@@ -84,6 +85,7 @@ const OLD_MIGRATION_002_CHECKSUM = 'fnv1a32:a0036d79'; // Measured against commi
 const OLD_MIGRATION_003_CHECKSUM = 'fnv1a32:519a9ef3'; // Measured against committed 145901c.
 const OLD_MIGRATION_004_CHECKSUM = 'fnv1a32:0f3c0f0e'; // Measured against committed 23b875d.
 const OLD_MIGRATION_005_CHECKSUM = 'fnv1a32:16a20fb2'; // Measured against committed 750d6fc.
+const OLD_MIGRATION_006_CHECKSUM = 'fnv1a32:c7bfac9e'; // Measured against committed 544cd78.
 const hash = 'a'.repeat(64);
 function departurePin(trip, version = '1.0.0', assetHash = hash) {
   return { tripId: trip.snapshot.tripId, petId: trip.snapshot.petId, cgId: 'postcard', variant: 'default',
@@ -266,23 +268,24 @@ describe('SQLite repository — schema and engine', () => {
     }
   });
 
-  it('creates v1 through v6 in contiguous order with verified pragmas and no memory tables', () => withMemory((repo, db) => {
+  it('creates v1 through v7 in contiguous order with verified pragmas and no memory tables', () => withMemory((repo, db) => {
     expect(db.prepare('PRAGMA journal_mode').get().journal_mode).toBe('memory');
     expect(db.prepare('PRAGMA foreign_keys').get().foreign_keys).toBe(1);
     expect(db.prepare('PRAGMA synchronous').get().synchronous).toBe(2);
     expect(db.prepare('PRAGMA busy_timeout').get().timeout).toBe(5000);
-    expect(db.prepare('PRAGMA user_version').get().user_version).toBe(6);
+    expect(db.prepare('PRAGMA user_version').get().user_version).toBe(7);
     const history = db.prepare('SELECT version, checksum FROM schema_migrations ORDER BY version').all();
-    expect(history.map(row => row.version)).toEqual([1,2,3,4,5,6]);
+    expect(history.map(row => row.version)).toEqual([1,2,3,4,5,6,7]);
     expect(history[0].checksum).toBe(OLD_MIGRATION_CHECKSUM);
     expect(history[1].checksum).toBe(OLD_MIGRATION_002_CHECKSUM);
     expect(history[2].checksum).toBe(OLD_MIGRATION_003_CHECKSUM);
     expect(history[3].checksum).toBe(OLD_MIGRATION_004_CHECKSUM);
     expect(history[4].checksum).toBe(OLD_MIGRATION_005_CHECKSUM);
-    expect(history[5].checksum).toMatch(/^fnv1a32:[0-9a-f]{8}$/);
+    expect(history[5].checksum).toBe(OLD_MIGRATION_006_CHECKSUM);
+    expect(history[6].checksum).toMatch(/^fnv1a32:[0-9a-f]{8}$/);
     expect(db.prepare('SELECT name FROM sqlite_temp_schema').all()).toEqual([]);
     expect(db.prepare("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all().map(row => row.name)).toEqual([
-      'cg_unlocks', 'commands', 'commerce_operation_instances', 'commerce_operation_materials', 'commerce_operations', 'inventory', 'item_instances', 'outbox',
+      'cg_unlocks', 'commands', 'commerce_operation_instances', 'commerce_operation_materials', 'commerce_operations', 'event_cg_unlocks', 'event_effects', 'event_finalizations', 'event_occurrences', 'event_trigger_receipts', 'inventory', 'item_instances', 'outbox',
       'pet_acquisitions', 'pet_equipment', 'pet_home_schedules', 'pet_progression', 'pet_states', 'pets', 'preferences',
       'reward_ledger', 'schema_migrations', 'settlements', 'trip_cg_asset_pins', 'trip_departure_equipment', 'trip_departure_loadouts', 'trip_departure_supplies', 'trip_events', 'trip_reports', 'trips', 'wallet',
     ]);
@@ -426,15 +429,41 @@ function createV5Archive(db) {
   } catch(error){db.exec('ROLLBACK');throw error;}
 }
 
+/** Genuine v6 store with a recorded new-format loadout and its receipt. */
+function createV6Archive(db) {
+  const prior=createV5Archive(db);
+  db.exec('BEGIN IMMEDIATE');
+  try{
+    db.exec(MIGRATION_006);
+    db.prepare('INSERT INTO schema_migrations VALUES(6,?,?)').run(OLD_MIGRATION_006_CHECKSUM,START+5);
+    db.exec('PRAGMA user_version=6');
+    const trip=tripRecord('trip-v6','pet-a',prior.acquired.acquiredAt,DEMO_ROUTE),s=trip.snapshot,c=trip.checkpoint;
+    const equipment=[{slot:'WEAPON',instanceId:prior.item.instanceId,definitionId:prior.item.definitionId,
+      definitionVersion:prior.item.definitionVersion,enhancement:0,bonus:{hp:1,atk:2,def:0,spd:0,luk:0}}];
+    const loadout=departureLoadout([],equipment),record={tripId:s.tripId,commandId:'v6-depart',loadout};
+    db.prepare(`INSERT INTO trips(trip_id,pet_id,route_id,status,seed,snapshot_json,checkpoint_json,json_schema_version,start_at,expected_return_at,
+      actual_returned_at,next_due_at,rules_version,cg_pin_schema,departure_loadout_trip_id) VALUES(?,?,?,'TRAVELING',?,?,?,1,?,?,NULL,?,?,2,?)`)
+      .run(s.tripId,s.petId,s.routeId,s.seed,JSON.stringify(s),JSON.stringify(c),s.startAt,s.expectedReturnAt,c.nextDueAt,s.rulesVersion,s.tripId);
+    db.prepare('INSERT INTO trip_departure_loadouts VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)').run(s.tripId,record.commandId,1,1,1,120,600,100,100,12,8,9,10);
+    db.prepare('INSERT INTO trip_departure_equipment VALUES(?,?,?,?,?,?,?,?,?,?,?)').run(s.tripId,'WEAPON',prior.item.instanceId,prior.item.definitionId,1,0,1,2,0,0,0);
+    db.prepare("UPDATE pet_states SET presence='AWAY',activity=NULL,energy10=480 WHERE pet_id='pet-a'").run();
+    db.prepare('UPDATE preferences SET revision=5').run();
+    const departure=legacyDepartureReceipt(trip,record,{},48,30,5);
+    db.prepare('INSERT INTO commands VALUES(?,?,?,1,?)').run(departure.commandId,departure.fingerprint,JSON.stringify(departure.outcome),departure.createdAt);
+    db.exec('COMMIT');
+    return {...prior,v6Trip:trip,loadout,departure};
+  }catch(error){db.exec('ROLLBACK');throw error;}
+}
+
 describe('SQLite repository — real v1 archive migration', () => {
   it('verifies the old archive, runs a synchronous backup outside the transaction, preserves history and settles legacy in-flight only as unversioned', () => withFile(path => {
     const db = new DatabaseSync(path);
     const { old, active, oldUnlock, final } = createV1Archive(db);
-    const backupPath = `${path}.before-v6`;
+    const backupPath = `${path}.before-v7`;
     let callbacks = 0;
     const repo = new SQLiteRepository(db, { persistent: true, beforeMigration(from, to) {
       callbacks++;
-      expect([from,to]).toEqual([1,6]);
+      expect([from,to]).toEqual([1,7]);
       expect(db.prepare('PRAGMA user_version').get().user_version).toBe(1);
       expect(db.prepare('SELECT version, checksum FROM schema_migrations').all()).toEqual([{ version: 1, checksum: OLD_MIGRATION_CHECKSUM }]);
       expect(db.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
@@ -444,7 +473,7 @@ describe('SQLite repository — real v1 archive migration', () => {
     } });
     try {
       expect(callbacks).toBe(1);
-      expect(db.prepare('PRAGMA user_version').get().user_version).toBe(6);
+      expect(db.prepare('PRAGMA user_version').get().user_version).toBe(7);
       expect(db.prepare('SELECT trip_id, cg_pin_schema FROM trips ORDER BY trip_id').all()).toEqual([
         { trip_id: 'trip-legacy', cg_pin_schema: 1 }, { trip_id: 'trip-old', cg_pin_schema: 1 },
       ]);
@@ -482,12 +511,12 @@ describe('SQLite repository — real v1 archive migration', () => {
       } finally { backup.close(); }
     } finally { repo.close(); }
     const reopened = new DatabaseSync(path);
-    const v6 = new SQLiteRepository(reopened, { persistent: true, beforeMigration() { throw new Error('should not back up v6 again'); } });
+    const v7 = new SQLiteRepository(reopened, { persistent: true, beforeMigration() { throw new Error('should not back up v7 again'); } });
     try {
-      expect(v6.transaction(tx => tx.listCgUnlocks('pet-a'))).toEqual([unlocked(oldUnlock)]);
+      expect(v7.transaction(tx => tx.listCgUnlocks('pet-a'))).toEqual([unlocked(oldUnlock)]);
       expect(reopened.prepare('PRAGMA integrity_check').all().map(row => row.integrity_check)).toEqual(['ok']);
       expect(reopened.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
-    } finally { v6.close(); }
+    } finally { v7.close(); }
   }));
 
   it('refuses to mutate a persistent v1 archive without a successful synchronous backup callback', () => withFile(path => {
@@ -541,25 +570,25 @@ describe('SQLite repository — real v1 archive migration', () => {
       expect(db.prepare('SELECT name FROM sqlite_schema WHERE name=?').get('trip_cg_asset_pins')).toBeUndefined();
       const repo = new SQLiteRepository(db, { persistent: true, beforeMigration });
       expect(backups).toBe(2);
-      expect(db.prepare('PRAGMA user_version').get().user_version).toBe(6);
+      expect(db.prepare('PRAGMA user_version').get().user_version).toBe(7);
       expect(repo.transaction(tx => tx.getCgUnlock('pet-a','postcard','default'))).toEqual(unlocked(oldUnlock));
     } finally { db.close(); }
   }));
 
-  it('verifies all six applied checksums and refuses missing or noncontiguous history on v6 startup', () => withFile(path => {
+  it('verifies all seven applied checksums and refuses missing or noncontiguous history on v7 startup', () => withFile(path => {
     const initial = new DatabaseSync(path);
     new SQLiteRepository(initial, { persistent: true }).close();
     const db = new DatabaseSync(path);
     try {
-      const v6 = db.prepare('SELECT checksum FROM schema_migrations WHERE version=6').get().checksum;
-      for (const [version, checksum] of [[1, OLD_MIGRATION_CHECKSUM],[2, OLD_MIGRATION_002_CHECKSUM],[3,OLD_MIGRATION_003_CHECKSUM],[4,OLD_MIGRATION_004_CHECKSUM],[5,OLD_MIGRATION_005_CHECKSUM],[6,v6]]) {
+      const v7 = db.prepare('SELECT checksum FROM schema_migrations WHERE version=7').get().checksum;
+      for (const [version, checksum] of [[1, OLD_MIGRATION_CHECKSUM],[2, OLD_MIGRATION_002_CHECKSUM],[3,OLD_MIGRATION_003_CHECKSUM],[4,OLD_MIGRATION_004_CHECKSUM],[5,OLD_MIGRATION_005_CHECKSUM],[6,OLD_MIGRATION_006_CHECKSUM],[7,v7]]) {
         db.prepare("UPDATE schema_migrations SET checksum='bad' WHERE version=?").run(version);
         expect(() => new SQLiteRepository(db, { persistent: true })).toThrow(/checksum mismatch/);
         db.prepare('UPDATE schema_migrations SET checksum=? WHERE version=?').run(checksum, version);
       }
-      db.exec('UPDATE schema_migrations SET version=7 WHERE version=2');
+      db.exec('UPDATE schema_migrations SET version=8 WHERE version=2');
       expect(() => new SQLiteRepository(db, { persistent: true })).toThrow(/not contiguous/);
-      db.exec('DELETE FROM schema_migrations WHERE version=7');
+      db.exec('DELETE FROM schema_migrations WHERE version=8');
       expect(() => new SQLiteRepository(db, { persistent: true })).toThrow(/history is invalid/);
     } finally { db.close(); }
   }));
@@ -581,13 +610,13 @@ describe('SQLite repository — real v1 archive migration', () => {
 });
 
 describe('SQLite repository — genuine v2 acquisition migration', () => {
-  it('preserves pinned CG/trips/receipt and legacy pets while invoking one v2→v6 pre-backup', () => withFile(path => {
+  it('preserves pinned CG/trips/receipt and legacy pets while invoking one v2→v7 pre-backup', () => withFile(path => {
     const db = new DatabaseSync(path), fixture = createV2Archive(db);
     const backupPath = `${path}.v2-copy`;
     let calls = 0;
     const repo = new SQLiteRepository(db, { persistent:true,beforeMigration(from,to) {
       calls++;
-      expect([from,to]).toEqual([2,6]);
+      expect([from,to]).toEqual([2,7]);
       expect(db.prepare('PRAGMA user_version').get().user_version).toBe(2);
       expect(db.prepare('SELECT version, checksum FROM schema_migrations ORDER BY version').all()).toEqual([
         {version:1,checksum:OLD_MIGRATION_CHECKSUM},{version:2,checksum:OLD_MIGRATION_002_CHECKSUM},
@@ -597,7 +626,7 @@ describe('SQLite repository — genuine v2 acquisition migration', () => {
     } });
     try {
       expect(calls).toBe(1);
-      expect(db.prepare('PRAGMA user_version').get().user_version).toBe(6);
+      expect(db.prepare('PRAGMA user_version').get().user_version).toBe(7);
       expect(db.prepare('SELECT * FROM pet_acquisitions').all()).toEqual([]);
       repo.transaction(tx => {
         expect(tx.listPets().map(p=>p.petId)).toEqual(['pet-a','pet-b','pet-c']);
@@ -675,7 +704,7 @@ describe('SQLite repository — genuine v3 home-clock migration', () => {
     let calls=0;
     const repo=new SQLiteRepository(db,{persistent:true,beforeMigration(from,to){
       calls++;
-      expect([from,to]).toEqual([3,6]);
+      expect([from,to]).toEqual([3,7]);
       expect(db.prepare('PRAGMA user_version').get().user_version).toBe(3);
       expect(db.prepare('SELECT version,checksum FROM schema_migrations ORDER BY version').all()).toEqual([
         {version:1,checksum:OLD_MIGRATION_CHECKSUM},{version:2,checksum:OLD_MIGRATION_002_CHECKSUM},{version:3,checksum:OLD_MIGRATION_003_CHECKSUM},
@@ -685,7 +714,7 @@ describe('SQLite repository — genuine v3 home-clock migration', () => {
     }});
     try{
       expect(calls).toBe(1);
-      expect(db.prepare('PRAGMA user_version').get().user_version).toBe(6);
+      expect(db.prepare('PRAGMA user_version').get().user_version).toBe(7);
       expect(db.prepare('SELECT * FROM pet_home_schedules').all()).toEqual([]);
       repo.transaction(tx=>{
         expect(tx.listPets().map(p=>p.petId)).toEqual(['pet-a','pet-b','pet-c',fixture.acquired.petId]);
@@ -737,13 +766,13 @@ describe('SQLite repository — genuine v4 commerce migration',()=>{
     const db=new DatabaseSync(path),fixture=createV4Archive(db),backupPath=`${path}.v4-backup`;
     let calls=0;
     const repo=new SQLiteRepository(db,{persistent:true,beforeMigration(from,to){
-      calls++;expect([from,to]).toEqual([4,6]);
+      calls++;expect([from,to]).toEqual([4,7]);
       expect(db.prepare('PRAGMA user_version').get().user_version).toBe(4);
       expect(db.prepare('SELECT name FROM sqlite_schema WHERE name=?').get('item_instances')).toBeUndefined();
       db.prepare('VACUUM INTO ?').run(backupPath);
     }});
     try{
-      expect(calls).toBe(1);expect(db.prepare('PRAGMA user_version').get().user_version).toBe(6);
+      expect(calls).toBe(1);expect(db.prepare('PRAGMA user_version').get().user_version).toBe(7);
       repo.transaction(tx=>{
         expect(tx.listInventory()).toEqual(fixture.stacks);
         expect(tx.listItemInstances()).toEqual([]);expect(tx.listPetEquipment()).toEqual([]);expect(tx.getCommerceOperation('absent')).toBeNull();
@@ -791,13 +820,13 @@ describe('SQLite repository — genuine v5 departure migration',()=>{
     const db=new DatabaseSync(path),fixture=createV5Archive(db),backupPath=`${path}.v5-backup`;
     let calls=0;
     const repo=new SQLiteRepository(db,{persistent:true,beforeMigration(from,to){
-      calls++;expect([from,to]).toEqual([5,6]);
+      calls++;expect([from,to]).toEqual([5,7]);
       expect(db.prepare('PRAGMA user_version').get().user_version).toBe(5);
       expect(db.prepare('SELECT name FROM sqlite_schema WHERE name=?').get('trip_departure_loadouts')).toBeUndefined();
       db.prepare('VACUUM INTO ?').run(backupPath);
     }});
     try {
-      expect(calls).toBe(1);expect(db.prepare('PRAGMA user_version').get().user_version).toBe(6);
+      expect(calls).toBe(1);expect(db.prepare('PRAGMA user_version').get().user_version).toBe(7);
       repo.transaction(tx=>{
         expect(tx.listInventory()).toEqual(fixture.stacks);expect(tx.getWalletCoins()).toBe(30);
         expect(tx.getItemInstance(fixture.item.instanceId)).toEqual(fixture.item);
@@ -842,6 +871,51 @@ describe('SQLite repository — genuine v5 departure migration',()=>{
       const repo=new SQLiteRepository(db,{persistent:true,beforeMigration(){}});
       expect(repo.transaction(tx=>[tx.getTripDepartureLoadout('trip-v5'),tx.getCommandReceipt(fixture.oldDeparture.commandId),tx.getCommerceOperation(fixture.operation.commandId)]))
         .toEqual([null,fixture.oldDeparture,fixture.operation]);
+    }finally{db.close();}
+  }));
+});
+
+describe('SQLite repository — genuine v6 narrative migration',()=>{
+  it('makes a verified v6 backup and retains real frozen trip/gear/CG/commerce/receipt history with zero invented events',()=>withFile(path=>{
+    const db=new DatabaseSync(path),fixture=createV6Archive(db),backupPath=`${path}.v6-backup`;
+    let calls=0;
+    const repo=new SQLiteRepository(db,{persistent:true,beforeMigration(from,to){
+      calls++;expect([from,to]).toEqual([6,7]);expect(db.prepare('PRAGMA user_version').get().user_version).toBe(6);
+      expect(db.prepare('SELECT name FROM sqlite_schema WHERE name=?').get('event_occurrences')).toBeUndefined();
+      db.prepare('VACUUM INTO ?').run(backupPath);
+    }});
+    try{
+      expect(calls).toBe(1);expect(db.prepare('PRAGMA user_version').get().user_version).toBe(7);
+      repo.transaction(tx=>{
+        expect(tx.getTrip('trip-v6')).toEqual(fixture.v6Trip);expect(tx.getTripDepartureLoadout('trip-v6')).toEqual(fixture.loadout);
+        expect(tx.getCommandReceipt(fixture.departure.commandId)).toEqual(fixture.departure);
+        expect(tx.getCgUnlock('pet-c','postcard','default')).toEqual(fixture.cg);expect(tx.getCommerceOperation(fixture.operation.commandId)).toEqual(fixture.operation);
+        expect(tx.getWalletCoins()).toBe(30);expect(tx.listInventory()).toEqual(fixture.stacks);
+        expect(tx.listEvents({filter:'ALL',offset:0,limit:30})).toEqual({total:0,pendingTotal:0,events:[]});
+        expect(tx.listEventCgUnlocks('pet-a')).toEqual([]);expect(tx.listDueEvents(START+1_000_000)).toEqual([]);
+      });
+      for(const table of ['event_TRIGGER_receipts','event_occurrences','event_finalizations','event_effects','event_cg_unlocks'])expect(db.prepare(`SELECT count(*) AS n FROM ${table}`).get().n).toBe(0);
+      const backup=new DatabaseSync(backupPath);
+      try{
+        expect(backup.prepare('PRAGMA user_version').get().user_version).toBe(6);
+        expect(backup.prepare('SELECT name FROM sqlite_schema WHERE name=?').get('event_occurrences')).toBeUndefined();
+        expect(backup.prepare('SELECT command_id FROM trip_departure_loadouts WHERE trip_id=?').get('trip-v6').command_id).toBe(fixture.departure.commandId);
+        expect(backup.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
+      }finally{backup.close();}
+    }finally{repo.close();}
+  }));
+  it('refuses a failed backup and rolls back v7 DDL on a genuine v6 store, preserving exact frozen sidecars and receipts',()=>withFile(path=>{
+    const db=new DatabaseSync(path),fixture=createV6Archive(db);
+    const take=()=>Object.fromEntries(['schema_migrations','trips','trip_departure_loadouts','trip_departure_equipment','cg_unlocks','commands'].map(table=>[table,db.prepare(`SELECT * FROM ${table}`).all()]));
+    const before=take(),failing={prepare:sql=>db.prepare(sql),close:()=>db.close(),exec(sql){db.exec(sql);if(sql.includes('CREATE TABLE event_trigger_receipts'))throw new Error('v7 post-DDL fault');}};
+    try{
+      expect(()=>new SQLiteRepository(db,{persistent:true})).toThrow(/pre-migration backup callback/);
+      expect(()=>new SQLiteRepository(db,{persistent:true,beforeMigration(){throw new Error('v6 backup failed');}})).toThrow(/v6 backup failed/);
+      expect(()=>new SQLiteRepository(failing,{persistent:true,beforeMigration(){}})).toThrow(/v7 post-DDL fault/);
+      expect(db.prepare('PRAGMA user_version').get().user_version).toBe(6);expect(take()).toEqual(before);
+      expect(db.prepare('SELECT name FROM sqlite_schema WHERE name=?').get('event_occurrences')).toBeUndefined();
+      const repo=new SQLiteRepository(db,{persistent:true,beforeMigration(){}});
+      expect(repo.transaction(tx=>tx.getTripDepartureLoadout('trip-v6'))).toEqual(fixture.loadout);
     }finally{db.close();}
   }));
 });
@@ -1004,6 +1078,184 @@ describe('SQLite repository — departure authority and immutable history',()=>{
       for(const invalid of [{offset:-1,limit:2},{offset:0,limit:21},{offset:1_000_001,limit:1},{offset:0,limit:1,extra:true}]) expect(()=>page(invalid)).toThrow();
     });
     expect(db.prepare('PRAGMA index_list(trips)').all().map(index=>index.name)).toEqual(expect.arrayContaining(['settled_trip_history','settled_pet_trip_history']));
+  }));
+});
+
+function testEvent({occurrenceId='occurrence-a',petId='pet-a',at=START,trigger='AFTER_INTERACTION',source=occurrenceId,
+  sourceTripId=null,routeId=null,automatic=false,cg=false,deadline=100}={}) {
+  const eventId=`story-${occurrenceId}`,asset=cg?{state:'PINNED',cgId:'postcard',variant:'default',characterId:'character-a',eventDefId:eventId,assetVersion:'1.0.0',assetHash:hash}:null;
+  const definition={eventId,version:1,trigger,conditions:[{kind:'CHARACTER',characterIds:['character-a']}],weight:1,rarity:'COMMON',cooldownMs:0,maxPerPet:10,
+    narrative:{title:'原创新故事',text:'旅途中的故事。',actionId:'happy'},effects:[{kind:'MOOD_DELTA',delta10:20},...(cg?[{kind:'CG_UNLOCK'}]:[])],
+    choices:automatic?[]:[{choiceId:'choice-a',label:'听故事',resultText:'听完故事。',effects:[{kind:'BOND_DELTA',delta10:10},{kind:'COIN',amount:3}]},
+      {choiceId:'choice-b',label:'珍惜纪念',resultText:'保留纪念。',effects:[{kind:'ITEM',itemId:'herb',quantity:2}]}],
+    defaultChoiceId:automatic?null:'choice-b',expiresAfterMs:automatic?null:deadline,asset};
+  const triggerKey=JSON.stringify([trigger,petId,source]),seed=12;
+  const selection=selectEvent([definition],{trigger,triggerKey,occurrenceId,seed,at,chanceBps:10_000,
+    context:{petId,characterId:'character-a',presence:'HOME',level:1,bond10:150,...(sourceTripId===null?{}:{sourceTripId,routeId})},history:[]});
+  if(selection.kind!=='OCCURRENCE')throw new Error('test event selection failed');
+  return {occurrence:selection.occurrence,receipt:{triggerKey,petId,trigger,seed,at,rngState:selection.rngState,drawCount:selection.drawCount,
+    sourceTripId,routeId,kind:'OCCURRENCE',occurrenceId}};
+}
+function persistEvent(tx,event){tx.insertEventTriggerReceipt(event.receipt);tx.insertEventOccurrence(event.occurrence);}
+function finalEvent(event,{kind='CHOICE',choiceId='choice-a',at=event.occurrence.occurredAt+1,commandId=`choose-${event.occurrence.occurrenceId}`,
+  newlyUnlocked=true,appliedMood=20}={}){
+  const o=event.occurrence,resolved=resolveEventOccurrence(o,{kind,occurrenceId:o.occurrenceId,petId:o.petId,status:'PENDING',at,...(kind==='CHOICE'?{choiceId}:{})});
+  if(!resolved.ok)throw new Error(`test branch invalid: ${resolved.reason}`);
+  const e=resolved.effects,rewards=[];
+  if(e.moodDelta10!==0)rewards.push({kind:'MOOD_DELTA',delta10:appliedMood});
+  if(e.bondDelta10!==0)rewards.push({kind:'BOND_DELTA',delta10:e.bondDelta10});
+  if(e.coins>0)rewards.push({kind:'COIN',amount:e.coins});
+  for(const item of e.items)rewards.push({kind:'ITEM',...item});
+  if(e.cgUnlock)rewards.push({kind:'CG_UNLOCK',cgId:e.cgUnlock.cgId,variant:e.cgUnlock.variant,newlyUnlocked});
+  return {occurrenceId:o.occurrenceId,status:resolved.status,resolvedAt:resolved.resolvedAt,choiceId:resolved.choiceId,resultText:resolved.resultText,
+    rewards,commandId:kind==='CHOICE'?commandId:null};
+}
+function eventChoiceReceipt(event,final,overrides={},payload={petId:event.occurrence.petId,occurrenceId:final.occurrenceId,choiceId:final.choiceId},walletCoins=3){
+  const petId=event.occurrence.petId;
+  return {commandId:final.commandId,fingerprint:canonical({commandId:final.commandId,issuedAt:final.resolvedAt,expectedRevision:0,type:'EVENT_CHOOSE',payload}),
+    outcome:{ok:true,snapshot:{revision:1,primaryPetId:petId,pets:[{petId,characterId:'character-a',nickname:'旅行者',presence:'HOME',activity:'IDLE',mood:'CALM',
+      healthStatus:'NORMAL',visibility:'VISIBLE',moodScore:77,healthPoints:100,energy:60,bond:16,level:1,xp:0,revision:1}],walletCoins,doNotDisturb:true,pausedRender:true}},
+    createdAt:final.resolvedAt,...overrides};
+}
+function eventSeedRepo(repo,at=START){repo.transaction(tx=>{tx.savePet(pet());tx.savePet(pet('pet-b'));tx.savePreferences({...preferences(),logicalTime:at});});}
+
+describe('SQLite repository — immutable random event decisions and authority',()=>{
+  it('persists a NO_EVENT receipt, rejects RNG mismatch and duplicate/replacement decisions',()=>withMemory((repo,db)=>{
+    eventSeedRepo(repo);
+    const no={triggerKey:'daily-a',petId:'pet-a',trigger:'HOME_DAILY',seed:12,at:START,rngState:12,drawCount:0,
+      sourceTripId:null,routeId:null,kind:'NO_EVENT',reason:'NO_ELIGIBLE'};
+    repo.transaction(tx=>tx.insertEventTriggerReceipt(no));
+    expect(repo.transaction(tx=>tx.getEventTriggerReceipt(no.triggerKey))).toEqual(no);
+    expect(()=>repo.transaction(tx=>tx.insertEventTriggerReceipt({...no,triggerKey:'wrong-rng',rngState:13}))).toThrow(/RNG audit/);
+    expect(()=>repo.transaction(tx=>tx.insertEventTriggerReceipt(no))).toThrow(/immutable/);
+    for(const sql of ["UPDATE event_trigger_receipts SET reason='TRIGGER_INELIGIBLE'",'DELETE FROM event_trigger_receipts',
+      'INSERT OR REPLACE INTO event_trigger_receipts SELECT * FROM event_trigger_receipts',
+      "INSERT OR REPLACE INTO event_trigger_receipts SELECT 'different-key',pet_id,trigger_kind,seed,at,rng_state,draw_count,source_trip_id,route_id,decision,reason,occurrence_id FROM event_trigger_receipts"])
+      expect(()=>db.exec(sql)).toThrow(/immutable/);
+    expect(repo.transaction(tx=>tx.countPendingEvents())).toBe(0);
+  }));
+
+  it('requires exact selected receipt before frozen occurrence and auto resolution in the same transaction',()=>withMemory((repo,db)=>{
+    eventSeedRepo(repo);const chosen=testEvent(),automatic=testEvent({occurrenceId:'auto-event',automatic:true});
+    expect(()=>repo.transaction(tx=>tx.insertEventTriggerReceipt(chosen.receipt))).toThrow(/foreign key/i);
+    expect(()=>repo.transaction(tx=>tx.insertEventOccurrence(chosen.occurrence))).toThrow(/exact selection receipt/);
+    expect(()=>repo.transaction(tx=>{tx.insertEventTriggerReceipt(chosen.receipt);tx.insertEventOccurrence({...chosen.occurrence,seed:13});})).toThrow(/exact selection receipt/);
+    expect(()=>repo.transaction(tx=>persistEvent(tx,automatic))).toThrow(/foreign key/i);
+    expect(repo.transaction(tx=>[tx.countPendingEvents(),tx.getEventTriggerReceipt(automatic.receipt.triggerKey)])).toEqual([0,null]);
+    repo.transaction(tx=>{persistEvent(tx,automatic);expect(tx.finalizeEventOccurrence(finalEvent(automatic,{kind:'AUTO',at:START}))).toBe(true);});
+    expect(repo.transaction(tx=>tx.getEventOccurrence('auto-event').status)).toBe('RESOLVED');
+    expect(db.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
+  }));
+
+  it('freezes a choice, exact effect ledger and command receipt, preserving first resolution across WAL restart',()=>withFile(path=>{
+    const db=new DatabaseSync(path),repo=new SQLiteRepository(db,{persistent:true}),event=testEvent(),final=finalEvent(event,{appliedMood:0}),success=eventChoiceReceipt(event,final);
+    eventSeedRepo(repo,START+1);
+    try{
+      repo.transaction(tx=>persistEvent(tx,event));
+      expect(repo.transaction(tx=>tx.getEventOccurrence(event.occurrence.occurrenceId))).toEqual({occurrence:event.occurrence,status:'PENDING',resolvedAt:null,choiceId:null,resultText:null,rewards:[],commandId:null});
+      repo.transaction(tx=>{
+        tx.savePet({...pet(),moodScore10:1000,bond10:160,revision:1});tx.setWalletCoins(3);tx.savePreferences({...preferences(),logicalTime:START+1,revision:1});
+        expect(tx.finalizeEventOccurrence(final)).toBe(true);tx.saveCommandReceipt(success);
+        expect(tx.finalizeEventOccurrence({...final,resultText:'另一个结果'})).toBe(false);
+      });
+    }finally{repo.close();}
+    const reopened=new DatabaseSync(path),again=new SQLiteRepository(reopened,{persistent:true});
+    try{
+      again.transaction(tx=>{
+        const {occurrenceId,...rest}=final;expect(tx.getEventOccurrence(occurrenceId)).toEqual({occurrence:event.occurrence,...rest});
+        expect(tx.getCommandReceipt(final.commandId)).toEqual(success);tx.saveCommandReceipt(success);
+        expect(tx.getWalletCoins()).toBe(3);expect(tx.listRewards(occurrenceId)).toEqual([]);
+      });
+      expect(reopened.prepare('SELECT count(*) AS n FROM event_effects').get().n).toBe(3);
+      expect(reopened.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
+    }finally{again.close();}
+  }));
+
+  it('rejects invalid frozen branches, extra/missing rewards and choice receipt mismatch with atomic rollback',()=>withMemory(repo=>{
+    const event=testEvent(),final=finalEvent(event),success=eventChoiceReceipt(event,final);
+    eventSeedRepo(repo,START+1);repo.transaction(tx=>persistEvent(tx,event));
+    for(const wrong of [{...final,resultText:'修改故事'}, {...final,commandId:null},{...final,resolvedAt:event.occurrence.deadlineAt},
+      {...final,rewards:[...final.rewards,{kind:'ITEM',itemId:'herb',quantity:10}]},{...final,rewards:final.rewards.filter(r=>r.kind!=='COIN')},
+      {...final,rewards:final.rewards.map(r=>r.kind==='MOOD_DELTA'?{kind:'MOOD_DELTA',delta10:-1}:r)}])
+      expect(()=>repo.transaction(tx=>tx.finalizeEventOccurrence(wrong))).toThrow(/frozen/);
+    const stage=tx=>{tx.setWalletCoins(3);tx.savePreferences({...preferences(),logicalTime:START+1,revision:1});tx.finalizeEventOccurrence(final);};
+    expect(()=>repo.transaction(stage)).toThrow(/foreign key/i);
+    for(const wrong of [eventChoiceReceipt(event,final,{}, {petId:'pet-b',occurrenceId:final.occurrenceId,choiceId:final.choiceId}),
+      eventChoiceReceipt(event,final,{}, {petId:'pet-a',occurrenceId:final.occurrenceId,choiceId:'choice-b'}),{...success,createdAt:START+2},eventChoiceReceipt(event,final,{},undefined,5)])
+      expect(()=>repo.transaction(tx=>{stage(tx);tx.saveCommandReceipt(wrong);})).toThrow(/exact immutable finalization/);
+    expect(()=>repo.transaction(tx=>tx.saveCommandReceipt(success))).toThrow(/exact immutable finalization/);
+    expect(repo.transaction(tx=>[tx.getEventOccurrence(final.occurrenceId).status,tx.getWalletCoins(),tx.getCommandReceipt(final.commandId)])).toEqual(['PENDING',0,null]);
+    const failure={...success,outcome:{ok:false,error:{code:'BUSINESS_RULE',message:'not due',retryable:false}}};
+    repo.transaction(tx=>tx.saveCommandReceipt(failure));
+    expect(()=>repo.transaction(stage)).toThrow(/exact pending branch/);
+  }));
+
+  it('protects frozen occurrence/finalization/effect ledger and linked command from SQL rewriting or later insertion',()=>withMemory((repo,db)=>{
+    const event=testEvent(),final=finalEvent(event),success=eventChoiceReceipt(event,final);eventSeedRepo(repo,START+1);
+    repo.transaction(tx=>persistEvent(tx,event));
+    expect(()=>repo.transaction(()=>db.prepare("INSERT INTO event_effects VALUES(?, 'COIN','',NULL,3,NULL)").run(final.occurrenceId))).toThrow(/foreign key/i);
+    expect(()=>db.prepare('INSERT INTO event_finalizations VALUES(?,?,?,?,?,?)').run(final.occurrenceId,final.status,final.resolvedAt,final.choiceId,final.resultText,final.commandId)).toThrow(/exact pending branch/);
+    repo.transaction(tx=>{tx.setWalletCoins(3);tx.savePreferences({...preferences(),logicalTime:START+1,revision:1});tx.finalizeEventOccurrence(final);tx.saveCommandReceipt(success);});
+    for(const sql of ['UPDATE event_occurrences SET event_version=2','DELETE FROM event_occurrences','INSERT OR REPLACE INTO event_occurrences SELECT * FROM event_occurrences',
+      "UPDATE event_finalizations SET result_text='fake'",'DELETE FROM event_finalizations','INSERT OR REPLACE INTO event_finalizations SELECT * FROM event_finalizations',
+      'UPDATE event_effects SET amount=amount+1','DELETE FROM event_effects','INSERT OR REPLACE INTO event_effects SELECT * FROM event_effects LIMIT 1',
+      "INSERT INTO event_effects VALUES ('occurrence-a','ITEM','herb',NULL,1,NULL)","UPDATE commands SET created_at=created_at+1",'DELETE FROM commands','INSERT OR REPLACE INTO commands SELECT * FROM commands'])
+      expect(()=>db.exec(sql)).toThrow(/immutable|exact selection receipt|exact pending branch/i);
+    expect(repo.transaction(tx=>tx.getEventOccurrence(final.occurrenceId).rewards)).toEqual(final.rewards);
+  }));
+
+  it('enforces per-pet cap and due/paged/history ordering including as-of past pending status and exact default expiry',()=>withMemory(repo=>{
+    eventSeedRepo(repo,START+1000);
+    const z=testEvent({occurrenceId:'z-event',at:START,deadline:100}),a=testEvent({occurrenceId:'a-event',at:START,deadline:100}),later=testEvent({occurrenceId:'later-event',at:START+10,deadline:200}),other=testEvent({occurrenceId:'other-event',petId:'pet-b',at:START+20,deadline:500});
+    repo.transaction(tx=>{for(const event of [z,a,later,other])persistEvent(tx,event);});
+    expect(()=>repo.transaction(tx=>persistEvent(tx,testEvent({occurrenceId:'fourth'})))).toThrow(/pending capacity/);
+    repo.transaction(tx=>{
+      expect(tx.countPendingEvents('pet-a')).toBe(3);expect(tx.countPendingEvents()).toBe(4);
+      expect(tx.listDueEvents(START+99)).toEqual([]);
+      expect(tx.listDueEvents(START+100).map(r=>r.occurrence.occurrenceId)).toEqual(['a-event','z-event']);
+      const expiry=finalEvent(a,{kind:'EXPIRE',at:START+1000});
+      expect(expiry.resolvedAt).toBe(START+100);expect(expiry.choiceId).toBe('choice-b');expect(tx.finalizeEventOccurrence(expiry)).toBe(true);
+      expect(tx.listEventHistory('pet-a',START+99).find(r=>r.occurrenceId==='a-event').status).toBe('PENDING');
+      expect(tx.listEventHistory('pet-a',START+100).find(r=>r.occurrenceId==='a-event').status).toBe('EXPIRED');
+      const page=(query)=>{const {total,pendingTotal,events}=tx.listEvents(query);return {total,pendingTotal,ids:events.map(r=>r.occurrence.occurrenceId)};};
+      expect(page({filter:'ALL',offset:0,limit:3})).toEqual({total:4,pendingTotal:3,ids:['other-event','later-event','a-event']});
+      expect(page({petId:'pet-a',filter:'PENDING',offset:1,limit:2})).toEqual({total:2,pendingTotal:2,ids:['z-event']});
+      expect(page({petId:'pet-a',filter:'HISTORY',offset:0,limit:1})).toEqual({total:1,pendingTotal:2,ids:['a-event']});
+      expect(page({petId:'absent',filter:'ALL',offset:0,limit:1})).toEqual({total:0,pendingTotal:0,ids:[]});
+      expect(()=>page({filter:'ALL',offset:0,limit:31})).toThrow();
+    });
+  }));
+
+  it('freezes a narrative CG first acquisition and exact favorite/view; later trip earning same identity cannot overwrite it',()=>withMemory((repo,db)=>{
+    eventSeedRepo(repo,START+1000);
+    const event=testEvent({cg:true,automatic:true}),final=finalEvent(event,{kind:'AUTO',at:START});
+    repo.transaction(tx=>{persistEvent(tx,event);tx.finalizeEventOccurrence(final);});
+    const asset=event.occurrence.asset,expected={petId:'pet-a',cgId:asset.cgId,variant:asset.variant,sourceEventId:event.occurrence.occurrenceId,unlockedAt:START,
+      assetRef:{state:'PINNED',characterId:asset.characterId,eventDefId:asset.eventDefId,assetVersion:asset.assetVersion,assetHash:asset.assetHash},
+      historicalCharacterId:asset.characterId,historicalEventDefId:asset.eventDefId,favorite:false,viewedAt:null};
+    repo.transaction(tx=>{
+      expect(tx.getEventCgUnlock('pet-a','postcard','default')).toEqual(expected);expect(tx.listCgUnlocks('pet-a')).toEqual([]);
+      expect(tx.setCgFavorite('pet-a','postcard','default',true)).toBe(true);
+      expect(()=>tx.markCgViewed('pet-a','postcard','default',asset.characterId,asset.eventDefId,'2.0.0',hash,START+1)).toThrow(/exact pinned/);
+      expect(tx.markCgViewed('pet-a','postcard','default',asset.characterId,asset.eventDefId,asset.assetVersion,asset.assetHash,START+1)).toBe(true);
+      expect(tx.markCgViewed('pet-a','postcard','default',asset.characterId,asset.eventDefId,asset.assetVersion,asset.assetHash,START+2)).toBe(false);
+      const trip=tripRecord('event-first-trip','pet-a',START+10);tx.insertTrip(trip);tx.insertTripCgAssetPin(departurePin(trip));
+      expect(completeTrip(tx,trip).inserted).toBe(false);expect(tx.listCgUnlocks('pet-a')).toEqual([]);
+      expect(tx.listEventCgUnlocks('pet-a')).toEqual([{...expected,favorite:true,viewedAt:START+1}]);
+    });
+    for(const sql of ["UPDATE event_cg_unlocks SET asset_version='2.0.0'",'UPDATE event_cg_unlocks SET viewed_at=NULL','DELETE FROM event_cg_unlocks','INSERT OR REPLACE INTO event_cg_unlocks SELECT * FROM event_cg_unlocks'])
+      expect(()=>db.exec(sql)).toThrow(/immutable|exact finalized/);
+  }));
+
+  it('preserves existing trip CG acquisition, records event CG reward as not new, and validates exact returned-trip provenance',()=>withMemory((repo,db)=>{
+    eventSeedRepo(repo,START+1000);const trip=tripRecord('trip-first');
+    repo.transaction(tx=>{tx.insertTrip(trip);tx.insertTripCgAssetPin(departurePin(trip));expect(completeTrip(tx,trip).inserted).toBe(true);});
+    const at=trip.snapshot.expectedReturnAt,event=testEvent({cg:true,automatic:true,trigger:'TRIP_RETURNED',source:trip.snapshot.tripId,sourceTripId:trip.snapshot.tripId,routeId:trip.snapshot.routeId,at});
+    expect(()=>repo.transaction(tx=>tx.insertEventTriggerReceipt({...event.receipt,routeId:'wrong-route'}))).toThrow(/invalid or duplicate immutable/);
+    expect(()=>repo.transaction(tx=>{persistEvent(tx,event);tx.finalizeEventOccurrence(finalEvent(event,{kind:'AUTO',at,newlyUnlocked:true}));})).toThrow(/first acquisition/);
+    repo.transaction(tx=>{persistEvent(tx,event);expect(tx.finalizeEventOccurrence(finalEvent(event,{kind:'AUTO',at,newlyUnlocked:false}))).toBe(true);
+      expect(tx.getEventCgUnlock('pet-a','postcard','default')).toBeNull();expect(tx.getCgUnlock('pet-a','postcard','default').sourceTripId).toBe(trip.snapshot.tripId);});
+    expect(()=>db.exec("INSERT OR REPLACE INTO event_trigger_receipts SELECT 'different-trip-trigger',pet_id,trigger_kind,seed,at,rng_state,draw_count,source_trip_id,route_id,decision,reason,occurrence_id FROM event_trigger_receipts")).toThrow(/immutable/);
   }));
 });
 

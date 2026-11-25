@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { eventChoosePayloadSchema, eventOccurrenceViewSchema, eventPageSchema, eventListQuerySchema } from '../src/events.js';
 import type { EventOccurrenceView } from '../src/events.js';
+import { domainCommandSchema, eventsIpcResultSchema, resultMatchesMethod } from '../src/index.js';
 const pending = { occurrenceId: 'ev-1', petId: 'pet-1', characterId: 'star-singer', eventId: 'star-singer.shared-constellation', eventVersion: 1,
   trigger: 'BOND_MILESTONE', sourceTripId: null, routeId: null, occurredAt: 100, rarity: 'RARE', title: '星图', narrative: '一起确认星图。', actionId: 'happy',
   choices: [{ choiceId: 'name', label: '命名星座' }, { choiceId: 'save', label: '留作纪念' }], deadlineAt: 200,
@@ -39,5 +40,17 @@ describe('event occurrence projection', () => {
     const select = { petId: 'pet-1', occurrenceId: 'ev-1', choiceId: 'name' };
     expect(eventChoosePayloadSchema.safeParse(select).success).toBe(true);
     expect(eventChoosePayloadSchema.safeParse({ ...select, coins: 100, at: 150 }).success).toBe(false);
+  });
+  it('requires same authority revision, exact current character, and mandatory expected revision', () => {
+    const snapshot={revision:5,primaryPetId:'pet-1',walletCoins:0,doNotDisturb:false,pausedRender:false,pets:[{petId:'pet-1',characterId:'star-singer',nickname:'星咏',presence:'HOME',activity:'IDLE',mood:'HAPPY',healthStatus:'NORMAL',visibility:'VISIBLE',moodScore:70,healthPoints:100,energy:100,bond:20,level:2,xp:100,revision:1}]};
+    const response={schemaVersion:1,requestId:'req',ok:true,snapshot,events:{revision:5,petId:'pet-1',filter:'PENDING',pendingTotal:1,total:1,offset:0,limit:10,rows:[pending]}};
+    const parsed=eventsIpcResultSchema.parse(response);
+    expect(resultMatchesMethod('events/list',parsed)).toBe(true);
+    expect(resultMatchesMethod('snapshot/get',parsed)).toBe(false);
+    expect(eventsIpcResultSchema.safeParse({...response,events:{...response.events,revision:6}}).success).toBe(false);
+    expect(eventsIpcResultSchema.safeParse({...response,snapshot:{...snapshot,pets:[{...snapshot.pets[0],characterId:'other'}]}}).success).toBe(false);
+    const command={type:'EVENT_CHOOSE',commandId:'cmd',issuedAt:100,payload:{petId:'pet-1',occurrenceId:'ev-1',choiceId:'name'}};
+    expect(domainCommandSchema.safeParse(command).success).toBe(false);
+    expect(domainCommandSchema.safeParse({...command,expectedRevision:5}).success).toBe(true);
   });
 });

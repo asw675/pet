@@ -4,6 +4,7 @@ import {
 } from '@pet-desktop/contracts';
 import type { AppSnapshot, CharacterCatalogPage, DomainCommand, DomainEvent, GalleryPage, GalleryQuery, InventoryPage, IpcErrorCode, IpcResult, PetSnapshot } from '@pet-desktop/contracts';
 import type { TravelCatalog, TravelPreview, TravelReportsPage, TravelReportsQuery, TripPreparationPayload } from '@pet-desktop/contracts/travel';
+import type { EventListQuery, EventPage } from '@pet-desktop/contracts/events';
 import {
   advanceTrip, createTripCheckpoint, createTripSnapshot, DEMO_ROUTE, recallTrip,
 } from '@pet-desktop/domain';
@@ -15,11 +16,13 @@ import { ROUTE_CATALOG_VERSION } from '@pet-desktop/domain/route-catalog';
 import type {
   AppRepository, AppRuntime, AppTransaction, CommandOutcome, PetRecord, PreferencesRecord, RewardLine, TripRecord,
 } from './ports.js';
-import { freezeTripCgAssets, projectGallery, TRIP_CG_VARIANT as CG_VARIANT } from '#gallery-service';
+import { findAnyCgUnlock, freezeTripCgAssets, projectGallery, TRIP_CG_VARIANT as CG_VARIANT } from '#gallery-service';
 import { characterAcquisitionContext, createCharacterPet, createStarterPets, projectCharacterCatalog } from '#character-service';
 import { applyHomeState, hasVisibleHomeChange, initialHomeState, readHomeState, scheduleFromHome, transitionHomeState } from '#home-state-service';
 import { executeEconomyCommand, projectInventory } from '#economy-service';
 import { freezeDepartureLoadout, prepareTravel, projectTravelCatalog, projectTravelReports } from '#travel-service';
+import { chooseEvent, DEFAULT_EVENT_POLICY, expireEvent, projectEvents, triggerBondMilestones, triggerDaily, triggerEvent } from '#event-service';
+import type { EventMutation, EventPolicy } from '#event-service';
 
 type Failure = Extract<CommandOutcome, { ok: false }>;
 type GalleryOutcome = { ok: true; snapshot: AppSnapshot; gallery: GalleryPage } | Failure;
@@ -28,6 +31,7 @@ type InventoryOutcome = { ok: true; snapshot: AppSnapshot; inventory: InventoryP
 type TravelCatalogOutcome = { ok: true; snapshot: AppSnapshot; travelCatalog: TravelCatalog };
 type TravelPreviewOutcome = { ok: true; snapshot: AppSnapshot; travelPreview: TravelPreview } | Failure;
 type TravelReportsOutcome = { ok: true; snapshot: AppSnapshot; travelReports: TravelReportsPage } | Failure;
+type EventsOutcome = { ok: true; snapshot: AppSnapshot; events: EventPage } | Failure;
 
 function failure(code: IpcErrorCode, message: string, retryable = false): Failure {
   return { ok: false, error: { code, message, retryable } };
@@ -138,10 +142,12 @@ export class AppService {
   private closed = false;
   private readonly repository: AppRepository;
   private readonly runtime: AppRuntime;
+  private readonly eventPolicy: EventPolicy;
 
-  constructor(repository: AppRepository, runtime: AppRuntime) {
+  constructor(repository: AppRepository, runtime: AppRuntime, eventPolicy: EventPolicy = DEFAULT_EVENT_POLICY) {
     this.repository = repository;
     this.runtime = runtime;
+    this.eventPolicy = eventPolicy;
     this.repository.transaction((tx) => {
       if (tx.getPreferences() !== null) {
         // A startup is a recovery boundary, not merely a new IPC listener.
@@ -230,6 +236,14 @@ export class AppService {
     }));
   }
 
+  private eventMutation(state: TransactionState, alreadyRevised = false): EventMutation {
+    let marked = alreadyRevised;
+    return { tx: state.tx, policy: this.eventPolicy, authorityAt: state.preferences.logicalTime,
+      createOccurrenceId: () => idSchema.parse(this.runtime.createId('event')),
+      markVisible: () => { if (!marked) { this.revise(state); marked = true; } },
+      emit: (type, id, cause, at, payload) => this.event(state, type, id, cause, at, payload) };
+  }
+
   private snapshot(state: TransactionState): AppSnapshot {
     const trips = state.tx.listTrips();
     const pets = state.tx.listPets().sort((a, b) => compareIds(a.petId, b.petId)).map((pet): PetSnapshot => {
@@ -292,6 +306,13 @@ export class AppService {
       active.sort((a, b) => a.checkpoint.nextDueAt! - b.checkpoint.nextDueAt!
         || compareIds(a.snapshot.petId, b.snapshot.petId) || compareIds(a.snapshot.tripId, b.snapshot.tripId));
       const next = active[0];
+      const dueEvent = tx.listDueEvents(targetTime)[0];
+      // Deadlines win ties. Re-evaluate after every commit: a returning pet
+      // may create another occurrence whose deadline is already offline-due.
+      if (dueEvent !== undefined && (next === undefined || dueEvent.occurrence.deadlineAt! <= next.checkpoint.nextDueAt!)) {
+        expireEvent(this.eventMutation(state), dueEvent);
+        continue;
+      }
       if (next === undefined || next.checkpoint.nextDueAt! > targetTime) break;
       const result = advanceTrip(next.snapshot, next.checkpoint, next.checkpoint.nextDueAt!);
       const updated = this.commitProgress(state, next, result);
@@ -315,6 +336,12 @@ export class AppService {
       if (pet.presence !== 'HOME') continue;
       const home = readHomeState(tx, pet, state.preferences.logicalTime);
       this.persistHomeProjection(state, pet, advanceHomeState(home, targetTime));
+    }
+    // No replay of arbitrary missed calendar days. The current UTC day is a
+    // single durable opportunity; a no-event is recorded just like a hit.
+    if (this.eventPolicy !== false) {
+      const ctx = this.eventMutation(state);
+      for (const pet of tx.listPets().sort((a, b) => compareIds(a.petId, b.petId))) triggerDaily(ctx, pet, targetTime);
     }
   }
 
@@ -357,6 +384,8 @@ export class AppService {
     tx.updateTrip(updated);
     tx.savePet(updatedPet);
     if (transition) tx.saveHomeSchedule(scheduleFromHome(transition));
+    if (updated.status === 'SETTLED') triggerEvent(this.eventMutation(state, true), updatedPet, 'TRIP_RETURNED',
+      updated.snapshot.tripId, updated.checkpoint.actualReturnedAt!, { sourceTripId: updated.snapshot.tripId, routeId: updated.snapshot.routeId });
     return updated;
   }
 
@@ -440,6 +469,7 @@ export class AppService {
     }
     if (command.type === 'SHOP_PURCHASE' || command.type === 'EQUIPMENT_EQUIP' || command.type === 'EQUIPMENT_UNEQUIP'
       || command.type === 'EQUIPMENT_UPGRADE' || command.type === 'EQUIPMENT_SALVAGE' || command.type === 'ITEM_USE') {
+      const beforeUse = command.type === 'ITEM_USE' ? tx.getPet(command.payload.petId) : null;
       const result = executeEconomyCommand(tx, command, at, () => this.runtime.createId('item'));
       if (!result.ok) return result;
       for (const affectedPetId of new Set(result.affectedPetIds)) {
@@ -449,6 +479,11 @@ export class AppService {
       }
       this.revise(state);
       this.event(state, result.eventType, result.aggregateId, command.commandId, at, result.payload);
+      if (beforeUse) {
+        const afterUse = tx.getPet(beforeUse.petId);
+        if (!afterUse) throw new Error('Item user is missing');
+        triggerBondMilestones(this.eventMutation(state, true), beforeUse.petId, beforeUse.bond10, afterUse.bond10, at);
+      }
       return;
     }
     // Acquiring creates an instance and therefore has no existing petId to
@@ -512,9 +547,25 @@ export class AppService {
         const result = interactHome(readHomeState(tx, pet, at), interaction, at);
         if (!result.accepted) return failure('BUSINESS_RULE', result.reason === 'ACTIVITY_BUSY'
           ? 'Finish the current activity before requesting rest or wake.' : 'The pet must be home to interact.');
+        const beforeRevision = state.preferences.revision;
         this.persistHomeProjection(state, pet, result.state, true);
         this.event(state, 'PetInteracted', pet.petId, command.commandId, at, { petId: pet.petId, interaction,
           rewardGranted: result.rewardGranted, reason: result.reason ?? null });
+        const ctx = this.eventMutation(state, state.preferences.revision !== beforeRevision);
+        triggerBondMilestones(ctx, pet.petId, pet.bond10, result.state.bond10, at);
+        if (interaction === 'PET' && result.rewardGranted) {
+          const latest = tx.getPet(pet.petId);
+          if (!latest) throw new Error('Interaction pet is missing');
+          triggerEvent(ctx, latest, 'AFTER_INTERACTION', command.commandId, at);
+        }
+        return;
+      }
+      case 'EVENT_CHOOSE': {
+        const record = tx.getEventOccurrence(command.payload.occurrenceId);
+        if (!record || record.occurrence.petId !== pet.petId) return failure('NOT_FOUND', 'The event does not exist for this pet.');
+        if (!chooseEvent(this.eventMutation(state), record, command.payload.choiceId, command.commandId)) {
+          return failure('BUSINESS_RULE', 'This choice is invalid or the event has already been resolved.');
+        }
         return;
       }
       case 'PET_SET_VISIBILITY':
@@ -607,7 +658,7 @@ export class AppService {
       }
       case 'CG_SET_FAVORITE': {
         const { cgId, variant, favorite } = command.payload;
-        const unlock = tx.getCgUnlock(pet.petId, cgId, variant);
+        const unlock = findAnyCgUnlock(tx, pet.petId, cgId, variant);
         if (unlock === null) return failure('NOT_FOUND', 'The CG has not been unlocked for this pet.');
         if (unlock.favorite !== favorite) {
           if (!tx.setCgFavorite(pet.petId, cgId, variant, favorite)) throw new Error('CG favorite update did not commit');
@@ -618,7 +669,7 @@ export class AppService {
       }
       case 'CG_MARK_VIEWED': {
         const { cgId, variant, characterId, eventDefId, assetVersion, assetHash } = command.payload;
-        const unlock = tx.getCgUnlock(pet.petId, cgId, variant);
+        const unlock = findAnyCgUnlock(tx, pet.petId, cgId, variant);
         if (unlock === null) return failure('NOT_FOUND', 'The CG has not been unlocked for this pet.');
         const ref = unlock.assetRef;
         if (ref.state !== 'PINNED' || ref.characterId !== characterId || ref.eventDefId !== eventDefId
@@ -712,6 +763,16 @@ export class AppService {
     });
   }
 
+  private getEvents(query: EventListQuery): EventsOutcome {
+    return this.repository.transaction(tx => {
+      const state = this.state(tx);
+      this.advanceAll(state);
+      if (query.petId !== undefined && tx.getPet(query.petId) === null) return failure('NOT_FOUND', 'The pet does not exist.');
+      const snapshot = this.snapshot(state);
+      return { ok: true, snapshot, events: projectEvents(tx, query, snapshot.revision) };
+    });
+  }
+
   dispatch(command: DomainCommand): CommandOutcome {
     if (this.closed) return unavailable();
     const parsed = domainCommandSchema.safeParse(command);
@@ -781,6 +842,11 @@ export class AppService {
         const outcome = this.getTravelReports(parsed.data.payload);
         return outcome.ok ? { schemaVersion: CONTRACT_SCHEMA_VERSION, ok: true, requestId,
           snapshot: outcome.snapshot, travelReports: outcome.travelReports } : respondError(outcome);
+      }
+      if (parsed.data.method === 'events/list') {
+        const outcome = this.getEvents(parsed.data.payload);
+        return outcome.ok ? { schemaVersion: CONTRACT_SCHEMA_VERSION, ok: true, requestId,
+          snapshot: outcome.snapshot, events: outcome.events } : respondError(outcome);
       }
       const outcome = parsed.data.method === 'snapshot/get' ? { ok: true as const, snapshot: this.getSnapshot() }
         : this.dispatch(parsed.data.payload.command);

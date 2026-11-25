@@ -120,6 +120,15 @@ describe('Main request routing', () => {
     await expect(routeRequest(center, sender(center), [requests[3]], forward, undefined)).resolves.toMatchObject({ ok: true });
     await expect(routeRequest(center, sender(center), [{ ...getSnapshot, method: 'command/dispatch', payload: { command: { commandId: common.commandId, issuedAt: 1, type: 'TRIP_START_PREPARED', payload } } }], forward, undefined)).resolves.toMatchObject({ ok: false, error: { code: 'INVALID_REQUEST' } });
   });
+  it('denies pet-window event choices and event lists, and requires a current revision', async () => {
+    const query: IpcRequest={...getSnapshot,method:'events/list',payload:{filter:'PENDING',offset:0,limit:10}};
+    const choose=dispatch({...common,type:'EVENT_CHOOSE',payload:{petId:'pet-a',occurrenceId:'event-1',choiceId:'answer'}});
+    const forward=relay();
+    for(const request of [query,choose]) await expect(routeRequest(pet,sender(pet),[request],forward,1)).resolves.toMatchObject({ok:false,error:{code:'FORBIDDEN'}});
+    expect(forward).not.toHaveBeenCalled();
+    await expect(routeRequest(center,sender(center),[choose],forward,undefined)).resolves.toMatchObject({ok:true});
+    await expect(routeRequest(center,sender(center),[{...getSnapshot,method:'command/dispatch',payload:{command:{commandId:common.commandId,issuedAt:1,type:'EVENT_CHOOSE',payload:{petId:'pet-a',occurrenceId:'ev',choiceId:'answer'}}}}],forward,undefined)).resolves.toMatchObject({ok:false,error:{code:'INVALID_REQUEST'}});
+  });
 
   it('rejects a valid request ID paired with a success result for the wrong method', async () => {
     const query: IpcRequest = { ...getSnapshot, method: 'gallery/list', payload: { filter: 'ALL', offset: 0, limit: 12 } };

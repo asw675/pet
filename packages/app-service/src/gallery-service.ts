@@ -1,9 +1,9 @@
 import { cgAssetRefSchema, galleryPageSchema } from '@pet-desktop/contracts';
 import type { GalleryPage, GalleryQuery, GalleryRow, LockedGalleryRow, PinnedCgAssetRef, UnlockedGalleryRow } from '@pet-desktop/contracts';
 import type { TripSnapshot } from '@pet-desktop/domain';
-import { BUILTIN_CG_CATALOG, findBuiltinCg } from '@pet-desktop/domain/cg-catalog';
+import { BUILTIN_CG_CATALOG, EVENT_CG_CATALOG, findBuiltinCg, findBuiltinEventCg } from '@pet-desktop/domain/cg-catalog';
 import type { CgCatalogEntry } from '@pet-desktop/domain/cg-catalog';
-import type { AppTransaction, CgUnlock, PetRecord, TripCgAssetPin } from './ports.js';
+import type { AppTransaction, CgUnlock, EventCgUnlock, PetRecord, TripCgAssetPin } from './ports.js';
 
 export const TRIP_CG_VARIANT = 'default';
 
@@ -87,6 +87,37 @@ function unlockedRow(tx: AppTransaction, pet: PetRecord, unlock: CgUnlock): Unlo
   };
 }
 
+function unlockedEventRow(tx: AppTransaction, pet: PetRecord, unlock: EventCgUnlock): UnlockedGalleryRow {
+  const source = tx.getEventOccurrence(unlock.sourceEventId);
+  const ref = unlock.assetRef;
+  if (unlock.petId !== pet.petId || !source || source.occurrence.petId !== pet.petId || source.status === 'PENDING'
+    || source.resolvedAt !== unlock.unlockedAt || source.occurrence.characterId !== unlock.historicalCharacterId
+    || source.occurrence.eventId !== unlock.historicalEventDefId || ref.characterId !== unlock.historicalCharacterId
+    || ref.eventDefId !== unlock.historicalEventDefId
+    || !source.rewards.some(reward => reward.kind === 'CG_UNLOCK' && reward.cgId === unlock.cgId
+      && reward.variant === unlock.variant && reward.newlyUnlocked)) throw new Error('Invalid event CG acquisition source');
+  const pinned = source.occurrence.asset;
+  if (pinned?.state !== 'PINNED' || pinned.assetVersion !== ref.assetVersion || pinned.assetHash !== ref.assetHash
+    || pinned.cgId !== unlock.cgId || pinned.variant !== unlock.variant) throw new Error('Invalid event CG asset pin');
+  const routeId = source.occurrence.routeId;
+  const historical = findBuiltinEventCg(ref.characterId, unlock.cgId, unlock.variant, ref.assetVersion);
+  const entry = historical?.assetHash === ref.assetHash && historical.eventDefId === ref.eventDefId
+    && historical.routeId === routeId ? historical : undefined;
+  return { petId: pet.petId, characterId: ref.characterId, cgId: unlock.cgId, variant: unlock.variant,
+    title: entry?.title ?? '历史纪念画面', hint: entry?.hint ?? '首次获得时的固定资源目前不可用，请保留历史记录。',
+    routeId, eventDefId: ref.eventDefId, rarity: entry?.rarity ?? null, unlockStatus: 'UNLOCKED',
+    sourceTripId: null, sourceEventId: unlock.sourceEventId, unlockedAt: unlock.unlockedAt,
+    favorite: unlock.favorite, viewedAt: unlock.viewedAt, assetRef: ref };
+}
+
+/** One identity, one first acquisition, regardless of its original ledger. */
+export function findAnyCgUnlock(tx: AppTransaction, petId: string, cgId: string, variant: string): CgUnlock | EventCgUnlock | null {
+  const trip = tx.getCgUnlock(petId, cgId, variant);
+  const event = tx.getEventCgUnlock(petId, cgId, variant);
+  if (trip && event) throw new Error('CG has duplicate acquisition sources');
+  return trip ?? event;
+}
+
 function rowKey(row: { cgId: string; variant: string }): string { return JSON.stringify([row.cgId, row.variant]); }
 
 function matches(row: GalleryRow, query: GalleryQuery): boolean {
@@ -113,9 +144,16 @@ export function projectGallery(tx: AppTransaction, query: GalleryQuery, revision
       const row = unlockedRow(tx, pet, unlock);
       byUnlockKey.set(rowKey(row), row);
     }
-    for (const entry of BUILTIN_CG_CATALOG) {
+    for (const unlock of tx.listEventCgUnlocks(pet.petId)) {
+      const row = unlockedEventRow(tx, pet, unlock);
+      const key = rowKey(row);
+      if (byUnlockKey.has(key)) throw new Error('CG has duplicate acquisition sources');
+      byUnlockKey.set(key, row);
+    }
+    for (const entry of [...BUILTIN_CG_CATALOG, ...EVENT_CG_CATALOG]) {
       if (entry.characterId !== pet.characterId || byUnlockKey.has(rowKey(entry))) continue;
-      const latest = findBuiltinCg(pet.characterId, entry.cgId, entry.variant);
+      const latest = findBuiltinCg(pet.characterId, entry.cgId, entry.variant)
+        ?? findBuiltinEventCg(pet.characterId, entry.cgId, entry.variant);
       if (latest) byUnlockKey.set(rowKey(entry), lockedRow(pet, latest));
     }
     for (const row of byUnlockKey.values()) if (matches(row, query)) rows.push(row);

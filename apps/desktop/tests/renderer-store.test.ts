@@ -47,9 +47,10 @@ function testBridge() {
   const listTravelCatalog = vi.fn<ControlCenterBridge['listTravelCatalog']>();
   const previewTravel = vi.fn<ControlCenterBridge['previewTravel']>();
   const listTravelReports = vi.fn<ControlCenterBridge['listTravelReports']>();
+  const listEvents = vi.fn<ControlCenterBridge['listEvents']>();
   const bridge: ControlCenterBridge = {
     role: 'control-center', getServiceStatus, getSnapshot, dispatch, listGallery, listCharacters, listInventory,
-    listTravelCatalog, previewTravel, listTravelReports,
+    listTravelCatalog, previewTravel, listTravelReports, listEvents,
     openControlCenter: () => Promise.resolve({ ok: true }),
     subscribeSnapshot: (listener) => {
       snapshots.add(listener);

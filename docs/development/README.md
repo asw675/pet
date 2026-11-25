@@ -41,7 +41,7 @@
 | 006F-2B | 新增2个剧情CG、事件源图鉴、精确版本读取 | 实际PNG与专项测试通过，解锁事务待接入 | [006f2b-narrative-cg-assets](006f2b-narrative-cg-assets.md) |
 | 006-Q | 中间代码与功能核对（固定5b6f4dc） | 开发覆盖41.3% | [006-progress-checkpoint](006-progress-checkpoint.md) |
 | 006-Q2 | 成长/三路线完成后核对（固定e513c0b） | 开发覆盖50.7% | [006-travel-progress-checkpoint](006-travel-progress-checkpoint.md) |
-| 006F-2 | 持久随机事件、分支与独立事件CG | 分模块开发中 | — |
+| 006F-2C/D | v7真实随机触发、分支、事件CG、实际事件箱 | SQLite/业务/页面验证通过 | [006f2-random-event-authority](006f2-random-event-authority.md) |
 | 007A-1 | AI 人格/Provider/逐宠会话及记忆契约 | 专项136项通过 | [007a1-ai-contract](007a1-ai-contract.md) |
 | 007A-2 | OpenAI-compatible Provider、受限流、人格 prompt | Fake fetch 61项通过，真实服务待配置 | [007a2-provider-adapter](007a2-provider-adapter.md) |
 | 007A-3 | 逐宠异步会话、取消、持久终态 port 与授权候选 | 33项专项通过；实际存储接入待完成 | [007a3-chat-coordinator](007a3-chat-coordinator.md) |

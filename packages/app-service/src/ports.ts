@@ -1,6 +1,8 @@
 import type {
-  Activity, AppSnapshot, CgAssetRef, DomainEvent, HealthStatus, IpcErrorCode, Mood, Presence, Visibility,
+  Activity, AppSnapshot, CgAssetRef, DomainEvent, HealthStatus, IpcErrorCode, Mood, Presence, Visibility, PinnedCgAssetRef,
 } from '@pet-desktop/contracts';
+import type { EventListQuery, EventReward } from '@pet-desktop/contracts/events';
+import type { EventHistoryEntry, EventSelectionResult, EventTrigger, FrozenEventOccurrence } from '@pet-desktop/domain/event-engine';
 import type { EquipmentSlot } from '@pet-desktop/contracts/inventory';
 import type { TripDepartureLoadout, TravelReportsQuery } from '@pet-desktop/contracts/travel';
 import type { TripDepartureLoadoutRecord } from './trip-departure-storage.js';
@@ -159,6 +161,31 @@ export interface TripCgAssetPin {
   assetRef: Exclude<CgAssetRef, { state: 'LEGACY_UNVERSIONED' }>;
 }
 
+/** Persistent selection audit, including a decision not to create an event. */
+export type EventTriggerReceipt = {
+  triggerKey: string; petId: string; trigger: EventTrigger; seed: number; at: number;
+  rngState: number; drawCount: 0 | 1 | 2; sourceTripId: string | null; routeId: string | null;
+} & ({kind: 'NO_EVENT'; reason: Extract<EventSelectionResult, {kind:'NO_EVENT'}>['reason']}
+  | {kind:'OCCURRENCE'; occurrenceId: string});
+
+/** Frozen historical definition and separately committed actual effects. */
+export interface EventOccurrenceRecord {
+  occurrence: FrozenEventOccurrence;
+  status: 'PENDING' | 'RESOLVED' | 'EXPIRED';
+  resolvedAt: number | null; choiceId: string | null; resultText: string | null;
+  rewards: EventReward[]; commandId: string | null;
+}
+export interface EventFinalizationRecord {
+  occurrenceId: string; status: 'RESOLVED' | 'EXPIRED'; resolvedAt: number;
+  choiceId: string | null; resultText: string; rewards: EventReward[]; commandId: string | null;
+}
+/** A narrative unlock has an occurrence source, never a fictitious trip. */
+export interface EventCgUnlock {
+  petId: string; cgId: string; variant: string; sourceEventId: string; unlockedAt: number;
+  assetRef: PinnedCgAssetRef; historicalCharacterId: string; historicalEventDefId: string;
+  favorite: boolean; viewedAt: number | null;
+}
+
 export interface OutboxRecord {
   seq: number;
   event: DomainEvent;
@@ -190,6 +217,15 @@ export interface AppTransaction {
   insertSettlement(settlement: SettlementRecord): boolean;
   insertReward(line: RewardLine): boolean;
   listRewards(sourceId: string): RewardLine[];
+  getEventTriggerReceipt(triggerKey: string): EventTriggerReceipt | null;
+  insertEventTriggerReceipt(record: EventTriggerReceipt): void;
+  insertEventOccurrence(occurrence: FrozenEventOccurrence): void;
+  getEventOccurrence(occurrenceId: string): EventOccurrenceRecord | null;
+  listEventHistory(petId: string, at: number): EventHistoryEntry[];
+  countPendingEvents(petId?: string): number;
+  listDueEvents(at: number): EventOccurrenceRecord[];
+  listEvents(query: EventListQuery): { total: number; pendingTotal: number; events: EventOccurrenceRecord[] };
+  finalizeEventOccurrence(record: EventFinalizationRecord): boolean;
   getWalletCoins(): number;
   setWalletCoins(coins: number): void;
   listInventory(): InventoryItem[];
@@ -210,6 +246,8 @@ export interface AppTransaction {
   listTripCgAssetPins(tripId: string): TripCgAssetPin[];
   getCgUnlock(petId: string, cgId: string, variant: string): CgUnlock | null;
   listCgUnlocks(petId: string): CgUnlock[];
+  getEventCgUnlock(petId: string, cgId: string, variant: string): EventCgUnlock | null;
+  listEventCgUnlocks(petId: string): EventCgUnlock[];
   unlockCg(unlock: CgUnlockInput): boolean;
   setCgFavorite(petId: string, cgId: string, variant: string, favorite: boolean): boolean;
   markCgViewed(petId: string, cgId: string, variant: string, characterId: string, eventDefId: string,

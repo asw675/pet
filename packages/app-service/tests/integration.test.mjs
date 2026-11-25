@@ -12,6 +12,9 @@ import { HOME_RULES, advanceHomeState } from '@pet-desktop/domain/home-simulatio
 import { ITEM_CATALOG_VERSION } from '@pet-desktop/domain/item-catalog';
 import { ROUTE_CATALOG_VERSION } from '@pet-desktop/domain/route-catalog';
 import { cumulativeXpAtLevel } from '@pet-desktop/domain/progression';
+import { EVENT_CATALOG } from '@pet-desktop/domain/event-catalog';
+import { selectEvent } from '@pet-desktop/domain/event-engine';
+import { eventSeed } from '../src/event-service.ts';
 
 const initialTime = 1_800_000_000_000;
 const minutes = (n) => n * 60_000;
@@ -29,7 +32,7 @@ const supported = major > 3 || (major === 3 && (minor > 51 || (minor === 51 && p
 const directories = [];
 const openRepositories = new Set();
 
-function fixture() {
+function fixture(eventPolicy = false) {
   const directory = mkdtempSync(join(tmpdir(), 'pet-desktop-integration-'));
   directories.push(directory);
   const dbPath = join(directory, 'state.sqlite');
@@ -46,7 +49,7 @@ function fixture() {
     const repo = new SQLiteRepository(connection, { persistent: true, ...rest,
       ...(beforeMigration ? { beforeMigration: (from, to) => beforeMigration(connection, from, to) } : {}) });
     openRepositories.add(repo);
-    const service = new AppService(wrap(repo), runtime);
+    const service = eventPolicy === true ? new AppService(wrap(repo), runtime) : new AppService(wrap(repo), runtime, eventPolicy);
     return { repo, service, close: () => { service.close(); openRepositories.delete(repo); } };
   };
   const command = (type, payload, commandId = `command-${++sequence}`, expectedRevision) => ({
@@ -78,6 +81,305 @@ function readGallery(service, query = {}) {
   expect(result.gallery.revision).toBe(result.snapshot.revision);
   return result;
 }
+
+function readEvents(service, query = {}) {
+  const result = service.handleRequest({ schemaVersion: 1, requestId: 'event-query', method: 'events/list',
+    payload: { filter: 'ALL', offset: 0, limit: 30, ...query } });
+  expect(result.ok).toBe(true);
+  expect(result.events.revision).toBe(result.snapshot.revision);
+  return result;
+}
+
+const allEventChances = Object.freeze({ HOME_DAILY: 10000, AFTER_INTERACTION: 10000, TRIP_RETURNED: 10000, BOND_MILESTONE: 10000 });
+const DAY = 86_400_000;
+const triggerKey = (kind, petId, source) => JSON.stringify([kind, petId, source]);
+
+describe.skipIf(!supported)('narrative events + real SQLite authority', () => {
+  it('uses the production policy, persists chance/no-event, hides effects, and commits a chosen branch once across restart', () => {
+    const f = fixture(true);
+    let instance = f.open();
+    const first = readEvents(instance.service);
+    expect(first.events.pendingTotal).toBe(1); // stable default policy seed for initialTime
+    const pending = first.events.rows[0];
+    expect(pending).toMatchObject({ eventId: 'star-singer.starlight-notes', status: 'PENDING', occurredAt: initialTime,
+      deadlineAt: initialTime + DAY, rewards: [], artState: 'NONE' });
+    expect(pending).not.toHaveProperty('effects');
+    expect(pending.choices[0]).not.toHaveProperty('effects');
+    const day = Math.floor(initialTime / DAY);
+    const receipts = instance.repo.transaction(tx => [tx.getEventTriggerReceipt(triggerKey('HOME_DAILY', 'pet-1', day)),
+      tx.getEventTriggerReceipt(triggerKey('HOME_DAILY', 'pet-2', day))]);
+    expect(receipts[0]).toMatchObject({ kind: 'OCCURRENCE', occurrenceId: pending.occurrenceId, drawCount: 2 });
+    expect(receipts[1]).toMatchObject({ kind: 'NO_EVENT', reason: 'NO_ELIGIBLE', drawCount: 0 });
+    expect(readEvents(instance.service)).toEqual(first);
+    const choice = { petId: 'pet-1', occurrenceId: pending.occurrenceId, choiceId: 'study-herbs' };
+    expect(f.request(instance.service, f.command('EVENT_CHOOSE', { ...choice, petId: 'pet-2' }, 'wrong-owner', first.snapshot.revision)))
+      .toMatchObject({ ok: false, error: { code: 'NOT_FOUND' } });
+    const command = f.command('EVENT_CHOOSE', choice, 'daily-branch', first.snapshot.revision);
+    const chosen = expectSuccess(f.request(instance.service, command));
+    expect(chosen.revision).toBe(first.snapshot.revision + 1);
+    expect(chosen.pets[0].bond).toBe(0.5);
+    const resolved = readEvents(instance.service, { filter: 'HISTORY' }).events.rows[0];
+    expect(resolved).toMatchObject({ status: 'RESOLVED', selectedChoiceId: 'study-herbs', resolvedAt: initialTime,
+      rewards: expect.arrayContaining([{ kind: 'MOOD_DELTA', delta10: 10 }, { kind: 'BOND_DELTA', delta10: 5 }, { kind: 'ITEM', itemId: 'herb', quantity: 1 }]) });
+    expect(instance.repo.transaction(tx => tx.listInventory().find(row => row.itemId === 'herb').quantity)).toBe(1);
+    instance.close(); instance = f.open();
+    expect(expectSuccess(f.request(instance.service, command))).toEqual(chosen);
+    const current = readEvents(instance.service);
+    expect(current.events.rows).toEqual([resolved]);
+    expect(f.request(instance.service, f.command('EVENT_CHOOSE', choice, 'duplicate-choice', current.snapshot.revision)))
+      .toMatchObject({ ok: false, error: { code: 'BUSINESS_RULE' } });
+    expect(instance.repo.transaction(tx => tx.listInventory().find(row => row.itemId === 'herb').quantity)).toBe(1);
+    expect(instance.repo.transaction(tx => tx.getEventTriggerReceipt(triggerKey('HOME_DAILY','pet-1', day)))).toEqual(receipts[0]);
+    f.advance(initialTime + DAY * 5);
+    const later = readEvents(instance.service);
+    expect(later.events.total).toBeLessThanOrEqual(2);
+    for (let offset = 1; offset < 5; offset++) expect(instance.repo.transaction(tx => tx.getEventTriggerReceipt(triggerKey('HOME_DAILY', 'pet-1', day + offset)))).toBeNull();
+    expect(instance.repo.transaction(tx => tx.getEventTriggerReceipt(triggerKey('HOME_DAILY','pet-1', day + 5)))).not.toBeNull();
+  });
+
+  it('only a rewarded pet interaction triggers an independent event; cooldown clicks and receipt retries do not reroll', () => {
+    const f = fixture(allEventChances); const instance = f.open();
+    readEvents(instance.service);
+    const click = f.command('PET_INTERACT', { petId: 'pet-2', interaction: 'PET' }, 'fluffy-touch');
+    const touched = expectSuccess(f.request(instance.service, click));
+    const first = readEvents(instance.service, { petId: 'pet-2' });
+    expect(first.events.rows).toHaveLength(1);
+    expect(first.events.rows[0]).toMatchObject({ eventId: 'fluffy-ranger.forest-tea', trigger: 'AFTER_INTERACTION' });
+    expect(instance.repo.transaction(tx => tx.getEventTriggerReceipt(triggerKey('AFTER_INTERACTION','pet-2','fluffy-touch')))).toMatchObject({ kind: 'OCCURRENCE' });
+    expect(expectSuccess(f.request(instance.service, click))).toEqual(touched);
+    expectSuccess(f.request(instance.service, f.command('PET_INTERACT', { petId: 'pet-2', interaction: 'PET' }, 'cooldown-touch')));
+    expect(instance.repo.transaction(tx => tx.getEventTriggerReceipt(triggerKey('AFTER_INTERACTION','pet-2','cooldown-touch')))).toBeNull();
+    expect(readEvents(instance.service, { petId: 'pet-2' }).events.rows).toEqual(first.events.rows);
+    expect(readEvents(instance.service, { petId: 'pet-2', offset: 1, limit: 1 }).events.rows).toEqual([]);
+  });
+
+  it('resolves a milestone created by an actual event bond gain, with an exact pinned event CG and unified favorite/view', () => {
+    const f = fixture(allEventChances); let instance = f.open();
+    // Existing legitimate progression just below the milestone (no historic
+    // event trigger is synthesized from this pre-v7 state).
+    instance.repo.transaction(tx => tx.savePet({ ...tx.getPet('pet-1'), xp: 100, bond10: 190 }));
+    const notes = readEvents(instance.service, { petId: 'pet-1' });
+    expect(notes.events.rows).toHaveLength(1);
+    expect(instance.repo.transaction(tx => tx.getEventTriggerReceipt(triggerKey('BOND_MILESTONE','pet-1',200)))).toBeNull();
+    expectSuccess(f.request(instance.service, f.command('EVENT_CHOOSE', { petId: 'pet-1', occurrenceId: notes.events.rows[0].occurrenceId,
+      choiceId: 'share-notes' }, 'real-crossing', notes.snapshot.revision)));
+    const milestone = readEvents(instance.service, { petId: 'pet-1', filter: 'PENDING' });
+    const star = milestone.events.rows[0];
+    expect(star).toMatchObject({ eventId: 'star-singer.shared-constellation', eventVersion: 2, artState: 'LOCKED' });
+    expect(readGallery(instance.service, { petId: 'pet-1', eventDefId: star.eventId }).gallery.rows[0]).not.toHaveProperty('assetRef');
+    const choose = f.command('EVENT_CHOOSE', { petId: 'pet-1', occurrenceId: star.occurrenceId, choiceId: 'keep-the-memory' }, 'constellation-choice', milestone.snapshot.revision);
+    expectSuccess(f.request(instance.service, choose));
+    expect(readEvents(instance.service, { filter: 'HISTORY', petId: 'pet-1' }).events.rows.find(row => row.occurrenceId === star.occurrenceId))
+      .toMatchObject({ artState: 'UNLOCKED', rewards: expect.arrayContaining([{ kind: 'CG_UNLOCK', cgId: star.eventId, variant: 'default', newlyUnlocked: true }]) });
+    const gallery = readGallery(instance.service, { petId: 'pet-1', filter: 'UNLOCKED' }).gallery.rows;
+    expect(gallery).toHaveLength(1);
+    const cg = gallery[0];
+    expect(cg).toMatchObject({ sourceTripId: null, sourceEventId: star.occurrenceId, assetRef: { state: 'PINNED', assetVersion: '1.0.0' } });
+    const ids = { petId: 'pet-1', cgId: cg.cgId, variant: cg.variant };
+    expectSuccess(f.request(instance.service, f.command('CG_SET_FAVORITE', { ...ids, favorite: true })));
+    const { state: _, ...ref } = cg.assetRef;
+    expectSuccess(f.request(instance.service, f.command('CG_MARK_VIEWED', { ...ids, ...ref })));
+    instance.close(); instance = f.open();
+    expect(readGallery(instance.service, { filter: 'FAVORITES' }).gallery.rows[0]).toMatchObject({ sourceEventId: star.occurrenceId,
+      favorite: true, viewedAt: initialTime, assetRef: cg.assetRef });
+    expect(instance.repo.transaction(tx => tx.listCgUnlocks('pet-1'))).toEqual([]);
+    expect(instance.repo.transaction(tx => tx.listEventCgUnlocks('pet-1'))).toHaveLength(1);
+  });
+
+  it('expires an event at its frozen deadline while offsite, then settles travel in due order without modifying its ledger', () => {
+    const f = fixture(allEventChances); let instance = f.open();
+    const notes = readEvents(instance.service, { petId: 'pet-1' }).events.rows[0];
+    const departs = notes.deadlineAt - minutes(5);
+    f.advance(departs);
+    const started = expectSuccess(f.request(instance.service, f.command('TRIP_START', { petId: 'pet-1', routeId: DEMO_ROUTE.routeId })));
+    const tripId = started.pets[0].trip.tripId;
+    const frozen = instance.repo.transaction(tx => tx.getTrip(tripId).snapshot);
+    f.advance(notes.deadlineAt);
+    const expired = readEvents(instance.service, { petId: 'pet-1', filter: 'HISTORY' });
+    expect(expired.events.rows[0]).toMatchObject({ status: 'EXPIRED', selectedChoiceId: 'share-notes', resolvedAt: notes.deadlineAt });
+    expect(expired.snapshot.pets[0]).toMatchObject({ presence: 'AWAY', energy: started.pets[0].energy, bond: 1.5, xp: 0 });
+    expect(instance.repo.transaction(tx => tx.getTrip(tripId).snapshot)).toEqual(frozen);
+    f.advance(departs + minutes(15));
+    const settled = readEvents(instance.service);
+    expect(settled.snapshot.pets[0].presence).toBe('HOME');
+    const ledger = instance.repo.transaction(tx => tx.listRewards(tripId));
+    expect(ledger.every(row => row.sourceType === 'TRIP')).toBe(true);
+    const outbox = instance.repo.transaction(tx => tx.listOutbox(0, 100)).map(row => row.event);
+    expect(outbox.findIndex(row => row.type === 'EventFinalized')).toBeLessThan(outbox.findIndex(row => row.type === 'TripSettled'));
+    instance.close(); instance = f.open();
+    expect(instance.repo.transaction(tx => tx.listRewards(tripId))).toEqual(ledger);
+    expect(readEvents(instance.service, { filter: 'HISTORY', petId: 'pet-1' }).events.rows[0].resolvedAt).toBe(notes.deadlineAt);
+  });
+
+  it('creates a homecoming from actual return time and expires it during offline catch-up with separate CG acquisition', () => {
+    const f = fixture(allEventChances); let instance = f.open();
+    const started = expectSuccess(f.request(instance.service, f.command('TRIP_START', { petId: 'pet-2', routeId: DEMO_ROUTE.routeId })));
+    const tripId = started.pets[1].trip.tripId;
+    f.advance(initialTime + 2 * DAY);
+    const report = readEvents(instance.service, { petId: 'pet-2', filter: 'HISTORY' });
+    const trip = instance.repo.transaction(tx => tx.getTrip(tripId));
+    const actual = trip.checkpoint.actualReturnedAt;
+    expect(report.events.rows).toHaveLength(1);
+    const event = report.events.rows[0];
+    expect(event).toMatchObject({ eventId: 'fluffy-ranger.meadow-homecoming', trigger: 'TRIP_RETURNED', sourceTripId: tripId,
+      occurredAt: actual, deadlineAt: actual + DAY, resolvedAt: actual + DAY, status: 'EXPIRED', artState: 'UNLOCKED' });
+    expect(report.snapshot.pets[1].presence).toBe('HOME');
+    const cg = readGallery(instance.service, { petId: 'pet-2', eventDefId: event.eventId }).gallery.rows[0];
+    expect(cg).toMatchObject({ sourceTripId: null, sourceEventId: event.occurrenceId, unlockedAt: actual + DAY });
+    const ledger = instance.repo.transaction(tx => tx.listRewards(tripId));
+    expect(ledger.every(row => row.sourceType === 'TRIP' && row.sourceId === tripId)).toBe(true);
+    instance.close(); instance = f.open();
+    expect(readEvents(instance.service, { petId: 'pet-2', filter: 'HISTORY' }).events.rows).toEqual([event]);
+    expect(instance.repo.transaction(tx => tx.listRewards(tripId))).toEqual(ledger);
+  });
+
+  it('rolls back effects, finalization and receipt when an outbox append fails; the same choice can then be retried', () => {
+    const f = fixture(allEventChances); let fail = false;
+    const instance = f.open(repo => ({ transaction: action => repo.transaction(tx => action(new Proxy(tx, {
+      get(target, key) { const value = target[key];
+        if (key === 'appendOutbox') return event => { if (fail && event.type === 'EventFinalized') throw new Error('injected failure'); return value.call(target, event); };
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    }))), close: () => repo.close() }));
+    const first = readEvents(instance.service, { petId: 'pet-1' });
+    const occurrenceId = first.events.rows[0].occurrenceId;
+    const command = f.command('EVENT_CHOOSE', { petId: 'pet-1', occurrenceId, choiceId: 'study-herbs' }, 'failed-choice', first.snapshot.revision);
+    fail = true;
+    expect(f.request(instance.service, command)).toMatchObject({ ok: false, error: { code: 'INTERNAL_ERROR' } });
+    expect(instance.repo.transaction(tx => tx.getEventOccurrence(occurrenceId))).toMatchObject({ status: 'PENDING', rewards: [] });
+    expect(instance.repo.transaction(tx => tx.getCommandReceipt(command.commandId))).toBeNull();
+    expect(instance.repo.transaction(tx => tx.listInventory())).toEqual([]);
+    fail = false;
+    expectSuccess(f.request(instance.service, command));
+    expect(instance.repo.transaction(tx => tx.listInventory())).toEqual([{ itemId: 'herb', quantity: 1 }]);
+  });
+
+  it('records an eligible chance miss and never draws again on repeat polling or reopen', () => {
+    const f = fixture({ ...allEventChances, HOME_DAILY: 0 }); let instance = f.open();
+    const initial = readEvents(instance.service);
+    expect(initial.events.total).toBe(0);
+    const key = triggerKey('HOME_DAILY', 'pet-1', Math.floor(initialTime / DAY));
+    const miss = instance.repo.transaction(tx => tx.getEventTriggerReceipt(key));
+    expect(miss).toMatchObject({ kind: 'NO_EVENT', reason: 'CHANCE_MISS', drawCount: 1, seed: eventSeed(key) });
+    instance.close(); instance = f.open();
+    expect(readEvents(instance.service)).toEqual(initial);
+    expect(instance.repo.transaction(tx => tx.getEventTriggerReceipt(key))).toEqual(miss);
+  });
+
+  it('records a cap-denied trigger durably per pet even after one old occurrence is finalized', () => {
+    const f = fixture(allEventChances); const instance = f.open();
+    // Load three independently frozen, pending historical selections. This is
+    // a storage fixture for future catalogs with more simultaneous branches,
+    // not a UI ability to create occurrences or bypass current cooldowns.
+    instance.repo.transaction(tx => {
+      for (let i = 0; i < 3; i++) {
+        const key = triggerKey('AFTER_INTERACTION', 'pet-2', `historical-${i}`);
+        const result = selectEvent(EVENT_CATALOG, { trigger: 'AFTER_INTERACTION', triggerKey: key, occurrenceId: `historical-event-${i}`,
+          seed: eventSeed(key), at: initialTime, chanceBps: 10000, history: [],
+          context: { petId: 'pet-2', characterId: 'fluffy-ranger', presence: 'HOME', level: 1, bond10: 0 } });
+        if (result.kind !== 'OCCURRENCE') throw new Error('Cannot construct frozen history fixture');
+        tx.insertEventTriggerReceipt({ triggerKey: key, petId: 'pet-2', trigger: 'AFTER_INTERACTION', seed: result.seed, at: initialTime,
+          rngState: result.rngState, drawCount: result.drawCount, sourceTripId: null, routeId: null, kind: 'OCCURRENCE', occurrenceId: result.occurrence.occurrenceId });
+        tx.insertEventOccurrence(result.occurrence);
+      }
+    });
+    const before = readEvents(instance.service);
+    expect(before.events.pendingTotal).toBe(4); // cap per pet, star can still create her daily event
+    const touch = f.command('PET_INTERACT', { petId: 'pet-2', interaction: 'PET' }, 'cap-touch');
+    const hitCap = expectSuccess(f.request(instance.service, touch));
+    const key = triggerKey('AFTER_INTERACTION', 'pet-2', 'cap-touch');
+    const receipt = instance.repo.transaction(tx => tx.getEventTriggerReceipt(key));
+    expect(receipt).toMatchObject({ kind: 'NO_EVENT', reason: 'TRIGGER_INELIGIBLE', drawCount: 0 });
+    expectSuccess(f.request(instance.service, f.command('EVENT_CHOOSE', { petId: 'pet-2', occurrenceId: 'historical-event-0',
+      choiceId: 'prepare-trail' }, 'free-capacity', hitCap.revision)));
+    expect(expectSuccess(f.request(instance.service, touch))).toEqual(hitCap);
+    expect(instance.repo.transaction(tx => tx.getEventTriggerReceipt(key))).toEqual(receipt);
+    expect(readEvents(instance.service, { petId: 'pet-2', filter: 'PENDING' }).events.total).toBe(2);
+  });
+
+  it('consumes a gift and creates one milestone within the exact immutable commerce receipt revision', () => {
+    const f = fixture(allEventChances); const instance = f.open();
+    const notes = readEvents(instance.service, { petId: 'pet-1' });
+    expectSuccess(f.request(instance.service, f.command('EVENT_CHOOSE', { petId: 'pet-1', occurrenceId: notes.events.rows[0].occurrenceId,
+      choiceId: 'share-notes' }, 'gift-prerequisite', notes.snapshot.revision)));
+    instance.repo.transaction(tx => { tx.savePet({ ...tx.getPet('pet-1'), xp: 100, bond10: 190 }); tx.addInventory('flower-bouquet', 2); });
+    const before = instance.service.getSnapshot();
+    expect(instance.repo.transaction(tx => tx.getEventTriggerReceipt(triggerKey('BOND_MILESTONE', 'pet-1', 200)))).toBeNull();
+    const gift = f.command('ITEM_USE', { petId: 'pet-1', itemId: 'flower-bouquet', catalogVersion: ITEM_CATALOG_VERSION }, 'gift-crossing', before.revision);
+    const result = expectSuccess(f.request(instance.service, gift));
+    expect(result.revision).toBe(before.revision + 1);
+    expect(result.pets[0].bond).toBe(21);
+    expect(readEvents(instance.service, { petId: 'pet-1', filter: 'PENDING' }).events.rows[0]).toMatchObject({ eventId: 'star-singer.shared-constellation' });
+    expect(expectSuccess(f.request(instance.service, gift))).toEqual(result);
+    expect(instance.repo.transaction(tx => tx.listInventory().find(row => row.itemId === 'flower-bouquet').quantity)).toBe(1);
+    expect(instance.repo.transaction(tx => tx.getCommerceOperation('gift-crossing'))).toMatchObject({ type: 'ITEM_USE', itemId: 'flower-bouquet' });
+  });
+
+  it('consumes a crossed milestone without prerequisites and only considers a later genuinely crossed threshold', () => {
+    const f = fixture(allEventChances); const instance = f.open();
+    instance.repo.transaction(tx => tx.savePet({ ...tx.getPet('pet-1'), xp: 100, bond10: 195 }));
+    const notes = readEvents(instance.service, { petId: 'pet-1' });
+    const threshold200 = triggerKey('BOND_MILESTONE', 'pet-1', 200);
+    expect(instance.repo.transaction(tx => tx.getEventTriggerReceipt(threshold200))).toBeNull();
+    const first = expectSuccess(f.request(instance.service, f.command('PET_INTERACT', { petId: 'pet-1', interaction: 'PET' }, 'early-bond-cross')));
+    const denied = instance.repo.transaction(tx => tx.getEventTriggerReceipt(threshold200));
+    expect(denied).toMatchObject({ kind: 'NO_EVENT', reason: 'NO_ELIGIBLE', drawCount: 0 });
+    expectSuccess(f.request(instance.service, f.command('EVENT_CHOOSE', { petId: 'pet-1', occurrenceId: notes.events.rows[0].occurrenceId,
+      choiceId: 'share-notes' }, 'prerequisite-later', first.revision)));
+    expect(readEvents(instance.service, { petId: 'pet-1', filter: 'PENDING' }).events.total).toBe(0);
+    expect(instance.repo.transaction(tx => tx.getEventTriggerReceipt(threshold200))).toEqual(denied);
+    instance.repo.transaction(tx => tx.savePet({ ...tx.getPet('pet-1'), bond10: 495 }));
+    f.advance(initialTime + HOME_RULES.petCooldownMs);
+    expectSuccess(f.request(instance.service, f.command('PET_INTERACT', { petId: 'pet-1', interaction: 'PET' }, 'later-bond-cross')));
+    expect(instance.repo.transaction(tx => tx.getEventTriggerReceipt(triggerKey('BOND_MILESTONE', 'pet-1', 500)))).toMatchObject({ kind: 'OCCURRENCE' });
+    expect(readEvents(instance.service, { petId: 'pet-1', filter: 'PENDING' }).events.rows[0]).toMatchObject({ eventId: 'star-singer.shared-constellation' });
+    expect(instance.repo.transaction(tx => tx.getEventTriggerReceipt(triggerKey('BOND_MILESTONE', 'pet-1', 800)))).toBeNull();
+  });
+
+  it('allows a pending choice while away, clamps saturation, and never mutates the frozen trip', () => {
+    const f = fixture(allEventChances); const instance = f.open();
+    const notes = readEvents(instance.service, { petId: 'pet-1' }).events.rows[0];
+    instance.repo.transaction(tx => tx.savePet({ ...tx.getPet('pet-1'), moodScore10: 995, bond10: 995 }));
+    const started = expectSuccess(f.request(instance.service, f.command('TRIP_START', { petId: 'pet-1', routeId: DEMO_ROUTE.routeId })));
+    const tripId = started.pets[0].trip.tripId;
+    const frozen = instance.repo.transaction(tx => tx.getTrip(tripId));
+    const result = expectSuccess(f.request(instance.service, f.command('EVENT_CHOOSE', { petId: 'pet-1', occurrenceId: notes.occurrenceId,
+      choiceId: 'share-notes' }, 'offsite-choice', started.revision)));
+    expect(result.pets[0]).toMatchObject({ presence: 'AWAY', energy: started.pets[0].energy, bond: 100, moodScore: 100, xp: 0 });
+    expect(readEvents(instance.service, { petId: 'pet-1', filter: 'HISTORY' }).events.rows[0].rewards)
+      .toEqual(expect.arrayContaining([{ kind: 'MOOD_DELTA', delta10: 5 }, { kind: 'BOND_DELTA', delta10: 5 }]));
+    expect(instance.repo.transaction(tx => tx.getTrip(tripId))).toEqual(frozen);
+    expect(instance.repo.transaction(tx => tx.listRewards(tripId))).toEqual([]);
+  });
+
+  it('automatically finalizes Nova’s homecoming in the return transaction and grants only one extra event item', () => {
+    const f = fixture(allEventChances); let instance = f.open();
+    for (let i = 0; i < 3; i++) {
+      f.advance(initialTime + minutes(120 * i));
+      expectSuccess(f.request(instance.service, f.command('TRIP_START', { petId: 'pet-1', routeId: DEMO_ROUTE.routeId })));
+      f.advance(initialTime + minutes(120 * i + 15)); instance.service.getSnapshot();
+    }
+    const acquired = expectSuccess(f.request(instance.service, f.command('PET_ACQUIRE', { characterId: 'nova', catalogVersion: CHARACTER_CATALOG_VERSION })));
+    const nova = acquired.pets.find(pet => pet.characterId === 'nova');
+    const started = expectSuccess(f.request(instance.service, f.command('TRIP_START', { petId: nova.petId, routeId: DEMO_ROUTE.routeId })));
+    const tripId = started.pets.find(pet => pet.petId === nova.petId).trip.tripId;
+    const stockBefore = instance.repo.transaction(tx => tx.listInventory().find(row => row.itemId === 'slime-gel')?.quantity ?? 0);
+    f.advance(initialTime + minutes(300));
+    const page = readEvents(instance.service, { petId: nova.petId, filter: 'HISTORY' });
+    const actual = instance.repo.transaction(tx => tx.getTrip(tripId).checkpoint.actualReturnedAt);
+    const auto = page.events.rows[0];
+    expect(auto).toMatchObject({ eventId: 'nova.field-calibration', status: 'RESOLVED', sourceTripId: tripId,
+      occurredAt: actual, resolvedAt: actual, selectedChoiceId: null, choices: [], deadlineAt: null,
+      rewards: expect.arrayContaining([{ kind: 'ITEM', itemId: 'slime-gel', quantity: 1 }]) });
+    const tripStock = instance.repo.transaction(tx => tx.listRewards(tripId).filter(row => row.kind === 'ITEM' && row.targetId === 'slime-gel')
+      .reduce((sum,row) => sum + row.amount,0));
+    const stockAfter = instance.repo.transaction(tx => tx.listInventory().find(row => row.itemId === 'slime-gel').quantity);
+    expect(stockAfter).toBe(stockBefore + tripStock + 1);
+    instance.close(); instance = f.open();
+    expect(readEvents(instance.service, { petId: nova.petId, filter: 'HISTORY' }).events.rows).toEqual([auto]);
+    expect(instance.repo.transaction(tx => tx.listInventory().find(row => row.itemId === 'slime-gel').quantity)).toBe(stockAfter);
+  });
+});
 
 function readCharacters(service) {
   const result = service.handleRequest({ schemaVersion: 1, requestId: 'characters-query', method: 'characters/list', payload: {} });
@@ -306,7 +608,7 @@ describe.skipIf(!supported)('application service + real SQLite persisted integra
       createdAt: initialTime,
     }));
     const runtime = { now: () => initialTime, seed: () => 8, createId: (kind) => `${kind}-unused` };
-    expect(() => new AppService(repo, runtime)).toThrow();
+    expect(() => new AppService(repo, runtime, false)).toThrow();
     expect(repo.transaction((tx) => tx.listPets())).toEqual([]);
   });
 
@@ -681,7 +983,7 @@ describe.skipIf(!supported)('persisted HOME recovery and bounded interactions', 
     instance.close();
     const upgraded = new DatabaseSync(f.dbPath, { readOnly: true });
     try {
-      expect(upgraded.prepare('PRAGMA user_version').get().user_version).toBe(6);
+      expect(upgraded.prepare('PRAGMA user_version').get().user_version).toBe(7);
       expect(upgraded.prepare('SELECT fingerprint,outcome_json,created_at FROM commands WHERE command_id=?').get(oldCommand.commandId))
         .toEqual({ fingerprint, outcome_json: outcome, created_at: initialTime });
       expect(upgraded.prepare('SELECT acquired_at FROM pet_acquisitions WHERE pet_id=?').get(petId).acquired_at)

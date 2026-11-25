@@ -106,7 +106,7 @@ describe('role-specific preload bridges', () => {
     const pet = createPetBridge(ipc);
     const center = createControlCenterBridge(ipc);
     expect(Object.keys(pet).sort()).toEqual([...commonKeys, 'setInteractive', 'reportVisualReady'].sort());
-    expect(Object.keys(center).sort()).toEqual([...commonKeys, 'listGallery', 'listCharacters', 'listInventory', 'listTravelCatalog', 'previewTravel', 'listTravelReports'].sort());
+    expect(Object.keys(center).sort()).toEqual([...commonKeys, 'listGallery', 'listCharacters', 'listInventory', 'listTravelCatalog', 'previewTravel', 'listTravelReports', 'listEvents'].sort());
     expect('reportVisualReady' in center).toBe(false);
     expect('listGallery' in pet).toBe(false);
     expect('listCharacters' in pet).toBe(false);
@@ -114,6 +114,7 @@ describe('role-specific preload bridges', () => {
     expect('listTravelCatalog' in pet).toBe(false);
     expect('previewTravel' in pet).toBe(false);
     expect('listTravelReports' in pet).toBe(false);
+    expect('listEvents' in pet).toBe(false);
     expect(pet.role).toBe('pet');
     expect(center.role).toBe('control-center');
     expect(Object.isFrozen(pet)).toBe(true);
@@ -155,6 +156,17 @@ describe('role-specific preload bridges', () => {
       travelReports: { revision: snapshot.revision, petId: null, offset: 12, limit: 10, total: 0, rows: [] } });
     expect(await bridge.listTravelReports({ offset: 0, limit: 10 })).toMatchObject({ ok: false, error: { code: 'INTERNAL_ERROR' } });
     expect(await bridge.listTravelReports({ offset: 0, limit: 21 })).toMatchObject({ ok: false, error: { code: 'INVALID_REQUEST' } });
+  });
+
+  it('correlates event history view and only accepts exact page/filter results', async () => {
+    const ipc=new FakeIpc(); const bridge=createControlCenterBridge(ipc,requestIds());
+    const query={filter:'PENDING' as const,offset:0,limit:10};
+    const result={schemaVersion:1,ok:true,requestId:'request-1',snapshot,events:{revision:snapshot.revision,petId:null,filter:'PENDING',offset:0,limit:10,total:0,pendingTotal:0,rows:[]}};
+    ipc.handle=()=>result;
+    expect(await bridge.listEvents(query)).toMatchObject({ok:true,events:{pendingTotal:0}});
+    ipc.handle=()=>({...result,requestId:'request-2',events:{...result.events,filter:'ALL'}});
+    expect(await bridge.listEvents(query)).toMatchObject({ok:false,error:{code:'INTERNAL_ERROR'}});
+    expect(await bridge.listEvents({...query,limit:31})).toMatchObject({ok:false,error:{code:'INVALID_REQUEST'}});
   });
 
   it('validates, wraps and correlates requests without changing the command ID', async () => {

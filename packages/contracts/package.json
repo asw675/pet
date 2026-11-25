@@ -9,6 +9,7 @@
     "./ai": "./src/ai.ts",
     "./voice": "./src/voice.ts",
     "./travel": "./src/travel.ts",
+    "./workspace": "./src/workspace.ts",
     "./events": "./src/events.ts"
   },
   "imports": {

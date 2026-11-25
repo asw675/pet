@@ -1,0 +1,20 @@
+appId: com.petdesktop.app
+productName: Pet Desktop
+directories:
+  output: release
+files:
+  - out/**/*
+  - package.json
+asarUnpack:
+  - '**/*.node'
+  - '**/better-sqlite3/**'
+npmRebuild: true
+win:
+  target:
+    - target: nsis
+      arch: x64
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  deleteAppDataOnUninstall: false

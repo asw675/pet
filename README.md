@@ -6,7 +6,7 @@
 
 - [V1.1 产品与技术设计基线](docs/design/V1.1.md)
 - [开发记录索引](docs/development/README.md)
-- [架构决策](docs/adr/0001-architecture-baseline.md)
+- [架构决策](docs/adr/0001-architecture-baseline.md) · [Electron 构建与沙箱](docs/adr/0003-electron-build-and-sandbox.md)
 - [POC 验收矩阵](docs/qa/poc-matrix.md)
 
 ## 工具链
@@ -25,7 +25,20 @@ mise exec node@26.12.1 -- pnpm test
 
 纯旅行领域的依赖无关 smoke 已可运行：在项目根目录执行 `pnpm test:smoke`。
 
-完整 SQLite POC 测试需 Node 26.12.1（或后续验证过且 SQLite 满足项目版本门槛的开发环境）；旧 Node 25 的内置 SQLite 3.51.2 不满足本项目文件数据库门槛。当前公共契约、领域和应用服务已实现，尚不存在可直接运行的 Electron UI；`pnpm dev` 将在宿主与双 renderer 原型完成后启用。依赖变更应提交真实生成的 `pnpm-lock.yaml`。
+完整 SQLite POC 测试需 Node 26.12.1（或后续验证过且 SQLite 满足项目版本门槛的开发环境）；旧 Node 25 的内置 SQLite 3.51.2 不满足本项目文件数据库门槛。依赖变更应提交真实生成的 `pnpm-lock.yaml`。
+
+### 桌面原型
+
+003 已建立 Electron Main、独立本地服务进程、两套受限 preload、两个 Vue renderer。首页、宠物馆、旅行地图、报告、设置使用真实服务投影，其余功能入口明确标记待开发。SVG 角色只用于工程原型，正式渲染与素材包见 004。
+
+```sh
+mise exec node@26.12.1 -- pnpm --filter @pet-desktop/desktop exec install-electron
+mise exec node@26.12.1 -- pnpm --filter @pet-desktop/desktop rebuild:native
+mise exec node@26.12.1 -- pnpm build
+mise exec node@26.12.1 -- pnpm dev
+```
+
+Electron 的运行时二进制及 native addon 必须在当前平台安装、重建。`pnpm build` 会验证独立入口和沙箱 preload，生成 `apps/desktop/out/`；开发存档单独写到 `apps/desktop/.data/development/`。原型的游戏命令接入本地业务服务，不使用模拟数据替代持久化。实际运行和平台发布的验证状态以 [POC 矩阵](docs/qa/poc-matrix.md) 为准。
 
 ## 目标环境
 

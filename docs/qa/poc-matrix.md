@@ -4,9 +4,9 @@
 
 | 门槛 | 核心内容 | 当前状态 | 证据/限制 |
 |---|---|---|---|
-| P0-01 | Windows 透明窗口、点击穿透、拖拽、多屏、免打扰 | 待开发 | 无 Windows 真机证据 |
-| P0-02 | 独立服务、双 renderer、受限 IPC、安装包 | 进行中 | 公共契约125/125、Node 独立子进程握手/请求/重启/退出通过；Electron utilityProcess、双 renderer、Windows 安装包待验证 |
-| P0-03 | SQLite、WAL、FTS5、迁移与故障恢复 | 进行中 | Node26 内置 SQLite 3.54.0 真实文件及仓储测试通过；better-sqlite3/Electron 安装版、Windows 与备份恢复待验证 |
+| P0-01 | Windows 透明窗口、点击穿透、拖拽、多屏、免打扰 | 原型已实现 | 小窗、DIP 夹紧、2秒命中租约、过期穿透与托盘兜底；真实 alpha、拖拽、混合 DPI、Win32 全屏、快捷键和 Windows 真机仍未验收 |
+| P0-02 | 独立服务、双 renderer、受限 IPC、安装包 | 进行中 | 公共契约125/125、Node 子进程、Electron utilityProcess 协议模拟、宿主边界、preload、Pinia 和六入口构建通过；真实 Electron 运行与 Windows 安装包仍待验证 |
+| P0-03 | SQLite、WAL、FTS5、迁移与故障恢复 | 进行中 | Node26 内置 SQLite 3.54.0 真实文件及仓储测试通过；已实现 utilityProcess 唯一持久连接与实际引擎版本检查，better-sqlite3/Electron ABI、Windows 与备份恢复待验证 |
 | P0-04 | 模拟确定性、离线结算、奖励幂等 | 开发机验证通过 | 领域 15/15、7/7 smoke；应用服务与真实 SQLite 7/7 集成、20次重启、离线结算、故障回滚和损坏检测通过；Windows 打包端需回归 |
 | P0-05 | 角色数据包、局部命中、序列帧、降级、CG 版本 | 待开发 | 未实现 |
 | P1-01 | AI 与逐宠记忆 | 待开发 | 后续阶段 |

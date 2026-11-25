@@ -13,7 +13,7 @@
 | 002B | 应用用例与原子结算 | 单元及真实数据库集成通过 | [002b-app-service](002b-app-service.md) |
 | 002C | 独立子进程验证 | Node 真实进程验证通过 | [002c-process](002c-process.md) |
 | 003-V | 首版单陪伴位与文档对齐 | 正式测试通过 | [003-visibility-alignment](003-visibility-alignment.md) |
-| 003 | 宿主、preload 与双 renderer 原型 | 开发中 | — |
+| 003 | 宿主、独立服务、preload 与双 renderer 原型（A–E、R） | 代码、类型、测试与构建通过；真实 Electron 启动待验证 | [003-desktop-host](003-desktop-host.md) |
 | 004 | 角色渲染及最小端到端闭环 | 待开发 | — |
 | 005 | Windows 安装包与真机 P0 验收 | 待开发 | — |
 

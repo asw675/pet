@@ -94,6 +94,7 @@ describe('snapshot projections', () => {
     { nickname: '' },
     { nickname: 'x'.repeat(81) },
     { presence: 'HIDDEN' },
+    { activity: null },
     { activity: 'EATING' },
     { mood: 'ANGRY' },
     { healthStatus: 'HEALTHY' },

@@ -54,6 +54,9 @@ export const petSnapshotSchema = z.strictObject({
   trip: tripSnapshotSchema.optional(),
 }).superRefine((pet, context) => {
   if (pet.presence === 'HOME') {
+    if (pet.activity === null) {
+      context.addIssue({ code: 'custom', path: ['activity'], message: 'A home pet requires a home activity' });
+    }
     if (pet.trip?.status === 'TRAVELING') {
       context.addIssue({ code: 'custom', path: ['trip', 'status'], message: 'A home pet cannot have an active trip' });
     }

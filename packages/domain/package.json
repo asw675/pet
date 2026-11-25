@@ -13,12 +13,15 @@
     "./item-catalog": "./src/item-catalog.ts",
     "./commerce-rules": "./src/commerce-rules.ts",
     "./route-catalog": "./src/route-catalog.ts",
-    "./trip-preparation": "./src/trip-preparation.ts"
+    "./trip-preparation": "./src/trip-preparation.ts",
+    "./event-engine": "./src/event-engine.ts",
+    "./event-catalog": "./src/event-catalog.ts"
   },
   "imports": {
     "#item-catalog": "./src/item-catalog.ts",
     "#equipment-rules": "./src/equipment-rules.ts",
-    "#route-catalog": "./src/route-catalog.ts"
+    "#route-catalog": "./src/route-catalog.ts",
+    "#event-engine": "./src/event-engine.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",

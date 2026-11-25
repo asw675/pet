@@ -3,7 +3,7 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import type { Interaction } from '@pet-desktop/contracts';
 import { useAppStore } from '../shared/store';
 import { petStatus, serviceStatusLabel } from '../shared/presentation';
-import PetPortrait from '../shared/PetPortrait.vue';
+import PetCanvas from './PetCanvas.vue';
 import { createInteractionLease } from '../shared/interaction-lease';
 
 const store = useAppStore();
@@ -11,7 +11,7 @@ const bridge = window.petDesktop?.role === 'pet' ? window.petDesktop : undefined
 const petId = new URL(window.location.href).searchParams.get('petId');
 const pet = computed(() => store.snapshot?.pets.find((entry) => entry.petId === petId));
 const canAct = computed(() => store.ready && !store.busy && !store.loading && pet.value?.presence === 'HOME');
-const sleeping = computed(() => pet.value?.activity === 'SLEEP' || pet.value?.activity === 'REST');
+const petCanvas = ref<InstanceType<typeof PetCanvas> | null>(null);
 const quietMotion = computed(() => !store.ready || !store.snapshot || store.snapshot.pausedRender || store.snapshot.doNotDisturb);
 const hostError = ref<string | null>(null);
 const openingCenter = ref(false);
@@ -32,14 +32,15 @@ function hitTest(renew = false): void {
     return;
   }
   const { x, y } = latestMouse;
-  // Hit-testing respects the portrait's clipped silhouette. Explicit drag
+  // The adapter transforms canvas-local CSS coordinates into the declared
+  // character regions, not the entire transparent canvas rectangle. Explicit drag
   // handle geometry is also accepted because native drag regions may consume
   // move events instead of exposing a regular DOM element target.
   const element = document.elementFromPoint(x, y);
   const dragHandle = document.querySelector('[data-drag]')?.getBoundingClientRect();
   const onDragHandle = dragHandle !== undefined && x >= dragHandle.left && x < dragHandle.right
     && y >= dragHandle.top && y < dragHandle.bottom;
-  const interactive = Boolean(element?.closest('[data-hit]') || onDragHandle);
+  const interactive = Boolean(element?.closest('[data-hit]') || onDragHandle || petCanvas.value?.hitTestClient(x, y));
   lease?.set(interactive, renew);
 }
 
@@ -94,6 +95,7 @@ async function openControlCenter(): Promise<void> {
 function interact(interaction: Interaction): void {
   if (!pet.value || !canAct.value) return;
   hostError.value = null;
+  if (interaction === 'PET') petCanvas.value?.playSemantic('tap.head');
   void store.dispatch({ type: 'PET_INTERACT', payload: { petId: pet.value.petId, interaction } },
     interaction === 'PET' ? '已互动，好感与心情已更新' : '已安排休息');
 }
@@ -108,9 +110,9 @@ function interact(interaction: Interaction): void {
         <span class="level">Lv.{{ pet.level }}</span>
         <button class="more" aria-label="打开控制中心" title="控制中心" :disabled="openingCenter" @click="openControlCenter">···</button>
       </div>
-      <button class="portrait-hit" data-hit :disabled="!canAct" :aria-label="`摸摸${pet.nickname}`" title="点击摸头" @click="interact('PET')">
-        <PetPortrait :character-id="pet.characterId" :sleeping="sleeping" :away="pet.presence !== 'HOME'" :paused="quietMotion" />
-      </button>
+      <div class="portrait-surface">
+        <PetCanvas ref="petCanvas" :character-id="pet.characterId" :activity="pet.activity" :paused="quietMotion" :interactive="canAct && canHit" @touch="interact('PET')" />
+      </div>
       <div class="state" data-hit>
         <span class="dot" :class="{ muted: !store.ready }"></span>
         {{ store.ready ? petStatus(pet) : serviceStatusLabel(store.serviceStatus) }}
@@ -153,9 +155,7 @@ button { -webkit-app-region: no-drag; app-region: no-drag; border: 1px solid #b4
 button:not(:disabled):hover, button:focus-visible { border-color: #efd2a0; background: #51415c; outline: none; }
 button:disabled { opacity: .62; cursor: default; }
 .more { display: grid; place-items: center; width: 25px; height: 21px; border: 0; border-radius: 7px; font-size: 16px; line-height: 1; }
-.portrait-hit { display: block; flex: 1; min-height: 100px; width: min(172px, 74vw); max-height: 166px; padding: 0; margin: 0; border: 0; background: transparent; clip-path: inset(0 round 25% 25% 28% 28%); }
-.portrait-hit:not(:disabled):hover, .portrait-hit:focus-visible { background: transparent; }
-.portrait-hit:disabled { opacity: 1; }
+.portrait-surface { display: block; flex: 1; min-height: 100px; width: min(172px, 74vw); max-height: 166px; padding: 0; margin: 0; }
 .state { display: flex; align-items: center; gap: 6px; background: #352b43ed; padding: 4px 8px; border-radius: 10px; font-size: 10px; border: 1px solid #b4a4d145; white-space: nowrap; }
 .dot { width: 6px; height: 6px; border-radius: 50%; background: #98daa3; }
 .dot.muted { background: #e3b67d; }

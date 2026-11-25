@@ -15,6 +15,16 @@
 
 开发阶段的每次提交必须记录完成范围、实际验证、失败原因和待验证项。不要将尚未执行的测试标为通过。
 
+### 当前开发环境验证
+
+```sh
+pnpm install
+pnpm typecheck
+pnpm test
+```
+
+当前只有公共契约和纯领域开发阶段，不存在可直接运行的 Electron 应用；`pnpm dev` 将在宿主与双 renderer 原型完成后启用。首次依赖安装成功后应提交真实生成的 `pnpm-lock.yaml`。
+
 ## 目标环境
 
 Windows 11 x64 优先，Windows 10 22H2 x64 作为兼容性验证环境。分阶段支持序列帧、经授权的 Live2D、AI、语音和快捷入口。

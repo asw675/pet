@@ -10,7 +10,7 @@ export interface CgCatalogEntry {
   readonly characterId: string;
   readonly cgId: string;
   readonly variant: string;
-  readonly routeId: string;
+  readonly routeId: string | null;
   readonly eventDefId: string;
   readonly assetVersion: string;
   readonly rarity: CgRarity;
@@ -51,7 +51,7 @@ export function serializeCgAssetDescriptor(entry: CgAssetDescriptor): string {
   });
 }
 
-function freezeEntry(entry: CgCatalogEntry): CgCatalogEntry {
+function freezeEntry<T extends CgCatalogEntry>(entry: T): T {
   return Object.freeze({
     ...entry,
     license: Object.freeze({ ...entry.license }),
@@ -66,7 +66,7 @@ function freezeEntry(entry: CgCatalogEntry): CgCatalogEntry {
  * than silently replace previously unlocked/pinned content. No gameplay
  * unlock, reward, favorite or view state is stored here.
  */
-export const BUILTIN_CG_CATALOG: readonly CgCatalogEntry[] = Object.freeze([
+export const BUILTIN_CG_CATALOG: readonly (CgCatalogEntry & { readonly routeId: string })[] = Object.freeze([
   freezeEntry({
     characterId: 'star-singer',
     cgId: 'morning-dew',
@@ -100,6 +100,41 @@ export const BUILTIN_CG_CATALOG: readonly CgCatalogEntry[] = Object.freeze([
     assetHash: 'e60e00265fae34a3e3b2685962e802cfc73f0bf4520e31ab0b197a8d010049fd',
   }),
 ]);
+
+/** New personal-story assets are authored separately. Service/gallery
+ * integration must use the source EVENT; old trip pins remain unchanged. */
+export const EVENT_CG_CATALOG: readonly CgCatalogEntry[] = Object.freeze([
+  freezeEntry({
+    characterId: 'star-singer', cgId: 'star-singer.shared-constellation', variant: 'default', routeId: null,
+    eventDefId: 'star-singer.shared-constellation', assetVersion: '1.0.0', rarity: 'RARE',
+    title: '只属于我们的星座', hint: '一起写过星光笔记后，星咏或许会与你绘制新的星图。',
+    caption: '月色洒进窗边，星咏在发光的星图旁把两颗星连成独特的记号。这是你们共同记录的一段回忆。',
+    license: { owner: 'Pet Desktop', reference: 'original-poc-fixture' },
+    image: { bytes: 83192, sha256: 'a9da709e3ba7608a4f7ea56544976bde2fee895e39b9d25679a7fbc2481c0653' },
+    thumbnail: { bytes: 22678, sha256: 'fb5b92f45a2283913018b2d4314839a3510f8ce60dcb5af8044259cb267288c6' },
+    assetHash: '20f15143d474fbda1db5acec6f277ba8f6a4581771a0afdef511a634ce2fe021',
+  }),
+  freezeEntry({
+    characterId: 'fluffy-ranger', cgId: 'fluffy-ranger.meadow-homecoming', variant: 'default', routeId: 'morning-dew-meadow',
+    eventDefId: 'fluffy-ranger.meadow-homecoming', assetVersion: '1.0.0', rarity: 'COMMON',
+    title: '归家暖意', hint: '绒绒从晨露草原归来时，或许会分享一段特别的旅行见闻。',
+    caption: '炉边灯火温暖，绒绒把旅行收集的花草摆在桌旁，坐下来慢慢讲述草地上的见闻。',
+    license: { owner: 'Pet Desktop', reference: 'original-poc-fixture' },
+    image: { bytes: 70089, sha256: '76aa8809834e13465ebde6f0217f3abeb6201dbbee9fe1d851042593ee258121' },
+    thumbnail: { bytes: 21252, sha256: '2113951b43b4055f538c05dfc89d85f03d3bb23ace1a0968ee1ff201dc40819a' },
+    assetHash: 'c133d4b622db732ccfeaa34648c9b3de0ff83986634c0345ac07ee7e8f2a3051',
+  }),
+]);
+
+export function findBuiltinEventCg(characterId: string, cgId: string, variant = 'default', assetVersion?: string): CgCatalogEntry | undefined {
+  let latest: CgCatalogEntry | undefined;
+  for (const entry of EVENT_CG_CATALOG) {
+    if (entry.characterId !== characterId || entry.cgId !== cgId || entry.variant !== variant) continue;
+    if (assetVersion !== undefined) { if (entry.assetVersion === assetVersion) return entry; }
+    else if (!latest || newer(entry.assetVersion, latest.assetVersion)) latest = entry;
+  }
+  return latest;
+}
 
 function newer(left: string, right: string): boolean {
   const l = left.split('.').map(Number);

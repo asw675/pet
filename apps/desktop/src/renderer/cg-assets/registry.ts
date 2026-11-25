@@ -1,6 +1,6 @@
 import { galleryRowSchema } from '@pet-desktop/contracts';
 import type { GalleryRow, UnlockedGalleryRow } from '@pet-desktop/contracts';
-import { BUILTIN_CG_CATALOG, serializeCgAssetDescriptor } from '@pet-desktop/domain/cg-catalog';
+import { BUILTIN_CG_CATALOG, EVENT_CG_CATALOG, serializeCgAssetDescriptor } from '@pet-desktop/domain/cg-catalog';
 import type { CgAssetFile, CgCatalogEntry } from '@pet-desktop/domain/cg-catalog';
 
 export type CgAssetKind = 'thumbnail' | 'image';
@@ -95,7 +95,8 @@ export function cgRowKey(row: GalleryRow): string {
 export function cgAcquisitionKey(row: UnlockedGalleryRow): string {
   const ref = row.assetRef;
   return JSON.stringify([
-    row.petId, row.cgId, row.variant, row.characterId, row.eventDefId, row.routeId, row.sourceTripId, row.unlockedAt,
+    row.petId, row.cgId, row.variant, row.characterId, row.eventDefId, row.routeId,
+    row.sourceTripId !== null ? ['TRIP', row.sourceTripId] : ['EVENT', row.sourceEventId], row.unlockedAt,
     ref.state, ...(ref.state === 'PINNED' ? [ref.characterId, ref.eventDefId, ref.assetVersion, ref.assetHash] : []),
   ]);
 }
@@ -103,7 +104,7 @@ export function cgAcquisitionKey(row: UnlockedGalleryRow): string {
 /** Only locally compiled exact catalog entries and static loader keys exist.
  * Locked, unavailable and legacy rows never resolve any artwork, and a pinned
  * version is never replaced by the newest catalog entry. */
-export function createCgAssetRegistry(catalog: readonly CgCatalogEntry[], loaders: CgAssetLoaderMap) {
+export function createCgAssetRegistry(catalog: readonly CgCatalogEntry[], loaders: CgAssetLoaderMap, eventCatalog: readonly CgCatalogEntry[] = []) {
   return async (rawRow: unknown, kind: CgAssetKind, signal: AbortSignal): Promise<CgAssetResult> => {
     try {
       checkAborted(signal);
@@ -114,7 +115,7 @@ export function createCgAssetRegistry(catalog: readonly CgCatalogEntry[], loader
       if (row.unlockStatus !== 'UNLOCKED') fail('LOCKED');
       const ref = row.assetRef;
       if (ref.state !== 'PINNED') fail(ref.state);
-      const matches = catalog.filter((entry) => entry.characterId === ref.characterId && entry.cgId === row.cgId
+      const matches = (row.sourceTripId === null ? eventCatalog : catalog).filter((entry) => entry.characterId === ref.characterId && entry.cgId === row.cgId
         && entry.variant === row.variant && entry.assetVersion === ref.assetVersion);
       const entry = matches.length === 1 ? matches[0] : undefined;
       if (!entry) fail(matches.length > 1 ? 'IDENTITY_MISMATCH' : 'VERSION_UNAVAILABLE');
@@ -143,4 +144,4 @@ export function createCgAssetRegistry(catalog: readonly CgCatalogEntry[], loader
 // Vite generates per-file lazy loaders; no network or arbitrary file access
 // is possible. `?inline` also avoids production fetch(file:) restrictions.
 const builtinLoaders = import.meta.glob<string>('./builtin/*/*/*/*/*.png', { query: '?inline', import: 'default' });
-export const resolveBuiltinCg = createCgAssetRegistry(BUILTIN_CG_CATALOG, builtinLoaders);
+export const resolveBuiltinCg = createCgAssetRegistry(BUILTIN_CG_CATALOG, builtinLoaders, EVENT_CG_CATALOG);

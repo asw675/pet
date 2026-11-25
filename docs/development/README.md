@@ -38,6 +38,7 @@
 | 006E-2B/C/D | v6三路线真实出发、物资与装备冻结、历史战报 | 数据库、专项、生产构建通过 | [006e2-travel-authority](006e2-travel-authority.md) |
 | 006F-1 | 随机剧情、分支冻结及六项原创事件 | 领域64项通过 | [006f1-event-engine](006f1-event-engine.md) |
 | 006F-2A | 事件待选、已提交效果与历史查询契约 | 5项专项通过，持久业务待接入 | [006f2a-event-projection](006f2a-event-projection.md) |
+| 006F-2B | 新增2个剧情CG、事件源图鉴、精确版本读取 | 实际PNG与专项测试通过，解锁事务待接入 | [006f2b-narrative-cg-assets](006f2b-narrative-cg-assets.md) |
 | 006-Q | 中间代码与功能核对（固定5b6f4dc） | 开发覆盖41.3% | [006-progress-checkpoint](006-progress-checkpoint.md) |
 | 006-Q2 | 成长/三路线完成后核对（固定e513c0b） | 开发覆盖50.7% | [006-travel-progress-checkpoint](006-travel-progress-checkpoint.md) |
 | 006F-2 | 持久随机事件、分支与独立事件CG | 分模块开发中 | — |

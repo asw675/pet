@@ -6,7 +6,7 @@ import { inflateSync } from 'node:zlib';
 import { describe, expect, it } from 'vitest';
 import { DEMO_ROUTE } from '@pet-desktop/domain';
 import {
-  BUILTIN_CG_CATALOG, findBuiltinCg, serializeCgAssetDescriptor, type CgCatalogEntry,
+  BUILTIN_CG_CATALOG, EVENT_CG_CATALOG, findBuiltinCg, findBuiltinEventCg, serializeCgAssetDescriptor, type CgCatalogEntry,
 } from '@pet-desktop/domain/cg-catalog';
 
 const CG_ROOT = fileURLToPath(new URL('../src/renderer/cg-assets/builtin/', import.meta.url));
@@ -188,5 +188,19 @@ describe('004E versioned built-in CG catalog and real artwork bytes', () => {
     expect(a.thumbnail.sha256).not.toBe(b.thumbnail.sha256);
     expect(a.assetHash).not.toBe(b.assetHash);
     expect(a.caption).not.toBe(b.caption);
+  });
+  it('ships two separate exact event CGs and thumbnails without modifying travel pins', () => {
+    expect(EVENT_CG_CATALOG).toHaveLength(2);
+    for (const entry of EVENT_CG_CATALOG) {
+      expect(findBuiltinEventCg(entry.characterId, entry.cgId, entry.variant, entry.assetVersion)).toBe(entry);
+      expect(findBuiltinEventCg(entry.characterId, entry.cgId, entry.variant, '0.9.0')).toBeUndefined();
+      expect(findBuiltinCg(entry.characterId, entry.cgId)).toBeUndefined();
+      expect(hash(serializeCgAssetDescriptor(entry))).toBe(entry.assetHash);
+      for (const [name, file] of [['image.png', entry.image], ['thumbnail.png', entry.thumbnail]] as const) {
+        const bytes = readFileSync(pathFor(entry, name));
+        expect(bytes.byteLength).toBe(file.bytes); expect(hash(bytes)).toBe(file.sha256);
+      }
+      expect(entry.image.sha256).not.toBe(entryFor(entry.characterId).image.sha256);
+    }
   });
 });

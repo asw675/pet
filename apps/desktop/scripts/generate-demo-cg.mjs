@@ -14,7 +14,7 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { deflateSync, inflateSync } from 'node:zlib';
-import { BUILTIN_CG_CATALOG, serializeCgAssetDescriptor } from '@pet-desktop/domain/cg-catalog';
+import { BUILTIN_CG_CATALOG, EVENT_CG_CATALOG, serializeCgAssetDescriptor } from '@pet-desktop/domain/cg-catalog';
 
 const SCRIPT = dirname(fileURLToPath(import.meta.url));
 const ART_ROOT = join(SCRIPT, '../src/renderer/asset-packs/builtin');
@@ -295,6 +295,73 @@ function renderScene(entry, sprite, spriteRect) {
   return draw;
 }
 
+/** Two new event-specific compositions; existing travel CG function/bytes
+ * are intentionally left unchanged. Original SD heroine sprite remains the
+ * engineering placeholder; the props/backdrop distinguish narrative scenes. */
+function renderEventScene(entry, sprite, spriteRect) {
+  const night = entry.characterId === 'star-singer';
+  const rnd = random(night ? 0x5ce15f91 : 0x14cc403c);
+  const canvas = new Canvas(W, H);
+  const palette = night ? ['25264f', '634d79', 'a381a7', '514160', 'e6d9fa'] : ['6a3f38', 'b87b55', 'e7b482', '866047', 'fff0ca'];
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const t = smooth(clamp(y / H, 0, 1));
+    const glow = clamp(1 - Math.hypot((x - (night ? 210 : 550)) / 500, (y - 150) / 380), 0, 1) * 0.37;
+    canvas.pixel(x, y, mixColor(mixColor(hex(palette[0]), hex(palette[1]), t), hex(palette[2]), glow));
+  }
+  const rect = (l, t, r, b, color) => canvas.poly([[l,t],[r,t],[r,b],[l,b]], color);
+  // Large window, distant sky and warm wooden frame; stars in the night
+  // scene, sunset hills and scattered tree shapes in the ranger's scene.
+  rect(48, 27, 332, 283, hex(night ? '171f42' : '704737'));
+  for (let y = 39; y < 268; y++) {
+    const sky = mixColor(hex(night ? '182241' : 'c27569'), hex(night ? '505280' : 'f7cf88'), (y - 39) / 229);
+    rect(59, y, 320, y + 1, sky);
+  }
+  if (night) {
+    canvas.ellipse(264, 87, 35, 35, hex('ece6ff', 230));
+    canvas.ellipse(277, 78, 32, 32, hex('2a3056'));
+    for (let i = 0; i < 64; i++) star(canvas, 68 + rnd() * 240, 45 + rnd() * 190, 1 + rnd() * 2, hex('faf0ff', 160));
+  } else {
+    canvas.ellipse(258, 120, 40, 40, hex('fff3bb'));
+    canvas.poly([[59,237],[118,173],[177,231],[222,190],[320,239],[320,268],[59,268]], hex('77796a'));
+    canvas.poly([[59,251],[132,221],[199,251],[253,229],[320,255],[320,268],[59,268]], hex('456e60'));
+    for (let i = 0; i < 6; i++) tree(canvas, 78 + i * 44, 266, 30 + rnd() * 40, 7, { trunk: hex('495f50'), bark: hex('606c55'), foliage: hex('496e59'), light: hex('77976f') }, rnd);
+  }
+  rect(182, 37, 193, 268, hex(palette[3])); rect(59, 152, 320, 162, hex(palette[3]));
+  rect(42, 272, 339, 286, hex(palette[3]));
+  // Floor, desk or hearth scene, with props unique to the event.
+  rect(0, 338, W, H, hex(night ? '3d314c' : '764d3e'));
+  for (let i = 0; i < 9; i++) canvas.line(i * 100, 339, i * 109 - 70, H, 1.7, hex('2e263b', 80));
+  canvas.line(0, 381, W, 381, 2, hex('2e263b', 90));
+  if (night) {
+    canvas.ellipse(188, 301, 131, 115, hex('b9b2e9', 36));
+    canvas.poly([[84,261],[282,259],[333,335],[40,335]], hex('ae9bd2'));
+    canvas.poly([[84,261],[282,259],[313,319],[58,319]], hex('f2e9d5'));
+    canvas.line(185, 263, 188, 318, 2.8, hex('a89188'));
+    const points = [[99,282],[130,275],[162,298],[210,278],[237,290],[277,278]];
+    for (let i = 1; i < points.length; i++) canvas.line(...points[i - 1], ...points[i], 1.7, hex('b859a2'));
+    for (const [x,y] of points) star(canvas,x,y,5,hex('cf78b5'));
+    rect(43, 334, 333, 349, hex('6d4b66')); rect(62, 349, 78, 419, hex('5a395b')); rect(301, 349, 317, 419, hex('5a395b'));
+  } else {
+    rect(488, 181, 721, 344, hex('6b403b')); rect(511, 211, 697, 344, hex('382f37'));
+    canvas.ellipse(603,310,84,35,hex('a9563d',180)); canvas.poly([[560,336],[574,299],[589,321],[604,267],[631,319],[650,306],[665,336]],hex('eb8755'));
+    canvas.poly([[590,336],[610,301],[620,318],[635,310],[646,336]],hex('f9da82'));
+    canvas.poly([[73,303],[314,303],[348,354],[39,354]],hex('bf946b'));
+    canvas.ellipse(130,316,30,9,hex('e6dcbc')); canvas.ellipse(130,310,23,14,hex('fff0d2'));
+    canvas.ellipse(130,304,20,6,hex('b27650')); canvas.ellipse(159,310,9,8,hex('fff0d2'));
+    for (let i = 0; i < 8; i++) { const x=215+rnd()*100, y=311+rnd()*22; flower(canvas,x,y,1.1,hex('f9e4bc'),hex('6d8a63')); }
+    rect(49,354,339,367,hex('694339')); rect(66,367,82,427,hex('694339')); rect(306,367,322,427,hex('694339'));
+  }
+  const size = 272, cx = night ? 504 : 414, bottom = 385;
+  canvas.ellipse(cx, bottom + 4, 99, 15, hex('29263a', 70));
+  canvas.sprite(sprite, ...spriteRect, cx - size / 2, bottom - size, size, size);
+  for (let i = 0; i < 24; i++) {
+    const x = rnd() * W, y = 40 + rnd() * 270;
+    if (Math.abs(x - cx) < 105 && y > 130) continue;
+    star(canvas,x,y,1.3+rnd()*2.5,hex(palette[4],90+rnd()*80));
+  }
+  return canvas;
+}
+
 const CRC = Uint32Array.from({ length: 256 }, (_, n) => {
   let r = n;
   for (let bit = 0; bit < 8; bit += 1) r = r & 1 ? 0xedb88320 ^ (r >>> 1) : r >>> 1;
@@ -407,11 +474,11 @@ function thumbnail(image) {
 
 function generate(entry) {
   if (!['star-singer', 'fluffy-ranger'].includes(entry.characterId)
-    || entry.cgId !== 'morning-dew' || entry.variant !== 'default' || entry.assetVersion !== '1.0.0') {
-    throw new Error('This generator owns only the two 1.0.0 demo CGs');
+    || !['morning-dew', 'star-singer.shared-constellation', 'fluffy-ranger.meadow-homecoming'].includes(entry.cgId) || entry.variant !== 'default' || entry.assetVersion !== '1.0.0') {
+    throw new Error('This generator owns only the four 1.0.0 engineering CGs');
   }
   const heroine = readHeroine(entry.characterId);
-  const canvas = renderScene(entry, heroine.image, heroine.rect);
+  const canvas = entry.cgId === 'morning-dew' ? renderScene(entry, heroine.image, heroine.rect) : renderEventScene(entry, heroine.image, heroine.rect);
   const image = encodePng(canvas);
   const preview = encodePng(thumbnail(canvas));
   const descriptor = { ...entry, image: { bytes: image.length, sha256: sha(image) },
@@ -425,14 +492,14 @@ if (process.versions.node !== '26.12.1') throw new Error('Use the pinned Node 26
 if (args.length > 1 || (args.length === 1 && !['--check', '--print-metadata'].includes(args[0]))) {
   throw new Error('Usage: generate-demo-cg.mjs [--check|--print-metadata]');
 }
-const outputs = BUILTIN_CG_CATALOG.filter((entry) => entry.cgId === 'morning-dew' && entry.assetVersion === '1.0.0')
+const outputs = [...BUILTIN_CG_CATALOG, ...EVENT_CG_CATALOG].filter((entry) => ['morning-dew', 'star-singer.shared-constellation', 'fluffy-ranger.meadow-homecoming'].includes(entry.cgId) && entry.assetVersion === '1.0.0')
   .map((entry) => ({ entry, ...generate(entry) }));
-if (outputs.length !== 2) throw new Error('Both original CG entries must exist');
+if (outputs.length !== 4) throw new Error('All four original CG entries must exist');
 // Print proposed metadata without altering pinned catalog or files. Used
 // during development of a new assetVersion, not by the application runtime.
 if (args[0] === '--print-metadata') {
   console.log(JSON.stringify(outputs.map(({ entry, descriptor, assetHash }) => ({
-    characterId: entry.characterId, image: descriptor.image, thumbnail: descriptor.thumbnail, assetHash,
+    characterId: entry.characterId, cgId: entry.cgId, image: descriptor.image, thumbnail: descriptor.thumbnail, assetHash,
   })), null, 2));
 } else {
   for (const { entry, descriptor, assetHash } of outputs) {

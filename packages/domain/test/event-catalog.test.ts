@@ -3,6 +3,7 @@ import { EVENT_CATALOG, EVENT_CATALOG_VERSION } from '@pet-desktop/domain/event-
 import { findCharacterDefinition } from '@pet-desktop/domain/character-catalog';
 import { findItemDefinition } from '@pet-desktop/domain/item-catalog';
 import { findRouteDefinition } from '@pet-desktop/domain/route-catalog';
+import { findBuiltinEventCg } from '@pet-desktop/domain/cg-catalog';
 import { resolveEventOccurrence, selectEvent, validateEventCatalog, validateFrozenOccurrence } from '@pet-desktop/domain/event-engine';
 import type {
   EventHistoryEntry, EventSelectionInput, EventTrigger, FrozenEventOccurrence,
@@ -39,7 +40,7 @@ function auto(event: FrozenEventOccurrence) {
 
 describe('actual built-in event-v1 authored content', () => {
   it('ships six canonical frozen definitions with real heroine/route/item references and no phantom art grant', () => {
-    expect(EVENT_CATALOG_VERSION).toBe(1);
+    expect(EVENT_CATALOG_VERSION).toBe(2);
     expect(EVENT_CATALOG.map((d) => d.eventId)).toEqual([
       'fluffy-ranger.forest-tea', 'fluffy-ranger.meadow-homecoming', 'nova.field-calibration',
       'nova.workshop-inventory', 'star-singer.shared-constellation', 'star-singer.starlight-notes',
@@ -47,7 +48,7 @@ describe('actual built-in event-v1 authored content', () => {
     expect(validateEventCatalog(EVENT_CATALOG)).toEqual(EVENT_CATALOG);
     const authoredCharacters = new Set<string>();
     for (const d of EVENT_CATALOG) {
-      expect(d.version).toBe(1);
+      expect(d.version).toBe(d.asset === null ? 1 : 2);
       expect(Object.isFrozen(d)).toBe(true);
       expect(Object.isFrozen(d.conditions)).toBe(true);
       expect(Object.isFrozen(d.narrative)).toBe(true);
@@ -70,9 +71,12 @@ describe('actual built-in event-v1 authored content', () => {
       }
       for (const effect of [...d.effects, ...d.choices.flatMap((c) => c.effects)]) {
         if (effect.kind === 'ITEM') expect(findItemDefinition(effect.itemId)?.storage).toBe('STACK');
-        expect(effect.kind).not.toBe('CG_UNLOCK'); // these new scenes have no pinned art yet
+        if (effect.kind === 'CG_UNLOCK') expect(d.asset?.state).toBe('PINNED');
       }
-      if (d.asset !== null) expect(d.asset.state).toBe('FUTURE_UNAVAILABLE');
+      if (d.asset !== null) {
+        expect(d.asset.state).toBe('PINNED');
+        if (d.asset.state === 'PINNED') expect(findBuiltinEventCg(d.asset.characterId, d.asset.cgId, d.asset.variant, d.asset.assetVersion)?.assetHash).toBe(d.asset.assetHash);
+      }
     }
     expect([...authoredCharacters].sort()).toEqual(['fluffy-ranger', 'nova', 'star-singer']);
     expect(JSON.stringify(EVENT_CATALOG)).not.toContain('carefully');
@@ -117,12 +121,12 @@ describe('actual built-in event-v1 authored content', () => {
     const follow = selected(next);
     expect(follow.eventId).toBe('star-singer.shared-constellation');
     expect(follow.rarity).toBe('RARE');
-    expect(follow.asset).toEqual({
-      state: 'FUTURE_UNAVAILABLE', characterId: 'star-singer', eventDefId: follow.eventId, cgId: follow.eventId, variant: 'default',
+    expect(follow.asset).toMatchObject({
+      state: 'PINNED', characterId: 'star-singer', eventDefId: follow.eventId, cgId: follow.eventId, variant: 'default',
     });
     expect(resolveEventOccurrence(follow, { kind: 'CHOICE', occurrenceId: follow.occurrenceId, petId: follow.petId,
       status: 'PENDING', choiceId: 'name-constellation', at: NOW + 300 })).toMatchObject({
-      ok: true, effects: { moodDelta10: 20, bondDelta10: 30, cgUnlock: null },
+      ok: true, effects: { moodDelta10: 20, bondDelta10: 30, cgUnlock: follow.asset },
     });
     for (const edit of [{ petId: 'another-star' }, { choiceId: 'study-herbs' }, { status: 'EXPIRED' as const }]) {
       expect(selectEvent(EVENT_CATALOG, { ...next, history: [{ ...receipt, ...edit }] })).toMatchObject({
@@ -164,10 +168,10 @@ describe('actual built-in event-v1 authored content', () => {
     expect(story.routeId).toBe('morning-dew-meadow');
     expect(story.sourceTripId).toBe('demo-finished-trip');
     expect(story.narrative.title).toBe('归家后的草原故事');
-    expect(story.asset).toMatchObject({ state: 'FUTURE_UNAVAILABLE', cgId: 'fluffy-ranger.meadow-homecoming' });
-    expect(choice(story, 'listen-to-story')).toMatchObject({ ok: true, effects: { bondDelta10: 15, moodDelta10: 30, cgUnlock: null } });
+    expect(story.asset).toMatchObject({ state: 'PINNED', cgId: 'fluffy-ranger.meadow-homecoming' });
+    expect(choice(story, 'listen-to-story')).toMatchObject({ ok: true, effects: { bondDelta10: 15, moodDelta10: 30, cgUnlock: story.asset } });
     expect(choice(story, 'save-keepsake')).toMatchObject({ ok: true,
-      effects: { moodDelta10: 10, items: [{ itemId: 'herb', quantity: 1 }], cgUnlock: null } });
+      effects: { moodDelta10: 10, items: [{ itemId: 'herb', quantity: 1 }], cgUnlock: story.asset } });
     expect(selectEvent(EVENT_CATALOG, { ...source, context: { ...source.context, routeId: 'mist-forest' } })).toMatchObject({
       kind: 'NO_EVENT', reason: 'NO_ELIGIBLE',
     });

@@ -1,11 +1,21 @@
 import { validateEventCatalog } from '#event-engine';
-import type { EventDefinition } from './event-engine.js';
+import type { EventDefinition, PinnedEventAsset } from './event-engine.js';
+import { findBuiltinEventCg } from '@pet-desktop/domain/cg-catalog';
 
 /** Original heroine narratives. No provider, script, animation path or
  * remotely generated content; future CG references are explicitly unavailable. */
-export const EVENT_CATALOG_VERSION = 1 as const;
+export const EVENT_CATALOG_VERSION = 2 as const;
 const DAY = 86_400_000;
 const CHOICE_EXPIRY = DAY;
+
+/** Bind newly authored event versions to one exact CG manifest. Old frozen
+ * occurrences retain their future/missing asset states when replayed. */
+function eventArt(characterId: string, eventId: string): PinnedEventAsset {
+  const entry = findBuiltinEventCg(characterId, eventId, 'default', '1.0.0');
+  if (!entry || entry.eventDefId !== eventId) throw new Error('Missing original event CG pin');
+  return { state: 'PINNED', characterId, eventDefId: eventId, cgId: entry.cgId, variant: entry.variant,
+    assetVersion: entry.assetVersion, assetHash: entry.assetHash };
+}
 
 const definitions = [
   {
@@ -60,7 +70,7 @@ const definitions = [
     defaultChoiceId: 'catalog-materials', expiresAfterMs: CHOICE_EXPIRY, asset: null,
   },
   {
-    eventId: 'star-singer.shared-constellation', version: 1, trigger: 'BOND_MILESTONE',
+    eventId: 'star-singer.shared-constellation', version: 2, trigger: 'BOND_MILESTONE',
     conditions: [{ kind: 'CHARACTER', characterIds: ['star-singer'] }, { kind: 'PRESENCE', presence: 'HOME' },
       { kind: 'LEVEL_AT_LEAST', level: 2 }, { kind: 'BOND_AT_LEAST', bond10: 200 },
       { kind: 'PREREQUISITE', eventId: 'star-singer.starlight-notes', choiceId: 'share-notes' }],
@@ -69,7 +79,7 @@ const definitions = [
       title: '只属于两人的星座', actionId: 'happy',
       text: '星咏拿出你们曾一起记录的星光笔记，用一条绯色丝线连起几颗星。那不是书中已有的星座，而是这段旅途留下的记忆。',
     },
-    effects: [{ kind: 'MOOD_DELTA', delta10: 20 }],
+    effects: [{ kind: 'MOOD_DELTA', delta10: 20 }, { kind: 'CG_UNLOCK' }],
     choices: [
       { choiceId: 'name-constellation', label: '给这颗新星座命名', resultText: '星咏郑重地写下一行新名字。她说，这是一个值得永远记住的约定。',
         effects: [{ kind: 'BOND_DELTA', delta10: 30 }] },
@@ -77,13 +87,10 @@ const definitions = [
         effects: [{ kind: 'BOND_DELTA', delta10: 10 }, { kind: 'ITEM', itemId: 'herb', quantity: 2 }] },
     ],
     defaultChoiceId: 'keep-the-memory', expiresAfterMs: CHOICE_EXPIRY,
-    // This scene has no verified CG today. It may show only narrative text;
-    // its effects intentionally contain no CG_UNLOCK operation.
-    asset: { state: 'FUTURE_UNAVAILABLE', characterId: 'star-singer', eventDefId: 'star-singer.shared-constellation',
-      cgId: 'star-singer.shared-constellation', variant: 'default' },
+    asset: eventArt('star-singer', 'star-singer.shared-constellation'),
   },
   {
-    eventId: 'fluffy-ranger.meadow-homecoming', version: 1, trigger: 'TRIP_RETURNED',
+    eventId: 'fluffy-ranger.meadow-homecoming', version: 2, trigger: 'TRIP_RETURNED',
     conditions: [{ kind: 'CHARACTER', characterIds: ['fluffy-ranger'] }, { kind: 'PRESENCE', presence: 'HOME' },
       { kind: 'ROUTE', routeIds: ['morning-dew-meadow'] }],
     weight: 80, rarity: 'COMMON', cooldownMs: DAY, maxPerPet: 10,
@@ -91,7 +98,7 @@ const definitions = [
       title: '归家后的草原故事', actionId: 'return',
       text: '绒绒已经回到家中，兴奋地讲述晨露草原的风景。她从自己的纪念品里挑出一份小礼物，等你一起决定如何纪念这次归来。',
     },
-    effects: [],
+    effects: [{ kind: 'CG_UNLOCK' }],
     choices: [
       { choiceId: 'listen-to-story', label: '听她讲完整的故事', resultText: '绒绒绘声绘色地讲完了见闻，快乐地在旅行日历上标出今天。',
         effects: [{ kind: 'BOND_DELTA', delta10: 15 }, { kind: 'MOOD_DELTA', delta10: 30 }] },
@@ -99,8 +106,7 @@ const definitions = [
         effects: [{ kind: 'ITEM', itemId: 'herb', quantity: 1 }, { kind: 'MOOD_DELTA', delta10: 10 }] },
     ],
     defaultChoiceId: 'listen-to-story', expiresAfterMs: CHOICE_EXPIRY,
-    asset: { state: 'FUTURE_UNAVAILABLE', characterId: 'fluffy-ranger', eventDefId: 'fluffy-ranger.meadow-homecoming',
-      cgId: 'fluffy-ranger.meadow-homecoming', variant: 'default' },
+    asset: eventArt('fluffy-ranger', 'fluffy-ranger.meadow-homecoming'),
   },
   {
     eventId: 'nova.field-calibration', version: 1, trigger: 'TRIP_RETURNED',

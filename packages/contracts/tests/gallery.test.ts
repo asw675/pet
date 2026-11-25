@@ -103,6 +103,14 @@ describe('gallery projection is a closed locked/unlocked union', () => {
     expect(galleryRowSchema.safeParse({ ...unlocked, assetRef, viewedAt: START + 1 }).success).toBe(false);
   });
 
+  it('retains original travel-source rows and permits exact, pinned event-source rows only', () => {
+    const event = { ...unlocked, sourceTripId: null, sourceEventId: 'event-1', routeId: null };
+    expect(galleryRowSchema.parse(event)).toEqual(event);
+    expect(galleryRowSchema.parse(unlocked)).toEqual(unlocked);
+    for (const raw of [{ ...event, sourceTripId: 'trip-1' }, { ...event, sourceEventId: null },
+      { ...event, assetRef: { state: 'LEGACY_UNVERSIONED' } }, { ...unlocked, sourceTripId: null }]) expect(galleryRowSchema.safeParse(raw).success).toBe(false);
+  });
+
   it.each([
     { viewedAt: START - 1 }, { viewedAt: -1 }, { viewedAt: Infinity }, { unlockedAt: -1 },
     { unlockedAt: Number.MAX_SAFE_INTEGER + 1 }, { favorite: 1 }, { sourceTripId: '' }, { assetRef: null },

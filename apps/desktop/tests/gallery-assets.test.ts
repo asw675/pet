@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import type { GalleryPage, GalleryQuery, LockedGalleryRow, UnlockedGalleryRow } from '@pet-desktop/contracts';
-import { BUILTIN_CG_CATALOG } from '@pet-desktop/domain/cg-catalog';
+import { BUILTIN_CG_CATALOG, EVENT_CG_CATALOG } from '@pet-desktop/domain/cg-catalog';
 import type { CgCatalogEntry } from '@pet-desktop/domain/cg-catalog';
 import { cgAcquisitionKey, createCgAssetRegistry, resolveBuiltinCg } from '../src/renderer/cg-assets/registry';
 import { confirmedViewPayload, exactGalleryRow, returnedGalleryMatchesQuery, usableGalleryPage } from '../src/renderer/cg-assets/gallery-view-policy';
@@ -64,13 +64,23 @@ describe('Gallery renderer projection and first-view policy', () => {
     ] as const) expect(confirmedViewPayload({ ...context, ...changes })).toBeUndefined();
   });
 });
-const unlocked = (entry: CgCatalogEntry): UnlockedGalleryRow => ({
+const unlocked = (entry: CgCatalogEntry): Extract<UnlockedGalleryRow, { sourceTripId: string }> => ({
   ...locked(entry), unlockStatus: 'UNLOCKED', sourceTripId: 'trip-1', unlockedAt: 30_000, viewedAt: null, favorite: false,
   assetRef: { state: 'PINNED', characterId: entry.characterId, eventDefId: entry.eventDefId, assetVersion: entry.assetVersion, assetHash: entry.assetHash },
 });
 const signal = () => new AbortController().signal;
 
 describe('Strict renderer CG asset registry', () => {
+  it('loads event-source artwork only from the event catalog and never as fictitious trip history', async () => {
+    const entry = EVENT_CG_CATALOG[0]!;
+    const event = { ...unlocked(entry), sourceTripId: null, sourceEventId: 'event-1', assetRef: {
+      state: 'PINNED', characterId: entry.characterId, eventDefId: entry.eventDefId, assetVersion: entry.assetVersion, assetHash: entry.assetHash,
+    } } satisfies UnlockedGalleryRow;
+    const resolve = createCgAssetRegistry(BUILTIN_CG_CATALOG, { [key(entry, 'thumbnail')]: async () => readDataUrl(entry, 'thumbnail') }, EVENT_CG_CATALOG);
+    expect(await resolve(event, 'thumbnail', signal())).toMatchObject({ ok: true, asset: { entry: { cgId: entry.cgId } } });
+    expect(await resolve(unlocked(entry), 'thumbnail', signal())).toEqual({ ok: false, code: 'VERSION_UNAVAILABLE' });
+    expect(cgAcquisitionKey(event)).not.toBe(cgAcquisitionKey({ ...event, sourceEventId: 'event-2' }));
+  });
   it('never imports any artwork for locked, unavailable, legacy or malformed rows', async () => {
     const image = vi.fn(async () => readDataUrl(first, 'image'));
     const thumbnail = vi.fn(async () => readDataUrl(first, 'thumbnail'));

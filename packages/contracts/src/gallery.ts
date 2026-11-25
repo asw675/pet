@@ -66,21 +66,31 @@ const lockedGalleryRowSchema = z.strictObject({
   unlockStatus: z.literal('LOCKED'),
 });
 
-const unlockedGalleryRowSchema = z.strictObject({
+const unlockedGalleryFields = {
   ...rowFields,
   unlockStatus: z.literal('UNLOCKED'),
-  sourceTripId: galleryIdSchema,
   unlockedAt: safeNonnegativeSchema,
   favorite: z.boolean(),
   viewedAt: safeNonnegativeSchema.nullable(),
+};
+const unlockedGalleryRowSchema = z.strictObject({
+  ...unlockedGalleryFields,
+  sourceTripId: galleryIdSchema,
   assetRef: cgAssetRefSchema,
+});
+// A non-travel narrative CG has its own exact source occurrence. The legacy
+// travel row shape stays byte-compatible; never use a fictitious trip FK.
+const unlockedEventGalleryRowSchema = z.strictObject({
+  ...unlockedGalleryFields, sourceTripId: z.null(), sourceEventId: galleryIdSchema,
+  assetRef: pinnedCgAssetRefSchema,
 });
 
 /** A locked row is a separate closed shape, not an unlocked row with hidden
  * fields. No asset descriptor, caption or URL can be sent for either row. */
-export const galleryRowSchema = z.discriminatedUnion('unlockStatus', [
+export const galleryRowSchema = z.union([
   lockedGalleryRowSchema,
   unlockedGalleryRowSchema,
+  unlockedEventGalleryRowSchema,
 ]).superRefine((row, context) => {
   if (row.unlockStatus !== 'UNLOCKED') return;
   if (row.viewedAt !== null && row.viewedAt < row.unlockedAt) {

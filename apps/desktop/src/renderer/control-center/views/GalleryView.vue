@@ -2,7 +2,7 @@
 import { computed, nextTick, onBeforeUnmount, ref, shallowRef, watch } from 'vue';
 import { galleryIpcResultSchema, galleryLimits, galleryQuerySchema } from '@pet-desktop/contracts';
 import type { GalleryFilter, GalleryQuery, GalleryRarity, GalleryRow, UnlockedGalleryRow } from '@pet-desktop/contracts';
-import { BUILTIN_CG_CATALOG } from '@pet-desktop/domain/cg-catalog';
+import { BUILTIN_CG_CATALOG, EVENT_CG_CATALOG } from '@pet-desktop/domain/cg-catalog';
 import { cgFailureText, cgRowKey, resolveBuiltinCg } from '../../cg-assets/registry';
 import type { CgAssetResult } from '../../cg-assets/registry';
 import { confirmedViewPayload, exactGalleryRow, returnedGalleryMatchesQuery, usableGalleryPage } from '../../cg-assets/gallery-view-policy';
@@ -36,10 +36,11 @@ const charactersSeen = ref<string[]>([]);
 const routesSeen = ref<string[]>([]);
 const eventsSeen = ref<string[]>([]);
 const options = (...sets: readonly (readonly string[])[]) => [...new Set(sets.flat().filter(Boolean))].sort();
-const characterOptions = computed(() => options(BUILTIN_CG_CATALOG.map(x => x.characterId), petOptions.value.map(x => x.characterId), charactersSeen.value, [characterFilter.value]));
-const routeOptions = computed(() => options(BUILTIN_CG_CATALOG.map(x => x.routeId), routesSeen.value, [routeFilter.value]));
-const eventOptions = computed(() => options(BUILTIN_CG_CATALOG.map(x => x.eventDefId), eventsSeen.value, [eventFilter.value]));
-const eventName = (id: string) => id === 'dew-postcard' ? '晨露明信片' : id;
+const allCgEntries = [...BUILTIN_CG_CATALOG, ...EVENT_CG_CATALOG];
+const characterOptions = computed(() => options(allCgEntries.map(x => x.characterId), petOptions.value.map(x => x.characterId), charactersSeen.value, [characterFilter.value]));
+const routeOptions = computed(() => options(allCgEntries.flatMap(x => x.routeId === null ? [] : [x.routeId]), routesSeen.value, [routeFilter.value]));
+const eventOptions = computed(() => options(allCgEntries.map(x => x.eventDefId), eventsSeen.value, [eventFilter.value]));
+const eventName = (id: string) => id === 'dew-postcard' ? '晨露明信片' : allCgEntries.find(x => x.eventDefId === id)?.title ?? id;
 const characterName = (id: string) => id === 'star-singer' ? '星咏' : id === 'fluffy-ranger' ? '绒绒' : id;
 const nickname = (row: GalleryRow) => petOptions.value.find(pet => pet.petId === row.petId)?.nickname ?? row.petId;
 
@@ -300,8 +301,8 @@ onBeforeUnmount(() => { disposed = true; requestEpoch++; closeScene(); });
       <div v-else class="scene-caption muted">{{ selection.row.hint }}</div>
       <dl class="scene-history">
         <div><dt>首次获得时间</dt><dd>{{ new Date(selection.row.unlockedAt).toLocaleString('zh-CN') }}</dd></div>
-        <div><dt>所属旅程</dt><dd>{{ selection.row.sourceTripId }}</dd></div>
-        <div><dt>路线 · 事件</dt><dd>{{ selection.row.routeId ? routeName(selection.row.routeId) : '未知路线' }} · {{ selection.row.eventDefId ? eventName(selection.row.eventDefId) : '历史事件' }}</dd></div>
+        <div><dt>{{ selection.row.sourceTripId === null ? '所属剧情事件' : '所属旅程' }}</dt><dd>{{ selection.row.sourceTripId === null ? selection.row.sourceEventId : selection.row.sourceTripId }}</dd></div>
+        <div><dt>路线 · 事件</dt><dd>{{ selection.row.routeId ? routeName(selection.row.routeId) : selection.row.sourceTripId === null ? '家中事件' : '未知路线' }} · {{ selection.row.eventDefId ? eventName(selection.row.eventDefId) : '历史事件' }}</dd></div>
         <div><dt>固定资源版本</dt><dd>{{ selection.row.assetRef.state === 'PINNED' ? selection.row.assetRef.assetVersion : '未绑定' }}</dd></div>
       </dl>
       <div class="scene-actions">

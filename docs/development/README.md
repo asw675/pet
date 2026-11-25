@@ -30,6 +30,7 @@
 | 006B-1 | 家中状态与需求纯规则 | 领域 27 项通过 | [006b1-home-rules](006b1-home-rules.md) |
 | 006C-1 | 职业成长与装备纯规则 | 领域 72 项通过 | [006c1-progression-rules](006c1-progression-rules.md) |
 | 006D-1 | 物品目录及商城纯报价 | 领域93项通过 | [006d1-item-catalog](006d1-item-catalog.md) |
+| 006D-2A | 背包、装备、成长、商城闭合契约 | 专项87项通过 | [006d2a-inventory-contract](006d2a-inventory-contract.md) |
 | 006E-1 | 三路线目录与出发前置纯规则 | 领域74项通过 | [006e1-travel-preparation](006e1-travel-preparation.md) |
 | 006B-2/C-2/D-2/E-2/F | 持久调度、成长投影、装备经济、旅行、随机事件 | 分模块开发中 | — |
 

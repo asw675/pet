@@ -3,7 +3,10 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "exports": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./inventory": "./src/inventory.ts"
+  },
   "imports": {
     "#character-pack": "./src/character-pack.ts",
     "#gallery": "./src/gallery.ts",

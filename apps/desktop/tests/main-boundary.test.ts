@@ -13,7 +13,7 @@ const sender = (binding: WindowBinding): SenderContext => ({
   senderId: binding.senderId, frameUrl: binding.trustedUrl, documentUrl: binding.trustedUrl, isMainFrame: true,
 });
 const getSnapshot: IpcRequest = { schemaVersion: 1, requestId: 'renderer-request', method: 'snapshot/get', payload: {} };
-const common = { commandId: 'command-123', issuedAt: 1 };
+const common = { commandId: 'command-123', issuedAt: 1, expectedRevision: 1 };
 const dispatch = (command: DomainCommand): IpcRequest => ({
   ...getSnapshot, method: 'command/dispatch', payload: { command },
 });
@@ -63,7 +63,7 @@ describe('Main request routing', () => {
       [pet, { ...sender(pet), isMainFrame: false }],
       [pet, { ...sender(pet), frameUrl: 'https://example.invalid' }],
     ] as const) {
-      await expect(routeRequest(binding, context, [getSnapshot], forward)).resolves.toMatchObject({
+      await expect(routeRequest(binding, context, [getSnapshot], forward, snapshot.revision)).resolves.toMatchObject({
         ok: false, error: { code: 'FORBIDDEN', requestId: getSnapshot.requestId },
       });
     }
@@ -75,7 +75,7 @@ describe('Main request routing', () => {
     for (const args of [[], [getSnapshot, true], [null], [{ ...getSnapshot, other: true }], [
       { ...getSnapshot, method: 'host/run' },
     ], [{ ...getSnapshot, schemaVersion: 2 }], [{ ...getSnapshot, payload: { arbitrary: 'file' } }]]) {
-      const result = await routeRequest(center, sender(center), args, forward);
+      const result = await routeRequest(center, sender(center), args, forward, undefined);
       expect(result).toMatchObject({ ok: false, error: { code: 'INVALID_REQUEST' } });
       expect(ipcResultSchema.safeParse(result).success).toBe(true);
     }
@@ -95,28 +95,63 @@ describe('Main request routing', () => {
       { ...common, type: 'TRIP_REPORT_READ', payload: { petId: 'pet-a', tripId: 'trip-a' } },
       { ...common, type: 'APP_SET_MODE', payload: { flag: 'pausedRender', enabled: true } },
     ];
-    await expect(routeRequest(pet, sender(pet), [getSnapshot], forward)).resolves.toMatchObject({ ok: true });
+    await expect(routeRequest(pet, sender(pet), [getSnapshot], forward, snapshot.revision)).resolves.toMatchObject({ ok: true });
     for (const command of commands.slice(0, 2)) {
-      await expect(routeRequest(pet, sender(pet), [dispatch(command)], forward)).resolves.toMatchObject({ ok: true });
+      await expect(routeRequest(pet, sender(pet), [dispatch(command)], forward, snapshot.revision)).resolves.toMatchObject({ ok: true });
     }
     for (const command of commands.slice(2)) {
-      await expect(routeRequest(pet, sender(pet), [dispatch(command)], forward)).resolves.toMatchObject({
+      await expect(routeRequest(pet, sender(pet), [dispatch(command)], forward, snapshot.revision)).resolves.toMatchObject({
         ok: false, error: { code: 'FORBIDDEN' },
       });
     }
     expect(forward).toHaveBeenCalledTimes(3);
     for (const command of commands) {
-      await expect(routeRequest(center, sender(center), [dispatch(command)], forward)).resolves.toMatchObject({ ok: true });
+      await expect(routeRequest(center, sender(center), [dispatch(command)], forward, undefined)).resolves.toMatchObject({ ok: true });
     }
     expect(forward).toHaveBeenCalledTimes(3 + commands.length);
+  });
+
+  it('keeps staging/retiring windows read-only even for valid own-pet commands', async () => {
+    const forward = relay();
+    const own = dispatch({ ...common, type: 'PET_INTERACT', payload: { petId: 'pet-a', interaction: 'PET' } });
+    const hide = dispatch({ ...common, type: 'PET_SET_VISIBILITY', payload: { petId: 'pet-a', visibility: 'HIDDEN' } });
+    await expect(routeRequest(pet, sender(pet), [getSnapshot], forward, undefined)).resolves.toMatchObject({ ok: true });
+    for (const request of [own, hide]) {
+      await expect(routeRequest(pet, sender(pet), [request], forward, undefined)).resolves.toMatchObject({
+        ok: false, error: { code: 'FORBIDDEN' },
+      });
+    }
+    expect(forward).toHaveBeenCalledTimes(1);
+    await expect(routeRequest(pet, sender(pet), [own], forward, snapshot.revision)).resolves.toMatchObject({ ok: true });
+    expect(forward).toHaveBeenCalledTimes(2);
+  });
+
+  it('requires the active window command revision and rejects missing or stale preconditions', async () => {
+    const forward = relay();
+    const base = { commandId: 'revision-command', issuedAt: 1, type: 'PET_INTERACT', payload: { petId: 'pet-a', interaction: 'PET' } } as const;
+    const omitted = dispatch(base);
+    await expect(routeRequest(pet, sender(pet), [omitted], forward, snapshot.revision)).resolves.toMatchObject({
+      ok: false, error: { code: 'INVALID_REQUEST' },
+    });
+    for (const expectedRevision of [0, 2]) {
+      await expect(routeRequest(pet, sender(pet), [dispatch({ ...base, expectedRevision })], forward, snapshot.revision)).resolves.toMatchObject({
+        ok: false, error: { code: 'REVISION_CONFLICT', retryable: true },
+      });
+    }
+    expect(forward).not.toHaveBeenCalled();
+    const matching = dispatch({ ...base, expectedRevision: snapshot.revision });
+    await expect(routeRequest(pet, sender(pet), [matching], forward, snapshot.revision)).resolves.toMatchObject({ ok: true });
+    expect(forward.mock.calls[0]?.[0].payload).toEqual(matching.payload);
+    // Center remains a trusted command origin without a view precondition.
+    await expect(routeRequest(center, sender(center), [omitted], forward, undefined)).resolves.toMatchObject({ ok: true });
   });
 
   it('isolates concurrent repeated renderer request IDs while preserving command ID and renderer correlation', async () => {
     const forward = relay();
     const request = dispatch({ ...common, type: 'PET_INTERACT', payload: { petId: 'pet-a', interaction: 'PET' } });
     const results = await Promise.all([
-      routeRequest(pet, sender(pet), [request], forward),
-      routeRequest(center, sender(center), [request], forward),
+      routeRequest(pet, sender(pet), [request], forward, snapshot.revision),
+      routeRequest(center, sender(center), [request], forward, undefined),
     ]);
     for (const result of results) expect(result).toMatchObject({ ok: true, requestId: 'renderer-request' });
     const [first, second] = forward.mock.calls.map(([call]) => call);
@@ -132,13 +167,13 @@ describe('Main request routing', () => {
       schemaVersion: 1, ok: false, error: { code: 'TIMEOUT', message: 'Timed out.', retryable: true, requestId: req.requestId },
     });
     const mismatchRelay = async (): Promise<IpcResult> => ({ schemaVersion: 1, ok: true, requestId: 'wrong-id', snapshot });
-    await expect(routeRequest(center, sender(center), [getSnapshot], errorRelay)).resolves.toMatchObject({
+    await expect(routeRequest(center, sender(center), [getSnapshot], errorRelay, undefined)).resolves.toMatchObject({
       ok: false, error: { code: 'TIMEOUT', requestId: getSnapshot.requestId, retryable: true },
     });
-    await expect(routeRequest(center, sender(center), [getSnapshot], mismatchRelay)).resolves.toMatchObject({
+    await expect(routeRequest(center, sender(center), [getSnapshot], mismatchRelay, undefined)).resolves.toMatchObject({
       ok: false, error: { code: 'INTERNAL_ERROR', requestId: getSnapshot.requestId },
     });
-    const thrown = await routeRequest(center, sender(center), [getSnapshot], async () => { throw new Error('Private details'); });
+    const thrown = await routeRequest(center, sender(center), [getSnapshot], async () => { throw new Error('Private details'); }, undefined);
     expect(thrown).toMatchObject({ ok: false, error: { code: 'SERVICE_UNAVAILABLE' } });
     expect(JSON.stringify(thrown)).not.toContain('Private details');
   });

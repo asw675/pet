@@ -5,17 +5,58 @@ import { useAppStore } from '../shared/store';
 import { petStatus, serviceStatusLabel } from '../shared/presentation';
 import PetCanvas from './PetCanvas.vue';
 import { createInteractionLease } from '../shared/interaction-lease';
+import type { PetVisualReady } from '../../shared/protocol';
 
 const store = useAppStore();
 const bridge = window.petDesktop?.role === 'pet' ? window.petDesktop : undefined;
 const petId = new URL(window.location.href).searchParams.get('petId');
 const pet = computed(() => store.snapshot?.pets.find((entry) => entry.petId === petId));
-const canAct = computed(() => store.ready && !store.busy && !store.loading && pet.value?.presence === 'HOME');
+const canAct = computed(() => store.ready && !store.busy && !store.loading && pet.value?.presence === 'HOME' && pet.value.visibility === 'VISIBLE');
 const petCanvas = ref<InstanceType<typeof PetCanvas> | null>(null);
-const quietMotion = computed(() => !store.ready || !store.snapshot || store.snapshot.pausedRender || store.snapshot.doNotDisturb);
+const quietMotion = computed(() => !store.ready || !store.snapshot || store.snapshot.pausedRender || store.snapshot.doNotDisturb || pet.value?.visibility !== 'VISIBLE');
 const hostError = ref<string | null>(null);
 const openingCenter = ref(false);
 const canHit = computed(() => !quietMotion.value && pet.value?.presence === 'HOME' && pet.value.visibility === 'VISIBLE');
+
+// A staging window can report only that its own verified visual/fallback has
+// been prepared. The host, not this renderer, decides which pet window appears.
+const visual = ref<Omit<PetVisualReady, 'generation'> | null>(null);
+const visualReport = computed<PetVisualReady | null>(() => {
+  if (!store.ready || store.serviceStatus?.stage !== 'READY' || pet.value?.presence !== 'HOME'
+    || pet.value.visibility !== 'VISIBLE' || visual.value?.characterId !== pet.value.characterId) return null;
+  return { ...visual.value, generation: store.serviceStatus.generation };
+});
+let visualReportEpoch = 0;
+let visualReportTimer: number | undefined;
+
+function clearVisualReportTimer(): void {
+  if (visualReportTimer !== undefined) window.clearTimeout(visualReportTimer);
+  visualReportTimer = undefined;
+}
+
+watch(() => pet.value?.characterId, (characterId) => {
+  if (visual.value?.characterId !== characterId) visual.value = null;
+});
+
+const visualReportKey = computed(() => {
+  const report = visualReport.value;
+  return report ? `${report.generation}:${report.characterId}:${report.result}` : null;
+});
+watch(visualReportKey, () => {
+  const report = visualReport.value;
+  const epoch = ++visualReportEpoch;
+  clearVisualReportTimer();
+  if (!report || !bridge) return;
+  const attempt = async (left: number): Promise<void> => {
+    if (visualReportEpoch !== epoch) return;
+    try {
+      const response = await bridge.reportVisualReady(report);
+      if (response.ok || visualReportEpoch !== epoch || left <= 1) return;
+    } catch { if (visualReportEpoch !== epoch || left <= 1) return; }
+    visualReportTimer = window.setTimeout(() => { void attempt(left - 1); }, 500);
+  };
+  void attempt(4);
+}, { flush: 'post' });
 
 // The window is click-through by default. Mouse moves forwarded by Electron
 // enable it only over the visible portrait, drag chip or explicit buttons.
@@ -67,6 +108,8 @@ onMounted(() => {
 });
 
 onBeforeUnmount(() => {
+  visualReportEpoch += 1;
+  clearVisualReportTimer();
   if (leaseTimer !== undefined) window.clearInterval(leaseTimer);
   document.removeEventListener('mousemove', onMouseMove);
   document.documentElement.removeEventListener('mouseleave', leave);
@@ -111,7 +154,7 @@ function interact(interaction: Interaction): void {
         <button class="more" aria-label="打开控制中心" title="控制中心" :disabled="openingCenter" @click="openControlCenter">···</button>
       </div>
       <div class="portrait-surface">
-        <PetCanvas ref="petCanvas" :character-id="pet.characterId" :activity="pet.activity" :paused="quietMotion" :interactive="canAct && canHit" @touch="interact('PET')" />
+        <PetCanvas ref="petCanvas" :character-id="pet.characterId" :activity="pet.activity" :paused="quietMotion" :interactive="canAct && canHit" @touch="interact('PET')" @visual="visual = $event" />
       </div>
       <div class="state" data-hit>
         <span class="dot" :class="{ muted: !store.ready }"></span>

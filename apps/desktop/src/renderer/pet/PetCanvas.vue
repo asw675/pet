@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onBeforeUnmount, onMounted, ref, watch } from 'vue';
+import { nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import type { Activity } from '@pet-desktop/contracts';
 import { loadBuiltinPack } from '../asset-packs/builtin-registry';
 import { CanvasRenderer } from '../rendering/canvas-renderer';
@@ -13,7 +13,10 @@ const props = defineProps<{
   paused: boolean;
   interactive: boolean;
 }>();
-const emit = defineEmits<{ touch: [region: string] }>();
+const emit = defineEmits<{
+  touch: [region: string];
+  visual: [report: { characterId: string; result: 'READY' | 'FALLBACK' }];
+}>();
 const surface = ref<HTMLCanvasElement | null>(null);
 const hasFrame = ref(false);
 const loadState = ref<'loading' | 'ready' | 'failed'>('loading');
@@ -96,11 +99,17 @@ async function replacePack(): Promise<void> {
     instance.setBaseAction(semanticIdForActivity(props.activity));
     resize();
     syncAnimation();
+    await nextTick();
+    if (mounted && loadAbort === request && !request.signal.aborted) emit('visual', { characterId, result: 'READY' });
   } catch {
     if (!mounted || loadAbort !== request || request.signal.aborted) return;
     // The adapter retains the previous prepared resource on failure. On an
-    // initial failure the non-interactive SVG silhouette remains as a fallback.
+    // initial failure or identity change, show the requested character's
+    // non-interactive SVG fallback, never an old character under a new name.
+    if (instance.activeCharacterId !== characterId) hasFrame.value = false;
     loadState.value = 'failed';
+    await nextTick();
+    if (mounted && loadAbort === request && !request.signal.aborted) emit('visual', { characterId, result: 'FALLBACK' });
   }
 }
 
@@ -152,7 +161,11 @@ onMounted(async () => {
   } catch {
     instance.destroy();
     if (renderer === instance) renderer = null;
-    if (mounted) loadState.value = 'failed';
+    if (mounted) {
+      loadState.value = 'failed';
+      await nextTick();
+      if (mounted) emit('visual', { characterId: props.characterId, result: 'FALLBACK' });
+    }
   }
 });
 

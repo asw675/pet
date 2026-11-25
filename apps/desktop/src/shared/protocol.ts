@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { appSnapshotSchema, ipcRequestSchema, ipcResultSchema } from '@pet-desktop/contracts';
+import { appSnapshotSchema, idSchema, ipcRequestSchema, ipcResultSchema, nonnegativeIntegerSchema } from '@pet-desktop/contracts';
 import type { AppBridge, AppSnapshot } from '@pet-desktop/contracts';
 
 export const DESKTOP_IPC = Object.freeze({
@@ -9,6 +9,7 @@ export const DESKTOP_IPC = Object.freeze({
   status: 'pet-desktop:status:v1',
   openControlCenter: 'pet-desktop:open-control-center:v1',
   petInteractive: 'pet-desktop:pet-interactive:v1',
+  petVisualReady: 'pet-desktop:pet-visual-ready:v1',
 });
 
 export const serviceStatusSchema = z.strictObject({
@@ -23,6 +24,15 @@ export const hostActionResultSchema = z.discriminatedUnion('ok', [
 ]);
 export type HostActionResult = z.infer<typeof hostActionResultSchema>;
 
+/** A visual completion signal, not a domain action or arbitrary resource reference.
+ * The host derives the pet identity from the sending pet window. */
+export const petVisualReadySchema = z.strictObject({
+  characterId: idSchema,
+  generation: nonnegativeIntegerSchema,
+  result: z.enum(['READY', 'FALLBACK']),
+});
+export type PetVisualReady = z.infer<typeof petVisualReadySchema>;
+
 export type DesktopRole = 'pet' | 'control-center';
 interface DesktopBridgeBase extends AppBridge {
   getServiceStatus(): Promise<ServiceStatus>;
@@ -33,6 +43,7 @@ interface DesktopBridgeBase extends AppBridge {
 export interface PetDesktopBridge extends DesktopBridgeBase {
   readonly role: 'pet';
   setInteractive(interactive: boolean): Promise<HostActionResult>;
+  reportVisualReady(report: PetVisualReady): Promise<HostActionResult>;
 }
 export interface ControlCenterBridge extends DesktopBridgeBase {
   readonly role: 'control-center';

@@ -5,26 +5,39 @@ import {
 } from 'electron';
 import type { IpcMainInvokeEvent, Rectangle } from 'electron';
 import type { AppSnapshot } from '@pet-desktop/contracts';
-import { DESKTOP_IPC } from '../shared/protocol';
-import type { HostActionResult, ServiceStatus } from '../shared/protocol';
+import { DESKTOP_IPC, petVisualReadySchema } from '../shared/protocol';
+import type { HostActionResult, PetVisualReady, ServiceStatus } from '../shared/protocol';
 import { authorizeSender, isTrustedDocument, routeRequest } from './boundary';
 import type { SenderContext, WindowBinding } from './boundary';
 import { ServiceClient } from './service-client';
 import type { ServiceChild } from './service-client';
-import { clampBounds, InputLease, rendererUrl, visibleHomePetIds } from './window-policy';
+import { clampBounds, InputLease, rendererUrl } from './window-policy';
+import { desiredPetSurface, isCurrentVisualReport, planPetHandover, samePetSurface } from './pet-handover';
+import type { PetSurfaceIdentity, PetSurfaceInfo, PetSurfacePhase } from './pet-handover';
 
 const CENTER_KEY = 'control-center';
 const PET_SIZE = { width: 260, height: 295 };
 const MAX_WINDOW_FAILURES = 3;
 const WINDOW_FAILURE_INTERVAL = 60_000;
 const TEMP_INTERACTION_MS = 20_000;
+const PET_VISUAL_TIMEOUT_MS = 10_000;
 const devLog = (...messages: string[]) => { if (!app.isPackaged) console.info('[desktop]', ...messages); };
 
 interface Anchor { displayId: number; offsetX: number; offsetY: number }
+interface PetWindowState {
+  readonly identity: PetSurfaceIdentity;
+  phase: PetSurfacePhase;
+  documentReady: boolean;
+  visualResult: PetVisualReady['result'] | undefined;
+  stagingTimer: ReturnType<typeof setTimeout> | undefined;
+  retirementTimer: ReturnType<typeof setTimeout> | undefined;
+  retirementDeadline: number | undefined;
+}
 interface WindowRecord {
   readonly key: string;
   readonly window: BrowserWindow;
   readonly binding: WindowBinding;
+  readonly pet: PetWindowState | undefined;
   ready: boolean;
   readonly inputLease: InputLease;
   responsive: boolean;
@@ -107,10 +120,10 @@ class DesktopHost {
     screen.on('display-added', () => this.reflowWindows());
     screen.on('display-removed', () => this.reflowWindows());
     screen.on('display-metrics-changed', () => this.reflowWindows());
-    powerMonitor.on('suspend', () => { this.suspended = true; this.updatePetVisibility(); });
-    powerMonitor.on('resume', () => { this.suspended = false; this.reflowWindows(); this.updatePetVisibility(); });
-    powerMonitor.on('lock-screen', () => { this.locked = true; this.updatePetVisibility(); });
-    powerMonitor.on('unlock-screen', () => { this.locked = false; this.reflowWindows(); this.updatePetVisibility(); });
+    powerMonitor.on('suspend', () => { this.suspended = true; this.reconcilePets(); });
+    powerMonitor.on('resume', () => { this.suspended = false; this.reflowWindows(); });
+    powerMonitor.on('lock-screen', () => { this.locked = true; this.reconcilePets(); });
+    powerMonitor.on('unlock-screen', () => { this.locked = false; this.reflowWindows(); });
 
     this.service.subscribeSnapshot((snapshot) => {
       if (this.stopping) return;
@@ -131,7 +144,7 @@ class DesktopHost {
         this.pendingSnapshot = undefined;
         this.acceptSnapshot(snapshot);
       } else {
-        this.updatePetVisibility();
+        this.reconcilePets();
       }
     });
 
@@ -157,7 +170,9 @@ class DesktopHost {
   private registerIpc(): void {
     ipcMain.handle(DESKTOP_IPC.request, (event, ...args: unknown[]) => {
       const { record, sender } = this.senderOf(event);
-      return routeRequest(record?.binding, sender, args, (request) => this.service.request(request));
+      const activePetRevision = record !== undefined && this.isActivePet(record) && record.window.isVisible()
+        ? this.snapshot?.revision : undefined;
+      return routeRequest(record?.binding, sender, args, (request) => this.service.request(request), activePetRevision);
     });
     ipcMain.handle(DESKTOP_IPC.getStatus, (event, ...args: unknown[]) => {
       const { record, sender } = this.senderOf(event);
@@ -180,7 +195,7 @@ class DesktopHost {
         record.inputLease.clear();
         return this.updatePetInput(record) ? { ok: true } : { ok: false, code: 'SERVICE_UNAVAILABLE' };
       }
-      if (!record.responsive || !record.ready || this.petSuppressed() || !record.window.isVisible()) {
+      if (!this.isActivePet(record) || !record.window.isVisible()) {
         record.inputLease.clear();
         this.updatePetInput(record);
         return { ok: false, code: 'SERVICE_UNAVAILABLE' };
@@ -198,6 +213,22 @@ class DesktopHost {
         this.updatePetInput(record);
         return { ok: false, code: 'SERVICE_UNAVAILABLE' };
       }
+    });
+    ipcMain.handle(DESKTOP_IPC.petVisualReady, (event, ...args: unknown[]): HostActionResult => {
+      const { record, sender } = this.senderOf(event);
+      if (!record?.pet || !authorizeSender(record.binding, sender, 'pet')) return { ok: false, code: 'FORBIDDEN' };
+      const parsed = petVisualReadySchema.safeParse(args[0]);
+      if (args.length !== 1 || !parsed.success) return { ok: false, code: 'INVALID_REQUEST' };
+      // Own bound sender, current desired character and current service generation only.
+      if (!isCurrentVisualReport(record.pet.identity, this.getDesiredPet(), parsed.data)) {
+        return { ok: false, code: 'FORBIDDEN' };
+      }
+      // A loading/reloading document cannot reuse a queued report from the
+      // previous document; the renderer retries until did-finish-load.
+      if (!record.responsive || !record.pet.documentReady) return { ok: false, code: 'SERVICE_UNAVAILABLE' };
+      record.pet.visualResult = parsed.data.result;
+      this.reconcilePets();
+      return { ok: true };
     });
   }
 
@@ -242,44 +273,119 @@ class DesktopHost {
     } catch { /* The target may have gone away; other windows must remain available. */ }
   }
 
-  private reconcilePets(): void {
-    if (this.stopping || this.status.stage !== 'READY' || !this.snapshot) return;
-    const desired = new Set(visibleHomePetIds(this.snapshot).map((petId) => `pet:${petId}`));
-    for (const [key, record] of this.windows) {
-      if (record.binding.role === 'pet' && !desired.has(key)) this.destroyWindow(record);
-    }
-    if (!this.petSuppressed()) {
-      for (const key of desired) {
-        if (!this.windows.has(key) && !this.blocked.has(key) && !this.retryTimers.has(key)) {
-          this.createWindow(key, key.slice(4), false);
-        }
-      }
-    }
-    this.updatePetVisibility();
-  }
-
   private petSuppressed(): boolean {
     return this.stopping || this.status.stage !== 'READY' || !this.snapshot || this.snapshot.doNotDisturb
       || this.manuallyHidden || this.suspended || this.locked;
   }
 
-  private updatePetVisibility(): void {
+  private getDesiredPet(): PetSurfaceIdentity | undefined {
+    return desiredPetSurface(this.snapshot, this.status, this.petSuppressed());
+  }
+
+  private isActivePet(record: WindowRecord): boolean {
+    const desired = this.getDesiredPet();
+    const pet = record.pet;
+    return this.isCurrent(record) && pet !== undefined && desired !== undefined
+      && pet.phase === 'ACTIVE' && samePetSurface(pet.identity, desired)
+      && pet.documentReady && pet.visualResult !== undefined && record.ready && record.responsive;
+  }
+
+  private clearPetTimers(pet: PetWindowState): void {
+    if (pet.stagingTimer !== undefined) clearTimeout(pet.stagingTimer);
+    if (pet.retirementTimer !== undefined) clearTimeout(pet.retirementTimer);
+    pet.stagingTimer = undefined;
+    pet.retirementTimer = undefined;
+    pet.retirementDeadline = undefined;
+  }
+
+  private setPetPhase(record: WindowRecord, phase: PetSurfacePhase): void {
+    const pet = record.pet;
+    if (!pet || !this.isCurrent(record)) return;
+    if (pet.phase !== phase) {
+      this.clearPetTimers(pet);
+      pet.phase = phase;
+    }
+    if (phase === 'STAGING' && pet.stagingTimer === undefined) {
+      pet.stagingTimer = setTimeout(() => {
+        if (!this.isCurrent(record) || pet.phase !== 'STAGING') return;
+        devLog('pet visual staging timed out');
+        this.recoverWindow(record);
+      }, PET_VISUAL_TIMEOUT_MS);
+    } else if (phase === 'RETIRING' && pet.retirementTimer === undefined) {
+      // Absolute deadline per retained surface, not per new target. A rapid
+      // B->C request or failed staging attempt must not extend old A forever.
+      pet.retirementDeadline = performance.now() + PET_VISUAL_TIMEOUT_MS;
+      pet.retirementTimer = setTimeout(() => {
+        if (!this.isCurrent(record) || pet.phase !== 'RETIRING') return;
+        this.destroyWindow(record);
+        this.reconcilePets();
+      }, PET_VISUAL_TIMEOUT_MS);
+    }
+    if (phase !== 'ACTIVE') {
+      record.inputLease.clear();
+      this.updatePetInput(record);
+    }
+  }
+
+  /** Keep at most one displayed surface and one hidden staging window. Native
+   * visibility follows the plan, but only authority selects/owns the pet. */
+  private reconcilePets(): void {
+    const surfaces: PetSurfaceInfo[] = [];
     for (const record of this.windows.values()) {
-      if (record.binding.role !== 'pet' || !this.isCurrent(record)) continue;
-      const suppressed = this.petSuppressed() || !record.ready;
-      if (suppressed) {
-        record.inputLease.clear();
-        this.updatePetInput(record);
-        if (record.window.isVisible()) record.window.hide();
-      } else {
-        if (this.updatePetInput(record) && !record.window.isVisible()) record.window.showInactive();
+      const pet = record.pet;
+      if (!pet || !this.isCurrent(record)) continue;
+      surfaces.push({
+        senderId: record.binding.senderId, identity: pet.identity, phase: pet.phase,
+        documentReady: pet.documentReady, paintReady: record.ready, visualResult: pet.visualResult,
+        responsive: record.responsive, visible: record.window.isVisible(), retirementDeadline: pet.retirementDeadline,
+      });
+    }
+    const plan = planPetHandover(this.snapshot, this.status, this.petSuppressed(), surfaces, performance.now());
+
+    // Disable input before any old surface is retired. Unexpected native close
+    // and late callbacks cannot re-authorize a non-desired window.
+    const retiring = plan.retiring === undefined ? undefined : this.senders.get(plan.retiring);
+    if (retiring) this.setPetPhase(retiring, 'RETIRING');
+    const staging = plan.staging === undefined ? undefined : this.senders.get(plan.staging);
+    if (staging) {
+      this.setPetPhase(staging, 'STAGING');
+      if (staging.window.isVisible()) staging.window.hide();
+    }
+    // Old surface must disappear before showing the newly ready one. Pending
+    // failed/obsolete staging surfaces are removed before creating the next.
+    for (const senderId of plan.remove) {
+      const record = this.senders.get(senderId);
+      if (record) this.destroyWindow(record);
+    }
+    const active = plan.active === undefined ? undefined : this.senders.get(plan.active);
+    if (active && this.isCurrent(active)) {
+      this.setPetPhase(active, 'ACTIVE');
+      try {
+        if (!this.updatePetInput(active)) {
+          if (active.window.isVisible()) active.window.hide();
+        } else if (!active.window.isVisible()) active.window.showInactive();
+      } catch {
+        devLog('pet surface could not be presented');
+        this.recoverWindow(active);
+      }
+    }
+    if (plan.create) {
+      const key = `pet:${plan.create.petId}`;
+      if (!this.windows.has(key) && !this.blocked.has(key) && !this.retryTimers.has(key)) {
+        try { this.createWindow(key, plan.create, false); }
+        catch {
+          devLog('pet staging window could not be created');
+          const record = this.windows.get(key);
+          if (record) this.recoverWindow(record);
+          else this.scheduleRecovery(key, 'pet');
+        }
       }
     }
   }
 
   private updatePetInput(record: WindowRecord): boolean {
     if (record.binding.role !== 'pet' || !this.isCurrent(record)) return false;
-    const suppressed = this.petSuppressed() || !record.ready || !record.responsive;
+    const suppressed = !this.isActivePet(record);
     if (suppressed) record.inputLease.clear();
     const ignore = suppressed || this.inputMode === 'through'
       || (this.inputMode === 'auto' && !record.inputLease.active);
@@ -295,7 +401,8 @@ class DesktopHost {
     }
   }
 
-  private createWindow(key: string, petId: string | undefined, focus: boolean): void {
+  private createWindow(key: string, identity: PetSurfaceIdentity | undefined, focus: boolean): void {
+    const petId = identity?.petId;
     if (this.stopping && petId !== undefined) return;
     const role = petId === undefined ? 'control-center' : 'pet';
     const url = rendererUrl(this.rendererDir, role, this.devUrl, petId);
@@ -330,39 +437,55 @@ class DesktopHost {
       : { senderId: window.webContents.id, role: 'pet', petId, trustedUrl: url };
     const record: WindowRecord = {
       key, window, binding, ready: false, responsive: true, focusOnReady: focus,
+      pet: identity === undefined ? undefined : {
+        identity, phase: 'STAGING', documentReady: false, visualResult: undefined,
+        stagingTimer: undefined, retirementTimer: undefined, retirementDeadline: undefined,
+      },
       inputLease: new InputLease(() => this.updatePetInput(record)),
     };
     this.windows.set(key, record);
     this.senders.set(binding.senderId, record);
     this.storeAnchor(record);
     this.protectContents(record);
-    if (pet) this.updatePetInput(record);
+    if (pet) this.setPetPhase(record, 'STAGING');
     window.on('move', () => this.storeAnchor(record));
     window.on('resize', () => this.storeAnchor(record));
-    window.on('closed', () => this.unregister(record));
+    window.on('closed', () => {
+      const registered = this.windows.get(record.key) === record;
+      this.unregister(record);
+      if (pet && registered && !this.stopping) this.scheduleRecovery(record.key, 'pet');
+    });
     window.on('hide', () => record.inputLease.clear());
     window.on('unresponsive', () => {
       record.responsive = false;
       record.inputLease.clear();
-      if (pet) this.updatePetInput(record);
+      if (pet) this.reconcilePets();
     });
-    window.on('responsive', () => { record.responsive = true; if (pet) this.updatePetInput(record); });
+    window.on('responsive', () => { record.responsive = true; if (pet) this.reconcilePets(); });
     window.once('ready-to-show', () => {
       if (!this.isCurrent(record)) return;
       record.ready = true;
-      if (pet) this.updatePetVisibility();
+      if (pet) this.reconcilePets();
       else if (record.focusOnReady) { window.show(); window.focus(); }
       else window.showInactive();
     });
     window.webContents.on('did-finish-load', () => {
       if (!this.isCurrent(record)) return;
       devLog('renderer loaded', role);
+      if (record.pet) record.pet.documentReady = true;
       this.send(record, DESKTOP_IPC.status, this.status);
       if (this.status.stage === 'READY' && this.snapshot) this.send(record, DESKTOP_IPC.snapshot, this.snapshot);
+      if (record.pet) this.reconcilePets();
     });
     window.webContents.on('did-start-loading', () => {
       record.inputLease.clear();
-      if (pet) this.updatePetInput(record);
+      if (record.pet) {
+        // Reloaded renderer must report a new ready surface for the same
+        // authorized identity; never re-use the old document's acknowledgement.
+        record.pet.documentReady = false;
+        record.pet.visualResult = undefined;
+        this.reconcilePets();
+      }
     });
     window.webContents.on('render-process-gone', (_event, details) => {
       devLog('renderer gone', role, details.reason);
@@ -390,6 +513,7 @@ class DesktopHost {
 
   private unregister(record: WindowRecord): void {
     record.inputLease.clear();
+    if (record.pet) this.clearPetTimers(record.pet);
     if (this.windows.get(record.key) === record) this.windows.delete(record.key);
     if (this.senders.get(record.binding.senderId) === record) this.senders.delete(record.binding.senderId);
   }
@@ -397,6 +521,12 @@ class DesktopHost {
   private destroyWindow(record: WindowRecord): void {
     if (!this.isCurrent(record)) return;
     this.storeAnchor(record);
+    if (record.pet) {
+      record.inputLease.clear();
+      record.pet.phase = 'STAGING';
+      this.updatePetInput(record);
+      if (record.window.isVisible()) record.window.hide();
+    }
     this.unregister(record);
     record.window.destroy();
   }
@@ -404,23 +534,28 @@ class DesktopHost {
   private recoverWindow(record: WindowRecord): void {
     if (this.stopping || !this.isCurrent(record)) return;
     this.destroyWindow(record);
+    this.scheduleRecovery(record.key, record.binding.role);
+  }
+
+  private scheduleRecovery(key: string, role: WindowBinding['role']): void {
+    if (this.stopping || this.retryTimers.has(key) || this.blocked.has(key)) return;
     const now = Date.now();
-    const failures = (this.failures.get(record.key) ?? []).filter((time) => now - time < WINDOW_FAILURE_INTERVAL);
+    const failures = (this.failures.get(key) ?? []).filter((time) => now - time < WINDOW_FAILURE_INTERVAL);
     failures.push(now);
-    this.failures.set(record.key, failures);
+    this.failures.set(key, failures);
     if (failures.length >= MAX_WINDOW_FAILURES) {
-      this.blocked.add(record.key);
+      this.blocked.add(key);
       this.updateTray();
       return;
     }
     const timer = setTimeout(() => {
-      this.retryTimers.delete(record.key);
+      this.retryTimers.delete(key);
       if (this.stopping) return;
-      if (record.binding.role === 'control-center') {
+      if (role === 'control-center') {
         if (!this.windows.has(CENTER_KEY)) this.createWindow(CENTER_KEY, undefined, false);
       } else this.reconcilePets();
     }, 250 * failures.length);
-    this.retryTimers.set(record.key, timer);
+    this.retryTimers.set(key, timer);
   }
 
   private resetFailures(key: string): void {
@@ -496,7 +631,6 @@ class DesktopHost {
       { label: this.manuallyHidden ? '恢复桌面宠物' : '暂时隐藏桌面宠物', click: () => {
         this.manuallyHidden = !this.manuallyHidden;
         this.reconcilePets();
-        this.updatePetVisibility();
         this.updateTray();
       } },
       { label: '自动命中（实验）', type: 'radio', checked: this.inputMode === 'auto', click: () => this.setInputMode('auto') },
@@ -521,7 +655,7 @@ class DesktopHost {
     for (const timer of this.retryTimers.values()) clearTimeout(timer);
     this.retryTimers.clear();
     if (this.interactionTimer !== undefined) clearTimeout(this.interactionTimer);
-    this.updatePetVisibility();
+    this.reconcilePets();
     this.updateTray();
     // A shutdown acknowledgment or kill() return is not actual writer exit.
     // The control center and tray remain available to explain STOPPING until

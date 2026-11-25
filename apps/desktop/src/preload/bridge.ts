@@ -3,14 +3,15 @@ import {
 } from '@pet-desktop/contracts';
 import type { AppSnapshot, DomainCommand, IpcErrorCode, IpcRequest, IpcResult } from '@pet-desktop/contracts';
 import {
-  DESKTOP_IPC, hostActionResultSchema, serviceStatusSchema,
+  DESKTOP_IPC, hostActionResultSchema, petVisualReadySchema, serviceStatusSchema,
 } from '../shared/protocol.js';
 import type {
-  ControlCenterBridge, HostActionResult, PetDesktopBridge, ServiceStatus,
+  ControlCenterBridge, HostActionResult, PetDesktopBridge, PetVisualReady, ServiceStatus,
 } from '../shared/protocol.js';
 
 type InvokeChannel = typeof DESKTOP_IPC.request | typeof DESKTOP_IPC.getStatus
-  | typeof DESKTOP_IPC.openControlCenter | typeof DESKTOP_IPC.petInteractive;
+  | typeof DESKTOP_IPC.openControlCenter | typeof DESKTOP_IPC.petInteractive
+  | typeof DESKTOP_IPC.petVisualReady;
 type PushChannel = typeof DESKTOP_IPC.snapshot | typeof DESKTOP_IPC.status;
 type PushListener = (event: unknown, ...args: unknown[]) => void;
 
@@ -127,9 +128,13 @@ function baseBridge(ipc: DesktopIpcPort, requestId: () => string): Omit<ControlC
   };
 }
 
-async function hostAction(ipc: DesktopIpcPort,
-  channel: typeof DESKTOP_IPC.openControlCenter | typeof DESKTOP_IPC.petInteractive,
-  ...args: [] | [boolean]): Promise<HostActionResult> {
+type HostActionInvoke =
+  | [channel: typeof DESKTOP_IPC.openControlCenter]
+  | [channel: typeof DESKTOP_IPC.petInteractive, interactive: boolean]
+  | [channel: typeof DESKTOP_IPC.petVisualReady, report: PetVisualReady];
+
+async function hostAction(ipc: DesktopIpcPort, ...call: HostActionInvoke): Promise<HostActionResult> {
+  const [channel, ...args] = call;
   try {
     const result = parse(hostActionResultSchema, await ipc.invoke(channel, ...args));
     if (result !== undefined) return result;
@@ -144,6 +149,11 @@ export function createPetBridge(ipc: DesktopIpcPort, requestId = newRequestId): 
     async setInteractive(interactive: boolean): Promise<HostActionResult> {
       if (typeof interactive !== 'boolean') return { ok: false, code: 'INVALID_REQUEST' };
       return hostAction(ipc, DESKTOP_IPC.petInteractive, interactive);
+    },
+    async reportVisualReady(report: PetVisualReady): Promise<HostActionResult> {
+      const parsed = parse(petVisualReadySchema, report);
+      if (parsed === undefined) return { ok: false, code: 'INVALID_REQUEST' };
+      return hostAction(ipc, DESKTOP_IPC.petVisualReady, parsed);
     },
   });
 }

@@ -4,7 +4,7 @@ import type { AppSnapshot, DomainCommand, IpcRequest, IpcResult } from '@pet-des
 import { createControlCenterBridge, createPetBridge } from '../src/preload/bridge.js';
 import type { DesktopIpcPort } from '../src/preload/bridge.js';
 import { DESKTOP_IPC } from '../src/shared/protocol.js';
-import type { ServiceStatus } from '../src/shared/protocol.js';
+import type { PetVisualReady, ServiceStatus } from '../src/shared/protocol.js';
 
 type PushListener = Parameters<DesktopIpcPort['on']>[1];
 type InvokeChannel = Parameters<DesktopIpcPort['invoke']>[0];
@@ -16,6 +16,7 @@ const snapshot = {
 } satisfies AppSnapshot;
 
 const status = { stage: 'READY', generation: 3 } satisfies ServiceStatus;
+const ready = { characterId: 'star-singer', generation: status.generation, result: 'READY' } satisfies PetVisualReady;
 const command = {
   type: 'PET_INTERACT', commandId: 'command-42', issuedAt: 1234,
   payload: { petId: 'pet-1', interaction: 'PET' },
@@ -70,8 +71,9 @@ describe('role-specific preload bridges', () => {
     ];
     const pet = createPetBridge(ipc);
     const center = createControlCenterBridge(ipc);
-    expect(Object.keys(pet).sort()).toEqual([...commonKeys, 'setInteractive'].sort());
+    expect(Object.keys(pet).sort()).toEqual([...commonKeys, 'setInteractive', 'reportVisualReady'].sort());
     expect(Object.keys(center).sort()).toEqual(commonKeys.sort());
+    expect('reportVisualReady' in center).toBe(false);
     expect(pet.role).toBe('pet');
     expect(center.role).toBe('control-center');
     expect(Object.isFrozen(pet)).toBe(true);
@@ -116,7 +118,7 @@ describe('role-specific preload bridges', () => {
     expect(JSON.stringify(result)).not.toContain(privateDetail);
   });
 
-  it('only invokes the two fixed host actions and rejects non-boolean interactive input', async () => {
+  it('only invokes the fixed host actions and rejects non-boolean interactive input', async () => {
     const ipc = new FakeIpc();
     const pet = createPetBridge(ipc);
     const center = createControlCenterBridge(ipc);
@@ -131,6 +133,34 @@ describe('role-specific preload bridges', () => {
       [DESKTOP_IPC.petInteractive, true], [DESKTOP_IPC.petInteractive, false],
       [DESKTOP_IPC.openControlCenter], [DESKTOP_IPC.openControlCenter], [DESKTOP_IPC.getStatus],
     ]);
+  });
+
+  it('reports ready/fallback only through the pet-specific visual channel', async () => {
+    const ipc = new FakeIpc();
+    const pet = createPetBridge(ipc);
+    const fallback = { ...ready, generation: 4, result: 'FALLBACK' } satisfies PetVisualReady;
+    expect(await pet.reportVisualReady(ready)).toEqual({ ok: true });
+    expect(await pet.reportVisualReady(fallback)).toEqual({ ok: true });
+    expect(ipc.calls).toEqual([[DESKTOP_IPC.petVisualReady, ready], [DESKTOP_IPC.petVisualReady, fallback]]);
+  });
+
+  it.each([
+    null, undefined, '', [], {}, { ...ready, characterId: '' },
+    { ...ready, characterId: '../private' },
+    { ...ready, characterId: 'x'.repeat(129) },
+    { ...ready, generation: -1 }, { ...ready, generation: 1.1 },
+    { ...ready, generation: '3' }, { ...ready, generation: Infinity },
+    { ...ready, generation: Number.MAX_SAFE_INTEGER + 1 },
+    { ...ready, result: 'FAILED' }, { ...ready, result: true },
+    { ...ready, petId: 'another-pet' }, { ...ready, path: privateDetail },
+    { ...ready, data: privateDetail }, { ...ready, channel: 'debug' },
+    Object.defineProperty({}, 'characterId', { enumerable: true, get() { throw new Error(privateDetail); } }),
+  ])('rejects malformed visual reports before invoking IPC: case %#', async (input) => {
+    const ipc = new FakeIpc();
+    const result = await createPetBridge(ipc).reportVisualReady(input as PetVisualReady);
+    expect(result).toEqual({ ok: false, code: 'INVALID_REQUEST' });
+    expect(ipc.calls).toEqual([]);
+    expect(JSON.stringify(result)).not.toContain(privateDetail);
   });
 });
 
@@ -177,6 +207,20 @@ describe('runtime response validation and error isolation', () => {
     expect(JSON.stringify(result)).not.toContain(privateDetail);
     expect(await bridge.openControlCenter()).toEqual({ ok: false, code: 'SERVICE_UNAVAILABLE' });
     expect(await bridge.getServiceStatus()).toEqual({ stage: 'UNAVAILABLE', generation: 0 });
+  });
+
+  it('sanitizes visual readiness reply errors without leaking host details', async () => {
+    const ipc = new FakeIpc();
+    const bridge = createPetBridge(ipc);
+    ipc.handle = () => ({ ok: false, code: 'FORBIDDEN' });
+    expect(await bridge.reportVisualReady(ready)).toEqual({ ok: false, code: 'FORBIDDEN' });
+    for (const reply of [null, { ok: true, path: privateDetail }, { ok: false, code: 'FORBIDDEN', message: privateDetail },
+      { ok: false, code: privateDetail }]) {
+      ipc.handle = () => reply;
+      expect(await bridge.reportVisualReady(ready)).toEqual({ ok: false, code: 'SERVICE_UNAVAILABLE' });
+    }
+    ipc.handle = () => { throw new Error(privateDetail); };
+    expect(await bridge.reportVisualReady(ready)).toEqual({ ok: false, code: 'SERVICE_UNAVAILABLE' });
   });
 });
 

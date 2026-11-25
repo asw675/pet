@@ -215,6 +215,7 @@ export interface AppTransaction {
   saveHomeSchedule(record: HomeScheduleRecord): void;
   listTrips(): TripRecord[];
   listSettledTrips(query: TravelReportsQuery): { total: number; trips: TripRecord[] };
+  getFirstRuinsBossVictory(petId: string): { tripId: string; earnedAt: number } | null;
   getTrip(tripId: string): TripRecord | null;
   /** Authority sets the second argument for every new real departure; the
    * default false remains solely for old low-level fixture/legacy APIs. */

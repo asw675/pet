@@ -1733,6 +1733,22 @@ class SQLiteTransaction implements AppTransaction {
     return { total,trips };
   }
 
+  getFirstRuinsBossVictory(petId: string): { tripId: string; earnedAt: number } | null {
+    const winner = this.db.prepare(`SELECT t.trip_id, t.actual_returned_at
+      FROM trips t
+      JOIN settlements s ON s.trip_id=t.trip_id
+      JOIN trip_events e ON e.trip_id=t.trip_id AND e.pet_id=t.pet_id
+      WHERE t.pet_id=? AND t.status='SETTLED' AND t.route_id='starfall-ruins' AND t.rules_version='trip-v3'
+        AND e.type='BATTLE_RESOLVED'
+        AND json_extract(e.payload_json, '$.enemyId')='ruins-core-guardian'
+        AND json_extract(e.payload_json, '$.outcome')='WIN'
+        AND json_extract(e.payload_json, '$.battle.boss')='RUINS_GUARDIAN'
+      ORDER BY t.actual_returned_at, t.trip_id LIMIT 1`).get(id(petId));
+    if (winner == null) return null;
+    const row = object(winner, 'first ruins boss victory');
+    return { tripId: id(row.trip_id), earnedAt: integer(row.actual_returned_at, 'title earned time') };
+  }
+
   getTrip(tripId: string): TripRecord | null {
     const value = this.db.prepare(`${TRIP_SELECT} WHERE t.trip_id = ?`).get(id(tripId));
     return value === undefined || value === null ? null : tripFromRow(value);

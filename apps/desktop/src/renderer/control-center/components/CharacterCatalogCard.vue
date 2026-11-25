@@ -57,6 +57,11 @@ function acquire(): void { if (props.allowCommands && eligible.value) emit('acqu
           <p class="small muted">完成所需结算并备齐游戏内金币后才能领取。</p>
         </template>
         <p v-if="row.instances.length" class="template-owned">已拥有 {{ row.instances.length }} 位独立伙伴：{{ row.instances.map(x => x.nickname).join('、') }}</p>
+        <ul v-if="row.instances.some(instance => instance.ruinsTitle)" class="template-titles" aria-label="已获得称号">
+          <li v-for="instance in row.instances.filter(instance => instance.ruinsTitle)" :key="instance.petId">
+            {{ instance.nickname }} <strong>星落破阵者</strong>
+          </li>
+        </ul>
         <button type="button" class="button button-primary acquire-button" :disabled="!eligible || !allowCommands" @click="acquire">{{ eligible ? '查看领取确认' : availabilityText }}</button>
       </section>
     </div>
@@ -91,6 +96,8 @@ function acquire(): void { if (props.allowCommands && eligible.value) emit('acqu
 .template-access { display: grid; gap: 7px; margin-top: auto; padding-top: 10px; border-top: 1px solid var(--border); }
 .template-access p { font-size: 12px; color: var(--gold-light); line-height: 1.6; }
 .template-access p.small { color: var(--muted); font-size: 11px; }
+.template-titles { list-style: none; padding: 0; margin: 0; display: grid; gap: 3px; font-size: 12px; color: var(--muted); }
+.template-titles strong { color: var(--gold-light); font-weight: 600; }
 .template-unlock-line { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; }
 .template-unlock-line .icon { width: 14px; height: 14px; }
 .template-unlock-line span { margin-left: auto; color: var(--muted); font-size: 10px; }

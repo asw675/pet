@@ -1382,6 +1382,9 @@ describe.skipIf(!supported)('prepared travel and historical reports in actual SQ
     const quote = readTravelPreview(instance.service, intent);
     const started = expectSuccess(f.request(instance.service, f.command('TRIP_START_PREPARED', intent, 'ruins-boss-win', quote.snapshot.revision)));
     const tripId = started.pets.find(pet => pet.petId === petId).trip.tripId;
+    const catalogInstance = (identity) => readCharacters(instance.service).characters.rows
+      .flatMap(row => row.instances).find(item => item.petId === identity);
+    expect(catalogInstance(petId)).not.toHaveProperty('ruinsTitle');
     const frozen = instance.repo.transaction(tx => tx.getTrip(tripId)).snapshot;
     expect(frozen.battle.bossNodeId).toBe('ruins-core-guardian');
     instance.close();
@@ -1389,6 +1392,10 @@ describe.skipIf(!supported)('prepared travel and historical reports in actual SQ
     f.advance(frozen.expectedReturnAt);
     const settled = () => readTravelReports(instance.service).travelReports.rows[0];
     const history = settled();
+    expect(catalogInstance(petId)?.ruinsTitle).toEqual({
+      id: 'ruins-pathbreaker', tripId, earnedAt: history.actualReturnedAt,
+    });
+    expect(catalogInstance('pet-2')).not.toHaveProperty('ruinsTitle');
     const boss = history.facts.find(fact => fact.payload.enemyId === frozen.battle.bossNodeId);
     expect(boss).toMatchObject({ type: 'BATTLE_RESOLVED', payload: { outcome: 'WIN', battle: { rulesVersion: 'battle-v3', boss: 'RUINS_GUARDIAN', petSkill: 'STARFLARE' } } });
     const skills = boss.payload.battle.rounds.flatMap(round => round.actions.flatMap(action => action.skills));
@@ -1398,6 +1405,9 @@ describe.skipIf(!supported)('prepared travel and historical reports in actual SQ
     instance.close();
     instance = f.open();
     expect(settled()).toEqual(history);
+    expect(catalogInstance(petId)?.ruinsTitle).toEqual({
+      id: 'ruins-pathbreaker', tripId, earnedAt: history.actualReturnedAt,
+    });
     expect(instance.service.getSnapshot().walletCoins).toBe(walletCoins);
   });
 

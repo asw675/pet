@@ -39,9 +39,12 @@ export function characterAcquisitionContext(tx: AppTransaction, pets: readonly P
 
 function ownedInstance(tx: AppTransaction, pet: PetRecord): OwnedCharacterInstance {
   const acquisition = tx.getPetAcquisition(pet.petId);
-  if (acquisition === null) return { petId: pet.petId, nickname: pet.nickname, origin: 'LEGACY', acquiredAt: null };
+  const victory = tx.getFirstRuinsBossVictory(pet.petId);
+  const identity = { petId: pet.petId, nickname: pet.nickname,
+    ...(victory ? { ruinsTitle: { id: 'ruins-pathbreaker' as const, ...victory } } : {}) };
+  if (acquisition === null) return { ...identity, origin: 'LEGACY', acquiredAt: null };
   if (acquisition.petId !== pet.petId) throw new Error('Acquisition record belongs to another pet');
-  const shared = { petId: pet.petId, nickname: pet.nickname, acquiredAt: acquisition.acquiredAt };
+  const shared = { ...identity, acquiredAt: acquisition.acquiredAt };
   return acquisition.origin === 'STARTER' ? { ...shared, origin: 'STARTER' } : { ...shared, origin: 'GAME' };
 }
 

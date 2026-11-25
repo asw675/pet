@@ -123,6 +123,7 @@ class MemoryRepository implements AppRepository, AppTransaction {
         || (a.snapshot.tripId < b.snapshot.tripId ? -1 : a.snapshot.tripId > b.snapshot.tripId ? 1 : 0));
     return { total: matches.length, trips: copy(matches.slice(query.offset, query.offset + query.limit)) };
   }
+  getFirstRuinsBossVictory(_petId: string): null { return null; }
   getTrip(tripId: string): TripRecord | null {
     return copy(this.state.trips.find((trip) => trip.snapshot.tripId === tripId) ?? null);
   }

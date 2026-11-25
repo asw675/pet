@@ -19,7 +19,8 @@ const characterUnlockSchema = z.discriminatedUnion('kind', [
   z.strictObject({ kind: z.literal('EXPLORATION_COINS'), requiredSettledTrips: nonnegative.min(1), coinCost: nonnegative }),
 ]);
 
-const ownedInstanceFields = { petId: identifier, nickname: z.string().min(1).max(80) };
+const ruinsTitle = z.strictObject({ id: z.literal('ruins-pathbreaker'), earnedAt: nonnegative, tripId: identifier });
+const ownedInstanceFields = { petId: identifier, nickname: z.string().min(1).max(80), ruinsTitle: ruinsTitle.optional() };
 export const ownedCharacterInstanceSchema = z.discriminatedUnion('origin', [
   z.strictObject({ ...ownedInstanceFields, origin: z.literal('LEGACY'), acquiredAt: z.null() }),
   z.strictObject({ ...ownedInstanceFields, origin: z.literal('STARTER'), acquiredAt: nonnegative }),

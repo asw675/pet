@@ -39,6 +39,7 @@
 | 006C-2/D-2/E-2/F | 成长投影、装备经济、旅行、随机事件 | 分模块开发中 | — |
 | 007A-1 | AI 人格/Provider/逐宠会话及记忆契约 | 专项136项通过 | [007a1-ai-contract](007a1-ai-contract.md) |
 | 007A-2 | OpenAI-compatible Provider、受限流、人格 prompt | Fake fetch 61项通过，真实服务待配置 | [007a2-provider-adapter](007a2-provider-adapter.md) |
+| 007A-3 | 逐宠异步会话、取消、持久终态 port 与授权候选 | 33项专项通过；实际存储接入待完成 | [007a3-chat-coordinator](007a3-chat-coordinator.md) |
 | 007B-1 | 逐宠记忆候选、同源约束、敏感筛查及授权检索 | 专项93项通过 | [007b1-memory-policy](007b1-memory-policy.md) |
 | 008A-1 | 语音契约、单会话取消及实际音频 RMS 口型算法 | 50项专项通过，实际设备/供应商待接入 | [008a1-voice-contract](008a1-voice-contract.md) |
 | 008B-1 | AudioWorklet 真实录放音 API 与有界清理 | 28项专项、Vite构建通过；设备/权限待联通 | [008b1-webaudio-adapter](008b1-webaudio-adapter.md) |

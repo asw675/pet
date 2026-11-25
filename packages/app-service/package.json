@@ -5,7 +5,10 @@
   "type": "module",
   "exports": {
     ".": "./src/index.ts",
-    "./memory-policy": "./src/memory-policy.ts"
+    "./memory-policy": "./src/memory-policy.ts",
+    "./ai-state-storage": "./src/ai-state-storage.ts",
+    "./ai-authority-service": "./src/ai-authority-service.ts",
+    "./workspace-storage": "./src/workspace-storage.ts"
   },
   "imports": {
     "#gallery-service": "./src/gallery-service.ts",
@@ -14,6 +17,9 @@
     "#economy-service": "./src/economy-service.ts",
     "#travel-service": "./src/travel-service.ts",
     "#event-service": "./src/event-service.ts",
+    "#ai-state-storage": "./src/ai-state-storage.ts",
+    "#workspace-storage": "./src/workspace-storage.ts",
+    "#ai-authority-service": "./src/ai-authority-service.ts",
     "#trip-departure-storage": "./src/trip-departure-storage.ts",
     "#ports": "./src/ports.ts",
     "#app-service": "./src/app-service.ts",

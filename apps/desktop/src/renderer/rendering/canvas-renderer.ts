@@ -1,4 +1,4 @@
-import type { ResolvedPack, ResolvedPackVariant } from '../asset-packs/resolve-pack';
+import type { ResolvedPack, ResolvedPackVariant } from '../../shared/resolve-character-pack';
 import { ActionController, type AnimationClip } from './action-controller';
 import type {
   ActionRequest, ActionResult, HitRegion, MouthSample, PetRenderer, RenderPose, RenderProfile,

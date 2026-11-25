@@ -53,7 +53,8 @@ export function applicableWorkspaceIntent(page: WorkspacePage, input: WorkspaceI
     case 'routine/update': return page.routines.some(routine => routine.id === intent.payload.routineId && routine.revision === intent.payload.expectedRevision)
       && validRoutineTargets(page, intent.payload.definition);
     case 'routine/delete': case 'routine/run': return page.routines.some(routine => routine.id === intent.payload.routineId && routine.revision === intent.payload.expectedRevision);
-    case 'routine/cancel': return false; // only the active sender-bound run, not a stored page authorization
+    case 'routine/cancel':
+    case 'suggestion/run': return false; // These require a separate sender-bound run or proposal authorization.
     case 'recommendation/settings': return page.revision === intent.payload.expectedRevision;
     case 'recommendation/seen': return page.settings.enabled && page.revision === intent.payload.expectedRevision
       && intent.payload.targetIds.every(id => page.recommendations.some(row => row.targetId === id));

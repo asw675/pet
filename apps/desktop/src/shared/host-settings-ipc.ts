@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { idSchema } from '@pet-desktop/contracts';
 
 /** Fixed host-only keyboard actions. No arbitrary accelerator, process,
  * login command, registry key, filename or executable arguments cross IPC. */
@@ -71,6 +72,20 @@ export const backupViewResultSchema = z.discriminatedUnion('ok', [
   z.strictObject({ ok: z.literal(true), schemaVersion: z.number().int().min(1).max(100_000) }),
   z.strictObject({ ok: z.literal(false), code: errorCode }),
 ]);
+const restoreFailureSchema = z.strictObject({ ok: z.literal(false), code: errorCode });
+export const restoreBackupResultSchema = z.discriminatedUnion('ok', [z.strictObject({ ok: z.literal(true) }), restoreFailureSchema]);
+export const restoreBackupStatusSchema = z.discriminatedUnion('ok', [
+  z.strictObject({ ok: z.literal(true), status: z.enum(['NONE', 'PENDING', 'RESTORED', 'FAILED']) }),
+  restoreFailureSchema,
+]);
+export type RestoreBackupResult = z.infer<typeof restoreBackupResultSchema>;
+export type RestoreBackupStatus = z.infer<typeof restoreBackupStatusSchema>;
+export const managedBackupDirectory = '.pet-snapshots';
+export const periodicBackupStatusSchema = z.discriminatedUnion('ok', [
+  z.strictObject({ ok: z.literal(true), status: z.enum(['WAITING', 'AVAILABLE', 'FAILED']), lastCompletedAt: z.iso.datetime().nullable() }),
+  restoreFailureSchema,
+]);
+export type PeriodicBackupStatus = z.infer<typeof periodicBackupStatusSchema>;
 const preferenceEditSchema = z.strictObject({ scalePercent: hostScaleSchema, reducedMotion: z.boolean() });
 export type HostPreferenceEdit = z.infer<typeof preferenceEditSchema>;
 export const hostPreferenceSaveSchema = preferenceEditSchema.extend({ expectedRevision: revision });
@@ -80,6 +95,19 @@ export type BackupViewResult = z.infer<typeof backupViewResultSchema>;
 export const hostRenderPreferencesSchema = z.strictObject({ reducedMotion: z.boolean() });
 export type HostRenderPreferences = z.infer<typeof hostRenderPreferencesSchema>;
 
+const coordinate = z.number().int().min(-1_000_000).max(1_000_000);
+const extent = z.number().int().min(1).max(32_768);
+const anchorFields = {
+  displayId: z.number().int().min(-Number.MAX_SAFE_INTEGER).max(Number.MAX_SAFE_INTEGER),
+  offsetX: coordinate, offsetY: coordinate, x: coordinate, y: coordinate, width: extent, height: extent,
+  displayScale1000: z.number().int().min(250).max(8000), observedAt: revision,
+};
+export const hostWindowAnchorSchema = z.discriminatedUnion('role', [
+  z.strictObject({ role: z.literal('control-center'), petId: z.null(), ...anchorFields }),
+  z.strictObject({ role: z.literal('pet'), petId: idSchema, ...anchorFields }),
+]);
+export type HostWindowAnchor = z.infer<typeof hostWindowAnchorSchema>;
+
 export const hostRendererRequestSchema = z.discriminatedUnion('kind', [
   z.strictObject({ kind: z.literal('settings') }),
   z.strictObject({ kind: z.literal('shortcuts'), enabled: hostSettingsToggleSchema }),
@@ -87,21 +115,40 @@ export const hostRendererRequestSchema = z.discriminatedUnion('kind', [
   z.strictObject({ kind: z.literal('preferences') }),
   z.strictObject({ kind: z.literal('save'), edit: hostPreferenceSaveSchema }),
   z.strictObject({ kind: z.literal('backup') }),
+  z.strictObject({ kind: z.literal('restore-backup') }),
+  z.strictObject({ kind: z.literal('restore-status') }),
+  z.strictObject({ kind: z.literal('periodic-backup-status') }),
 ]);
 
 export const hostAuthorityRequestSchema = z.discriminatedUnion('kind', [
+  z.strictObject({ kind: z.literal('window-anchors') }),
+  z.strictObject({ kind: z.literal('save-window-anchor'), anchor: hostWindowAnchorSchema }),
   z.strictObject({ kind: z.literal('preferences') }),
   z.strictObject({ kind: z.literal('save'), edit: hostPreferenceSaveSchema }),
   z.strictObject({ kind: z.literal('shortcuts'), enabled: hostSettingsToggleSchema, expectedRevision: revision }),
   z.strictObject({ kind: z.literal('backup'), destination: z.string().min(1).max(4096).refine(value => !value.includes('\0')) }),
+  z.strictObject({ kind: z.literal('restore-backup'), source: z.string().min(1).max(4096).refine(value => !value.includes('\0')) }),
+  z.strictObject({ kind: z.literal('restore-status') }),
+  z.strictObject({ kind: z.literal('periodic-backup-status') }),
 ]);
 export type HostAuthorityRequest = z.infer<typeof hostAuthorityRequestSchema>;
 export const hostAuthorityResultSchema = z.discriminatedUnion('kind', [
+  z.strictObject({ kind: z.literal('window-anchors'), result: z.discriminatedUnion('ok', [
+    z.strictObject({ ok: z.literal(true), anchors: z.array(hostWindowAnchorSchema).max(101) }), restoreFailureSchema,
+  ]) }),
+  z.strictObject({ kind: z.literal('save-window-anchor'), result: restoreBackupResultSchema }),
   z.strictObject({ kind: z.literal('preferences'), result: hostPreferencesViewResultSchema }),
   z.strictObject({ kind: z.literal('backup'), result: backupViewResultSchema }),
+  z.strictObject({ kind: z.literal('restore-backup'), result: restoreBackupResultSchema }),
+  z.strictObject({ kind: z.literal('restore-status'), result: restoreBackupStatusSchema }),
+  z.strictObject({ kind: z.literal('periodic-backup-status'), result: periodicBackupStatusSchema }),
 ]);
 export type HostAuthorityResult = z.infer<typeof hostAuthorityResultSchema>;
 
+export function hostAuthorityResultKind(request: HostAuthorityRequest): HostAuthorityResult['kind'] {
+  return request.kind === 'save' || request.kind === 'shortcuts' ? 'preferences' : request.kind;
+}
+
 export function hostAuthorityFailure(request: HostAuthorityRequest): HostAuthorityResult {
-  return { kind: request.kind === 'backup' ? 'backup' : 'preferences', result: { ok: false, code: 'SERVICE_UNAVAILABLE' } };
+  return { kind: hostAuthorityResultKind(request), result: { ok: false, code: 'SERVICE_UNAVAILABLE' } };
 }

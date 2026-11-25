@@ -2,7 +2,6 @@ import { DatabaseSync } from 'node:sqlite';
 import { describe, expect, it } from 'vitest';
 import { proactiveLimits } from '@pet-desktop/contracts/proactive';
 import { AppService, SQLiteRepository } from '../src/index.ts';
-import { AI_PROACTIVE_MIGRATION_SQL, AiProactiveStorage } from '../src/ai-proactive-storage.ts';
 
 const now = 1_800_000_000_000;
 const petId = 'pet-1';
@@ -13,8 +12,7 @@ function fixture(action) {
   const repository = new SQLiteRepository(database, { persistent: false });
   const service = new AppService(repository, { now: () => now, createId: kind => `fixture-${kind}`, seed: () => 1 });
   try {
-    database.exec(AI_PROACTIVE_MIGRATION_SQL);
-    return action(new AiProactiveStorage(database, () => true));
+    return service.withFeatureTransaction(tx => action(tx.proactive()));
   } finally {
     service.close();
   }

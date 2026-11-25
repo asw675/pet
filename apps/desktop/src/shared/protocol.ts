@@ -3,6 +3,7 @@ import { appSnapshotSchema, idSchema, ipcRequestSchema, ipcResultSchema, nonnega
 import type { ActiveTravelIpcResult, AppBridge, AppSnapshot, CharactersIpcResult, GalleryIpcResult, GalleryQuery, InventoryIpcResult,
   TravelCatalogIpcResult, TravelPreviewIpcResult, TravelReportsIpcResult, EventsIpcResult } from '@pet-desktop/contracts';
 import type { EventListQuery } from '@pet-desktop/contracts/events';
+import type { CharacterPackChanged, CharacterPackResult } from './character-pack-ipc';
 import type { TripPreparationPayload, TravelReportsQuery } from '@pet-desktop/contracts/travel';
 import { featureInputSchema, featureOutputSchema } from './feature-protocol';
 import type { AiIntent, AiResult, CredentialSave, CredentialRevoke } from './ai-ipc';
@@ -10,10 +11,13 @@ import type { AiCancelReason,ChatStreamEvent } from '@pet-desktop/contracts/ai';
 import type { VoiceChatIdentity, VoiceMicGrant, VoiceMouthNotification, VoiceOwnedJob, VoiceServiceRequest, VoiceServiceResult } from './voice-ipc';
 import type {VoiceSettingsRequest,VoiceSettingsResult} from './voice-settings-ipc';
 import type {WorkspaceIntent,WorkspaceResult} from './workspace-ipc';
+import type { ProactiveDesktopBubble, ProactiveIntent, ProactiveNoticeReady, ProactiveResult } from './proactive-ipc';
 
-import type { BackupViewResult, HostPreferenceSave, HostPreferencesViewResult, HostRenderPreferences, HostSettingsResult } from './host-settings-ipc';
+import type { BackupViewResult, HostPreferenceSave, HostPreferencesViewResult, HostRenderPreferences, HostSettingsResult, PeriodicBackupStatus, RestoreBackupResult, RestoreBackupStatus } from './host-settings-ipc';
 
 export const DESKTOP_IPC = Object.freeze({
+  characterPackRequest: 'pet-desktop:character-pack-request:v1',
+  characterPackChanged: 'pet-desktop:character-pack-changed:v1',
   hostRequest: 'pet-desktop:host-settings:v1',
   hostRenderPreferences: 'pet-desktop:host-render-preferences:v1',
   request: 'pet-desktop:request:v1',
@@ -27,6 +31,9 @@ export const DESKTOP_IPC = Object.freeze({
   voiceRequest:'pet-desktop:voice-request:v1',micAuthorize:'pet-desktop:mic-authorize:v1',micRequest:'pet-desktop:mic-request:v1',micRevoke:'pet-desktop:mic-revoke:v1',
   voiceChatCancel:'pet-desktop:voice-chat-cancel:v1',voiceMouth:'pet-desktop:voice-mouth:v1',voiceSuspend:'pet-desktop:voice-suspend:v1',
   voiceSettingsRequest:'pet-desktop:voice-settings:v1',workspaceRequest:'pet-desktop:workspace:v1',
+  proactiveRequest: 'pet-desktop:proactive:v1',
+  proactiveNotice: 'pet-desktop:proactive-notice:v1',
+  proactiveBubble: 'pet-desktop:proactive-bubble:v1',
 });
 
 export const serviceStatusSchema = z.strictObject({
@@ -59,19 +66,28 @@ export interface DesktopBridgeBase extends AppBridge {
 
 export interface PetDesktopBridge extends DesktopBridgeBase {
   readonly role: 'pet';
+  readCharacterPack(characterId: string): Promise<CharacterPackResult>;
+  subscribeCharacterPackChanged(listener: (change: CharacterPackChanged) => void): () => void;
   setInteractive(interactive: boolean): Promise<HostActionResult>;
   reportVisualReady(report: PetVisualReady): Promise<HostActionResult>;
   subscribeHostRenderPreferences(listener: (value: HostRenderPreferences) => void): () => void;
   subscribeVoiceMouth(listener:(event:VoiceMouthNotification)=>void):()=>void;
+  subscribeProactiveBubble(listener: (bubble: ProactiveDesktopBubble) => void): () => void;
 }
 export interface ControlCenterBridge extends DesktopBridgeBase {
   readonly role: 'control-center';
+  listCharacterPacks(): Promise<CharacterPackResult>;
+  importCharacterPack(): Promise<CharacterPackResult>;
+  activateCharacterPack(change: CharacterPackChanged): Promise<CharacterPackResult>;
   getHostSettings(): Promise<HostSettingsResult>;
   setHostShortcutEnabled(enabled: boolean): Promise<HostSettingsResult>;
   setLoginStart(enabled: boolean): Promise<HostSettingsResult>;
   getHostPreferences(): Promise<HostPreferencesViewResult>;
   saveHostPreferences(edit: HostPreferenceSave): Promise<HostPreferencesViewResult>;
   exportBackup(): Promise<BackupViewResult>;
+  restoreBackup(): Promise<RestoreBackupResult>;
+  getRestoreBackupStatus(): Promise<RestoreBackupStatus>;
+  getPeriodicBackupStatus(): Promise<PeriodicBackupStatus>;
   listGallery(query: GalleryQuery): Promise<GalleryIpcResult>;
   listCharacters(): Promise<CharactersIpcResult>;
   listInventory(legacyOffset?: number): Promise<InventoryIpcResult>;
@@ -87,6 +103,8 @@ export interface ControlCenterBridge extends DesktopBridgeBase {
   voiceRequest(request:VoiceServiceRequest):Promise<VoiceServiceResult>;
   voiceSettingsRequest(request:VoiceSettingsRequest):Promise<VoiceSettingsResult>;
   workspaceRequest(intent:WorkspaceIntent):Promise<WorkspaceResult>;
+  proactiveRequest(intent: ProactiveIntent): Promise<ProactiveResult>;
+  subscribeProactiveNotices(listener: (notice: ProactiveNoticeReady) => void): () => void;
   authorizeMicrophone():Promise<HostActionResult>;
   requestMic(job:VoiceOwnedJob):Promise<VoiceMicGrant|null>;
   revokeMic(grant:VoiceMicGrant):Promise<void>;

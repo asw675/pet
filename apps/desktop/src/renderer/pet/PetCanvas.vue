@@ -2,6 +2,7 @@
 import { nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import type { Activity } from '@pet-desktop/contracts';
 import { loadBuiltinPack } from '../asset-packs/builtin-registry';
+import { loadInstalledPack } from '../asset-packs/installed-pack';
 import { AdaptiveRendererHost } from '../rendering/adaptive-renderer-host';
 import type { AdaptiveRenderState } from '../rendering/adaptive-renderer-host';
 import { CanvasRenderer } from '../rendering/canvas-renderer';
@@ -28,6 +29,7 @@ const loadState = ref<'loading' | 'ready' | 'failed'>('loading');
 let renderer: AdaptiveRendererHost | null = null;
 let mounted = false;
 let loadAbort: AbortController | null = null;
+let unsubscribePackChange: (() => void) | undefined;
 let resizeObserver: ResizeObserver | null = null;
 let frameRequest: number | null = null;
 let lastFrame: number | null = null;
@@ -98,9 +100,18 @@ async function replacePack(): Promise<void> {
   const isCurrent = () => mounted && loadAbort === request && !request.signal.aborted;
   instance.invalidate(characterId);
   try {
-    const pack = await loadBuiltinPack(characterId, request.signal);
+    const bridge = window.petDesktop?.role === 'pet' ? window.petDesktop : undefined;
+    const installed = await loadInstalledPack(bridge, characterId, request.signal).catch(() => null);
     if (!isCurrent()) return;
-    await instance.loadPack(pack, request.signal);
+    if (installed) {
+      await instance.loadPack(installed, request.signal);
+      if (!isCurrent()) return;
+    }
+    if (!installed || loadState.value === 'failed') {
+      const pack = await loadBuiltinPack(characterId, request.signal);
+      if (!isCurrent()) return;
+      await instance.loadPack(pack, request.signal);
+    }
   } catch {
     if (!isCurrent()) return;
     instance.showPortrait(characterId);
@@ -176,11 +187,17 @@ onMounted(() => {
   window.addEventListener('resize', resize);
   motionPreference.addEventListener('change', syncQuality);
   syncAnimation();
+  if (window.petDesktop?.role === 'pet') {
+    unsubscribePackChange = window.petDesktop.subscribeCharacterPackChanged(change => {
+      if (change.characterId === props.characterId) void replacePack();
+    });
+  }
   void replacePack();
 });
 
 onBeforeUnmount(() => {
   mounted = false;
+  unsubscribePackChange?.();
   loadAbort?.abort();
   stopFrames();
   resizeObserver?.disconnect();

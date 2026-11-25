@@ -1,6 +1,6 @@
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { loadBuiltinPack } from '../src/renderer/asset-packs/builtin-registry';
-import type { ResolvedPack } from '../src/renderer/asset-packs/resolve-pack';
+import type { ResolvedPack } from '../src/shared/resolve-character-pack';
 import { AdaptiveRendererHost } from '../src/renderer/rendering/adaptive-renderer-host';
 import { PixiRenderer } from '../src/renderer/rendering/pixi-renderer';
 import type { PixiBitmapDecoder } from '../src/renderer/rendering/pixi-renderer';

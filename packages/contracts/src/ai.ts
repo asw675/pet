@@ -1,4 +1,6 @@
 import { z } from 'zod';
+import { proactiveTriggerSchema } from '#proactive';
+import { aiQuickActionBindingSchema } from '#workspace';
 
 /** Declarative AI contracts. None of these schemas grants tools, system
  * permissions, memory writes or authoritative gameplay effects. */
@@ -222,6 +224,8 @@ export const turnContextSchema = z.strictObject({
   recentMessages: z.array(chatContextMessageSchema).max(aiLimits.historyMessages),
   authorizedMemories: z.array(authorizedMemoryContextSchema).max(aiLimits.authorizedMemories),
   historySummary: historySummarySchema.nullable(),
+  quickActions: z.array(aiQuickActionBindingSchema).max(12)
+    .refine(rows => new Set(rows.map(row => row.targetId)).size === rows.length).optional(),
 });
 export type TurnContext = z.infer<typeof turnContextSchema>;
 export const turnTriggerSchema = z.enum(['USER', 'PROACTIVE', 'MEMORY_EXTRACTION', 'SUMMARY']);
@@ -232,11 +236,18 @@ export type TurnTrigger = z.infer<typeof turnTriggerSchema>;
 export const turnRequestSchema = z.strictObject({
   ...identity, trigger: turnTriggerSchema, personaRevision: integer, snapshotRevision: integer, deadline,
   userText: boundedText(aiLimits.userText).nullable(), userMessageId: id.nullable(), context: turnContextSchema,
+  proactiveReason: proactiveTriggerSchema.optional(),
 }).superRefine((turn, ctx) => {
   const { context } = turn;
   if (turn.trigger === 'USER' ? turn.userText === null || turn.userMessageId === null
     : turn.userText !== null || turn.userMessageId !== null) {
     ctx.addIssue({ code: 'custom', path: ['userText'], message: 'Only a user turn carries a current user message' });
+  }
+  if (turn.proactiveReason !== undefined && turn.trigger !== 'PROACTIVE') {
+    ctx.addIssue({ code: 'custom', path: ['proactiveReason'], message: 'Only proactive turns carry a proactive reason' });
+  }
+  if (turn.trigger !== 'USER' && context.quickActions?.length) {
+    ctx.addIssue({ code: 'custom', path: ['context', 'quickActions'], message: 'Only user turns can receive quick actions' });
   }
   if (context.game.petId !== turn.petId || context.persona.characterId !== context.game.characterId
     || context.persona.revision !== turn.personaRevision) {
@@ -283,9 +294,17 @@ export const actionProposalDraftSchema = z.strictObject(proposalFields);
 export type ActionProposalDraft = z.infer<typeof actionProposalDraftSchema>;
 /** Only trusted service code binds a proposal to its source and confirmation
  * requirements. This still represents a suggestion, not permission to execute. */
-export const actionProposalSchema = z.strictObject({ ...proposalFields, ...identity,
-  proposalId: id, expiresAt: deadline, confirmationRequired: z.literal(true) });
+const trustedProposalFields = { ...proposalFields, ...identity,
+  proposalId: id, expiresAt: deadline, confirmationRequired: z.literal(true) } as const;
+export const quickActionProposalSchema = z.strictObject({ ...trustedProposalFields, type: z.literal('QUICK_ACTION_SUGGESTION'),
+  targetRevision: integer, targetLabel: aiQuickActionBindingSchema.shape.label });
+export const actionProposalSchema = z.discriminatedUnion('type', [
+  z.strictObject({ ...trustedProposalFields, type: z.literal('REST') }),
+  z.strictObject({ ...trustedProposalFields, type: z.literal('TRIP_SUGGESTION') }),
+  quickActionProposalSchema,
+]);
 export type ActionProposal = z.infer<typeof actionProposalSchema>;
+export type QuickActionProposal = z.infer<typeof quickActionProposalSchema>;
 
 /** Entire model reply is schema-validated before presentation or proposal
  * handling. Free-form text is displayed as plain text, never executed. */

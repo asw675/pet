@@ -5,8 +5,10 @@ import {
   providerConfigSchema, turnRequestSchema,
 } from '@pet-desktop/contracts/ai';
 import type {
-  ActionProposalDraft, AiError, AiErrorCode, AiGameContext, Conversation, PersonaContext, ProviderConfig, TurnRequest,
+  ActionProposalDraft, AiError, AiErrorCode, AiGameContext, Conversation, PersonaContext, ProviderConfig, QuickActionProposal, TurnRequest,
 } from '@pet-desktop/contracts/ai';
+import type { ProactiveTrigger } from '@pet-desktop/contracts/proactive';
+import type { AiQuickActionBinding } from '@pet-desktop/contracts/workspace';
 import { CHARACTER_CATALOG_VERSION, findCharacterDefinition } from '@pet-desktop/domain/character-catalog';
 import { findRouteCatalogEntry } from '@pet-desktop/domain/route-catalog';
 import type {
@@ -21,6 +23,8 @@ import type { TrustedMemoryConfirmation } from './memory-policy.js';
 export interface AiAuthorityGameView {
   snapshot(): AppSnapshot;
   recentEvents?(petId: string): AiGameContext['recentEvents'];
+  proactiveTrigger?(identity: AiTurnIdentity): ProactiveTrigger | null;
+  quickActions?(at: number): readonly AiQuickActionBinding[];
 }
 export interface AiAuthorityServiceOptions {
   transaction<T>(run: (store: AiStateStorage, game: AiAuthorityGameView) => T): T;
@@ -128,7 +132,7 @@ function currentPetForTurn(snapshot: AppSnapshot, turn: AiTurnRecord): PetSnapsh
   const pet = findPet(snapshot,turn.petId), persona = pet ? personaFor(pet.characterId) : null;
   return pet && persona && pet.characterId === turn.characterId && persona.revision === turn.personaRevision ? pet : null;
 }
-function allowProposal(pet: PetSnapshot, draft: ActionProposalDraft): boolean {
+function allowProposal(pet: PetSnapshot, draft: ActionProposalDraft, quickAction?: AiQuickActionBinding): boolean {
   if (pet.presence !== 'HOME' || pet.activity === 'DRAG' || pet.activity === 'CHAT') return false;
   if (draft.type === 'REST') return draft.targetId === 'self';
   if (draft.type === 'TRIP_SUGGESTION') {
@@ -139,9 +143,11 @@ function allowProposal(pet: PetSnapshot, draft: ActionProposalDraft): boolean {
     return route !== undefined && pet.level >= route.minLevel && pet.energy * 10 + 1e-6 >= route.energyCost10
       && pet.healthStatus === 'NORMAL' && pet.healthPoints > 0;
   }
-  // Workspace integration may later expose real selected IDs. Deny every
-  // quick action until that separately trusted whitelist exists.
-  return false;
+  return quickAction?.targetId === draft.targetId;
+}
+
+function allowedQuickAction(game: AiAuthorityGameView, targetId: string, at: number, revision: number, label: string): AiQuickActionBinding | undefined {
+  return game.quickActions?.(at).find(action => action.targetId === targetId && action.targetRevision === revision && action.label === label);
 }
 
 /** Synchronous service. No provider network requests, credentials, effects or
@@ -228,13 +234,19 @@ export class AiAuthorityService {
       if(store.hasPendingTurn(intent.petId)||store.countPendingTurns()>=3)return rejected('UNAVAILABLE');
       const deadline=Math.min(Number.MAX_SAFE_INTEGER,now+assigned.provider.config.timeoutMs);
       if(deadline<=now)return rejected('TIMEOUT');
-      const recentMessages=store.listRecentCompletedMessages(intent.petId,intent.conversationId)
+      const recentMessages=(intent.trigger==='USER'?store.listRecentCompletedMessages(intent.petId,intent.conversationId):[])
         .map(({messageId,petId,conversationId,role,text,createdAt})=>({messageId,petId,conversationId,role,text,createdAt}));
       const authorizedMemories=intent.trigger==='USER'?store.retrieveMemories(intent.petId,intent.userText,now):[];
+      const proactiveReason = intent.trigger === 'PROACTIVE' ? view.proactiveTrigger?.(intent) : null;
+      const quickActions = intent.trigger === 'USER' && assigned.provider.config.privacyBoundary !== 'CLOUD'
+        && (assigned.provider.config.capabilities.nativeStructured || assigned.provider.config.capabilities.jsonMode)
+        ? view.quickActions?.(now).slice(0, 12) : undefined;
       const turn=turnRequestSchema.parse({...identity(intent),trigger:intent.trigger,userText:intent.userText,
         userMessageId:intent.trigger==='USER'?this.allocate('user-message'):null,
         personaRevision:persona.revision,snapshotRevision:snapshot.revision,deadline,
-        context:{persona,game:gameContext(pet,view,now),recentMessages,authorizedMemories,historySummary:null}});
+        ...(proactiveReason ? { proactiveReason } : {}),
+        context:{persona,game:gameContext(pet,view,now),recentMessages,authorizedMemories,historySummary:null,
+          ...(quickActions?.length ? { quickActions } : {})}});
       const providerId=assigned.provider.config.providerId,providerRevision=assigned.provider.revision;
       const started=store.beginTurn({turn,providerId,providerRevision,assistantMessageId:this.allocate('assistant-message'),startedAt:now});
       return started==='STARTED'?{kind:'STARTED',turn,providerId,providerRevision}:{kind:'DUPLICATE'};
@@ -257,14 +269,16 @@ export class AiAuthorityService {
     });
   }
   lookupMessage(messageId:string) {return this.options.transaction(store=>store.lookupMessage(messageId));}
-  isProposalAllowed(request:AiTurnIdentity,raw:ActionProposalDraft):boolean {
+  isProposalAllowed(request:AiTurnIdentity,raw:ActionProposalDraft,binding?: AiQuickActionBinding,at?: number):boolean {
     const draft=actionProposalDraftSchema.safeParse(raw);
     if(!draft.success)return false;
     return this.options.transaction((store,game)=>{
       const turn=store.getTurn(id(request.requestId));
       if(!turn||turn.status!=='PENDING'||turn.trigger!=='USER'||!sameIdentity(turn,request))return false;
       const pet=currentPetForTurn(getSnapshot(game),turn);
-      return pet!==null&&allowProposal(pet,draft.data);
+      const quick = draft.data.type === 'QUICK_ACTION_SUGGESTION' && binding && at !== undefined && binding.targetId === draft.data.targetId
+        ? allowedQuickAction(game, binding.targetId, time(at), binding.targetRevision, binding.label) : undefined;
+      return pet!==null&&allowProposal(pet,draft.data,quick);
     });
   }
   finishTurn(terminal:AiChatTerminal):boolean {
@@ -278,7 +292,9 @@ export class AiAuthorityService {
         const keys=new Set<string>();
         for(const proposal of terminal.proposals){
           const draft=actionProposalDraftSchema.parse({type:proposal.type,targetId:proposal.targetId,reason:proposal.reason}),key=JSON.stringify([draft.type,draft.targetId]);
-          if(turn.trigger!=='USER'||keys.has(key)||!allowProposal(pet,draft)||proposal.expiresAt-terminal.completedAt>PROPOSAL_TTL)throw new Error('AI proposal no longer allowed');
+          const quick = proposal.type === 'QUICK_ACTION_SUGGESTION' && provider.config.privacyBoundary !== 'CLOUD'
+            ? allowedQuickAction(view, proposal.targetId, terminal.completedAt, proposal.targetRevision, proposal.targetLabel) : undefined;
+          if(turn.trigger!=='USER'||keys.has(key)||!allowProposal(pet,draft,quick)||proposal.expiresAt-terminal.completedAt>PROPOSAL_TTL)throw new Error('AI proposal no longer allowed');
           keys.add(key);
         }
       }
@@ -295,11 +311,27 @@ export class AiAuthorityService {
     return this.options.transaction((store,view)=>{
       const snapshot=getSnapshot(view),pet=findPet(snapshot,petId);
       if(!pet)return [];
-      return store.listActionProposals(petId,at,limit).filter(proposal=>allowProposal(pet,proposal));
+      return store.listActionProposals(petId,at,limit).filter(proposal=>allowProposal(pet,proposal,
+        proposal.type === 'QUICK_ACTION_SUGGESTION'
+          ? allowedQuickAction(view, proposal.targetId, at, proposal.targetRevision, proposal.targetLabel) : undefined));
     });
   }
   dismissActionProposal(petId:string,proposalId:string):boolean {
     return this.options.transaction((store,game)=>{requirePet(game,petId);return store.deleteActionProposal(petId,proposalId);});
+  }
+  /** Main-only exact read/consume. The echoed version and expiry come from the
+   * proposal returned to Main before it displayed native confirmation. */
+  resolveQuickProposal(petId: string, proposalId: string, at: number,
+    consume?: Pick<QuickActionProposal, 'targetId' | 'targetRevision' | 'expiresAt'>): QuickActionProposal | null {
+    return this.options.transaction((store, game) => {
+      const pet = findPet(getSnapshot(game), petId);
+      const proposal = store.getActionProposal(petId, proposalId, at);
+      if (!pet || proposal?.type !== 'QUICK_ACTION_SUGGESTION'
+        || !allowProposal(pet, proposal, allowedQuickAction(game, proposal.targetId, at, proposal.targetRevision, proposal.targetLabel))) return null;
+      if (consume && (consume.targetId !== proposal.targetId || consume.targetRevision !== proposal.targetRevision
+        || consume.expiresAt !== proposal.expiresAt || !store.deleteActionProposal(petId, proposalId))) return null;
+      return proposal;
+    });
   }
   listPendingCandidates(petId:string,at:number,limit=MAX_PAGE,offset=0) {
     return this.options.transaction((store,game)=>{requirePet(game,petId);return store.listPendingCandidates(petId,at,limit,offset);});

@@ -12,9 +12,13 @@ type FatalCode = Extract<ServiceOutput, { kind: 'fatal' }>['code'];
 type Service = Pick<AppService, 'getSnapshot' | 'handleRequest' | 'close'>;
 
 interface UtilityOptions {
-  /** Only the trusted Main process supplies this single startup argument. */
+  /** Only the trusted Main process supplies startup and optional recovery arguments. */
   args: readonly string[];
-  start(databasePath: string): { service: Service; sqliteVersion: string; createFeatures?: (send:(message:FeatureOutput)=>void,fault:()=>void)=>UtilityFeatures };
+  start(databasePath: string, recoverySource?: string): {
+    service: Service; sqliteVersion: string;
+    createFeatures?: (send:(message:FeatureOutput)=>void,fault:()=>void)=>UtilityFeatures;
+    runMaintenance?: () => void;
+  };
   send(message: ServiceOutput): void;
   exit(code: 0 | 1): void;
 }
@@ -28,6 +32,7 @@ export function startUtilityTransport(options: UtilityOptions): {
   let service: Service | undefined;
   let features:UtilityFeatures|undefined;
   let timer: ReturnType<typeof setInterval> | undefined;
+  let runMaintenance: (() => void) | undefined;
   let terminal = false;
   let lastRevision = -1;
 
@@ -69,6 +74,7 @@ export function startUtilityTransport(options: UtilityOptions): {
     if (terminal) return;
     try {
       pushSnapshot();
+      runMaintenance?.();
     } catch {
       finish('SERVICE_FAILED');
     }
@@ -108,12 +114,16 @@ export function startUtilityTransport(options: UtilityOptions): {
   }
 
   const databasePath = options.args[0];
-  if (options.args.length !== 1 || databasePath === undefined || !isAbsolute(databasePath) || databasePath.includes('\0')) {
+  const selectedBackup = options.args[2];
+  const recoverySource = options.args.length === 3 && options.args[1] === '--recover-from-backup' && selectedBackup
+    && selectedBackup.length <= 4096 && isAbsolute(selectedBackup) && !selectedBackup.includes('\0') ? selectedBackup : undefined;
+  if ((!recoverySource && options.args.length !== 1) || databasePath === undefined || !isAbsolute(databasePath) || databasePath.includes('\0')) {
     finish('INVALID_STARTUP');
   } else {
     try {
-      const started = options.start(databasePath);
+      const started = recoverySource ? options.start(databasePath, recoverySource) : options.start(databasePath);
       service = started.service;
+      runMaintenance = started.runMaintenance;
       features=started.createFeatures?.(message=>{if(!terminal)send(message);},()=>finish('SERVICE_FAILED'));
       // Validate the initial projection before advertising readiness.
       const initial = serviceOutputSchema.parse({ kind: 'snapshot', snapshot: service.getSnapshot() });

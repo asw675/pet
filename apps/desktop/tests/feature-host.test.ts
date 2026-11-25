@@ -17,7 +17,7 @@ import type { VoiceSettingsRequest, VoiceSettingsResult } from '../src/shared/vo
 // handlers and lifecycle using exact webContents/frame object identities.
 const electronMock = vi.hoisted(() => ({ handlers: new Map<string, (...args: any[]) => any>(), windows: [] as any[],
   permission: undefined as ((...args: any[]) => void) | undefined, check: undefined as (() => boolean) | undefined,
-  device: undefined as (() => boolean) | undefined, prompt: vi.fn(), savePrompt: vi.fn(), power: undefined as EventEmitter | undefined,
+  device: undefined as (() => boolean) | undefined, prompt: vi.fn(), savePrompt: vi.fn(), openPrompt: vi.fn(), power: undefined as EventEmitter | undefined,
   screen: undefined as EventEmitter | undefined }));
 
 vi.mock('electron', async () => {
@@ -35,7 +35,7 @@ vi.mock('electron', async () => {
     send(channel: string, value: unknown) { this.sent.push({ channel, value }); }
     setWindowOpenHandler() {}
   }
-  const display = { id: 1, workArea: { x: 0, y: 0, width: 1920, height: 1080 } };
+  const display = { id: 1, scaleFactor: 1.5, workArea: { x: 0, y: 0, width: 1920, height: 1080 } };
   class Window extends EventEmitter {
     webContents = new Contents();
     visible = false;
@@ -76,7 +76,7 @@ vi.mock('electron', async () => {
   electronMock.screen = Object.assign(new EventEmitter(), { getAllDisplays: () => [display], getPrimaryDisplay: () => display,
     getDisplayMatching: () => display, getCursorScreenPoint: () => ({ x: 0, y: 0 }) });
   class Tray extends EventEmitter { setToolTip() {} setContextMenu() {} isDestroyed() { return false; } destroy() {} }
-  return { app, BrowserWindow: Window, dialog: { showMessageBox: electronMock.prompt, showSaveDialog: electronMock.savePrompt }, ipcMain: { handle: (channel: string, handler: any) => electronMock.handlers.set(channel, handler) },
+  return { app, BrowserWindow: Window, dialog: { showMessageBox: electronMock.prompt, showSaveDialog: electronMock.savePrompt, showOpenDialog: electronMock.openPrompt }, ipcMain: { handle: (channel: string, handler: any) => electronMock.handlers.set(channel, handler) },
     Menu: { buildFromTemplate: () => ({}) }, nativeImage: { createFromBitmap: () => ({ setTemplateImage() {} }) }, powerMonitor: electronMock.power,
     safeStorage: {}, screen: electronMock.screen, session: { defaultSession: {
       setPermissionRequestHandler: (handler: any) => { electronMock.permission = handler; },
@@ -86,6 +86,8 @@ vi.mock('electron', async () => {
 });
 
 import { DesktopHost } from '../src/main/bootstrap';
+import { proactiveFailure } from '../src/shared/proactive-ipc';
+import type { ProactiveNoticeReady, ProactiveRequest } from '../src/shared/proactive-ipc';
 
 const snapshot = (primaryPetId = 'pet-a'): AppSnapshot => ({ revision: 0, primaryPetId, doNotDisturb: false, pausedRender: false, walletCoins: 0,
   pets: ['pet-a', 'pet-b'].map((petId) => ({ petId, characterId: petId === 'pet-a' ? 'star-singer' : 'fluffy-ranger', nickname: petId,
@@ -100,16 +102,24 @@ function fixture() {
   let active: VoiceOwnedJob | undefined;
   let statusListener: (status: ServiceStatus) => void = () => {};
   let snapshotListener: (value: AppSnapshot) => void = () => {};
+  let proactiveListener: (event: ProactiveNoticeReady) => void = () => {};
   const service = {
     requestHost: vi.fn(async (request: HostAuthorityRequest): Promise<HostAuthorityResult> => {
+      if (request.kind === 'window-anchors') return { kind: request.kind, result: { ok: true, anchors: [] } };
+      if (request.kind === 'save-window-anchor') return { kind: request.kind, result: { ok: true } };
       if (request.kind === 'backup') return { kind: 'backup', result: { ok: true, schemaVersion: 11 } };
+      if (request.kind === 'restore-backup') return { kind: 'restore-backup', result: { ok: true } };
+      if (request.kind === 'restore-status') return { kind: 'restore-status', result: { ok: true, status: 'RESTORED' } };
       return { kind: 'preferences', result: { ok: true, preferences: { revision: 0, updatedAt: null,
         values: { hotkeysEnabled: true, scalePercent: 100, reducedMotion: false } } } };
     }),
-    getStatus: () => current, start: () => snapshotListener(snapshot()), stop: async () => {}, request: vi.fn(),
+    getStatus: () => current, start: () => snapshotListener(snapshot()), stop: async () => {}, restart: vi.fn(() => true), recover: vi.fn(() => true), request: vi.fn(),
     subscribeStatus: (listener: typeof statusListener) => { statusListener = listener; return () => {}; },
     subscribeSnapshot: (listener: typeof snapshotListener) => { snapshotListener = listener; return () => {}; },
     subscribeChat: vi.fn(() => () => {}),
+    subscribeProactive: (listener: typeof proactiveListener) => { proactiveListener = listener; return () => {}; },
+    setProactiveHost: vi.fn(),
+    requestProactive: vi.fn(async (request: ProactiveRequest) => proactiveFailure(request)),
     requestAi: vi.fn(async (request: AiRequest) => aiSuccess(request)),
     requestVoiceSettings: vi.fn(async (request: VoiceSettingsRequest):Promise<VoiceSettingsResult> => ({ok:true,kind:'profile',profile:{petId:request.petId,
       revision:request.kind==='save'||request.kind==='reset'?request.expectedRevision+1:0,updatedAt:request.kind==='save'||request.kind==='reset'?1:null,
@@ -148,7 +158,8 @@ function fixture() {
   expect(pet.visible).toBe(true);
   service.revokeFeatureDocument.mockClear();
   return { host, service, vault, cc, pet, call, event, callFrom, permission, authorize, reserve, grant,
-    status: (status: ServiceStatus) => { current = status; statusListener(status); }, snapshot: (next: AppSnapshot) => snapshotListener(next) };
+    status: (status: ServiceStatus) => { current = status; statusListener(status); }, snapshot: (next: AppSnapshot) => snapshotListener(next),
+    proactive: (event: ProactiveNoticeReady) => proactiveListener(event) };
 }
 
 describe('actual Main feature IPC and lifecycle (mocked Electron)', () => {
@@ -157,10 +168,61 @@ describe('actual Main feature IPC and lifecycle (mocked Electron)', () => {
     vi.useFakeTimers({ toFake: ['setTimeout','clearTimeout','setInterval','clearInterval','performance'] });
     electronMock.handlers.clear(); electronMock.windows.length = 0; electronMock.power?.removeAllListeners(); electronMock.screen?.removeAllListeners();
     electronMock.savePrompt.mockReset();
+    electronMock.openPrompt.mockReset();
     electronMock.prompt.mockReset(); electronMock.prompt.mockResolvedValue({ response: 1 });
     f = fixture();
   });
   afterEach(async () => { await f?.host.stop(); vi.useRealTimers(); });
+
+  it('restores a saved display anchor and coalesces window move events into one authoritative write', async () => {
+    const stored = { role: 'control-center' as const, petId: null, displayId: 1, offsetX: 150, offsetY: 100,
+      x: 150, y: 100, width: 840, height: 650, displayScale1000: 1500, observedAt: 1 };
+    f.service.requestHost.mockImplementation(async request => request.kind === 'window-anchors'
+      ? { kind: request.kind, result: { ok: true, anchors: [stored] } }
+      : request.kind === 'save-window-anchor'
+        ? { kind: request.kind, result: { ok: true } }
+        : { kind: 'preferences', result: { ok: false, code: 'UNAVAILABLE' } });
+    f.status({ stage: 'READY', generation: 2 });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(f.service.requestHost).toHaveBeenCalledWith({ kind: 'window-anchors' });
+    expect(f.cc.getBounds()).toEqual({ x: 150, y: 100, width: 840, height: 650 });
+    f.cc.setPosition(185, 120);
+    f.cc.emit('move');
+    f.cc.setPosition(195, 130);
+    f.cc.emit('move');
+    await vi.advanceTimersByTimeAsync(399);
+    expect(f.service.requestHost.mock.calls.filter(([request]) => request.kind === 'save-window-anchor')).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(f.service.requestHost).toHaveBeenLastCalledWith({
+      kind: 'save-window-anchor',
+      anchor: { ...stored, x: 195, y: 130, offsetX: 195, offsetY: 130, observedAt: expect.any(Number) },
+    });
+    await expect(f.call(DESKTOP_IPC.hostRequest, { kind: 'save-window-anchor', anchor: stored }))
+      .rejects.toThrow('INVALID_REQUEST');
+  });
+
+  it('routes proactive requests only from the control center and shows a bubble only on the active matching pet', async () => {
+    const request: ProactiveRequest = { requestId: 'read-proactive', intent: { method: 'settings/get', payload: { petId: 'pet-a' } } };
+    expect(await f.callFrom(f.pet, DESKTOP_IPC.proactiveRequest, request)).toMatchObject({ ok: false, error: { code: 'INVALID_REQUEST' } });
+    expect(f.service.requestProactive).not.toHaveBeenCalled();
+    await f.call(DESKTOP_IPC.proactiveRequest, request);
+    expect(f.service.requestProactive).toHaveBeenCalledExactlyOnceWith({ ...request, requestId: expect.stringMatching(/^proactive-/u) });
+    expect(f.service.setProactiveHost).toHaveBeenLastCalledWith('pet-a');
+
+    const event: ProactiveNoticeReady = { kind: 'notice-ready', notice: {
+      noticeId: 'fresh', petId: 'pet-a', trigger: 'IDLE', sourceKey: 'idle:0', sourceAt: 0, createdAt: 1, text: '测试问候',
+      responseKind: 'RULE', deliveryStatus: 'READY', generation: null, readyAt: 1, acknowledgedAt: null, dismissedAt: null,
+    } };
+    f.proactive({ ...event, notice: { ...event.notice, petId: 'pet-b' } });
+    expect(f.pet.webContents.sent).not.toContainEqual({ channel: DESKTOP_IPC.proactiveBubble, value: expect.anything() });
+    f.proactive(event);
+    expect(f.pet.webContents.sent).toContainEqual({ channel: DESKTOP_IPC.proactiveBubble, value: { petId: 'pet-a', text: '测试问候' } });
+    f.snapshot({ ...snapshot(), revision: 1, doNotDisturb: true });
+    expect(f.service.setProactiveHost).toHaveBeenLastCalledWith(null);
+    expect(f.pet.visible).toBe(false);
+    f.proactive(event);
+    expect(f.pet.webContents.sent.filter((entry: { channel: string }) => entry.channel === DESKTOP_IPC.proactiveBubble)).toHaveLength(1);
+  });
 
   it('accepts backup only from the focused control center and sends only the native-selected path to the writer', async () => {
     const destination = join(tmpdir(), 'synthetic-backup.sqlite3');
@@ -172,6 +234,34 @@ describe('actual Main feature IPC and lifecycle (mocked Electron)', () => {
     expect(f.service.requestHost).not.toHaveBeenCalled();
     expect(await f.call(DESKTOP_IPC.hostRequest, { kind: 'backup' })).toEqual({ ok: true, schemaVersion: 11 });
     expect(f.service.requestHost).toHaveBeenCalledExactlyOnceWith({ kind: 'backup', destination });
+  });
+
+  it('requires the focused control center, native selection and affirmative restore confirmation before triggering maintenance', async () => {
+    const source = join(tmpdir(), 'synthetic 源备份.sqlite3');
+    await expect(f.callFrom(f.pet, DESKTOP_IPC.hostRequest, { kind: 'restore-backup' })).rejects.toThrow('FORBIDDEN');
+    await expect(f.call(DESKTOP_IPC.hostRequest, { kind: 'restore-backup', source })).rejects.toThrow('INVALID_REQUEST');
+    expect(electronMock.openPrompt).not.toHaveBeenCalled();
+    electronMock.openPrompt.mockResolvedValue({ canceled: false, filePaths: [source] });
+    electronMock.prompt.mockResolvedValueOnce({ response: 0 }).mockResolvedValueOnce({ response: 1 });
+    await expect(f.call(DESKTOP_IPC.hostRequest, { kind: 'restore-backup' })).resolves.toEqual({ ok: false, code: 'CANCELLED' });
+    expect(f.service.requestHost).not.toHaveBeenCalled();
+    expect(f.service.restart).not.toHaveBeenCalled();
+    await expect(f.call(DESKTOP_IPC.hostRequest, { kind: 'restore-backup' })).resolves.toEqual({ ok: true });
+    expect(f.service.requestHost).toHaveBeenCalledExactlyOnceWith({ kind: 'restore-backup', source });
+    expect(f.service.restart).toHaveBeenCalledOnce();
+    await expect(f.call(DESKTOP_IPC.hostRequest, { kind: 'restore-status' })).resolves.toEqual({ ok: true, status: 'RESTORED' });
+  });
+
+  it('allows controlled recovery from an unavailable service only after a native confirmation', async () => {
+    const source = join(tmpdir(), 'recovery.sqlite3');
+    f.status({ stage: 'UNAVAILABLE', generation: 1 });
+    electronMock.openPrompt.mockResolvedValue({ canceled: false, filePaths: [source] });
+    electronMock.prompt.mockResolvedValueOnce({ response: 0 }).mockResolvedValueOnce({ response: 1 });
+    await expect(f.call(DESKTOP_IPC.hostRequest, { kind: 'restore-backup' })).resolves.toEqual({ ok: false, code: 'CANCELLED' });
+    expect(f.service.recover).not.toHaveBeenCalled();
+    await expect(f.call(DESKTOP_IPC.hostRequest, { kind: 'restore-backup' })).resolves.toEqual({ ok: true });
+    expect(f.service.recover).toHaveBeenCalledExactlyOnceWith(source);
+    expect(f.service.requestHost).not.toHaveBeenCalled();
   });
 
   it('accepts only the trusted control-center main frame and remaps the AI transport correlation ID', async () => {

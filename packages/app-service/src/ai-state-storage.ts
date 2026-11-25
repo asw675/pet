@@ -8,7 +8,7 @@ import type {
   Conversation, MemoryRecord, PendingMemoryCandidate, ProviderConfig, TurnRequest,
 } from '@pet-desktop/contracts/ai';
 import {
-  confirmMemoryCandidate, memoryPolicyLimits, retrieveAuthorizedMemories, screenMemoryText,
+  confirmMemoryCandidate, memoryPolicyLimits, memorySearchTerms, retrieveAuthorizedMemories, screenMemoryText,
 } from '@pet-desktop/app-service/memory-policy';
 import type { ConfirmMemoryResult, TrustedMemoryConfirmation } from '@pet-desktop/app-service/memory-policy';
 import type { SqliteConnection, SqlValue } from './ports.js';
@@ -255,6 +255,48 @@ BEGIN
   DELETE FROM ai_action_proposals WHERE request_id IN (SELECT request_id FROM ai_turn_sources WHERE message_id=NEW.message_id);
 END;
 `;
+
+/** v13. An INTEGER PRIMARY KEY is stable through VACUUM, unlike the
+ * implicit rowid of the existing text-key memories table. The index holds
+ * only tokens, and nested triggers cover message-source deletion too. */
+export const AI_MEMORY_FTS_MIGRATION_SQL = `
+CREATE TABLE ai_memory_search_keys (
+  search_id INTEGER PRIMARY KEY,
+  memory_id TEXT UNIQUE NOT NULL REFERENCES ai_memories(memory_id) ON DELETE CASCADE
+) STRICT;
+CREATE VIRTUAL TABLE ai_memory_fts USING fts5(search_text, content='', contentless_delete=1, tokenize='trigram');
+INSERT INTO ai_memory_fts(ai_memory_fts,rank) VALUES('secure-delete',1);
+
+INSERT INTO ai_memory_search_keys(memory_id) SELECT memory_id FROM ai_memories ORDER BY memory_id;
+INSERT INTO ai_memory_fts(rowid,search_text)
+SELECT k.search_id,m.summary FROM ai_memories m JOIN ai_memory_search_keys k USING(memory_id);
+
+CREATE TRIGGER ai_memory_search_insert AFTER INSERT ON ai_memories BEGIN
+  INSERT INTO ai_memory_search_keys(memory_id) VALUES(NEW.memory_id);
+  INSERT INTO ai_memory_fts(rowid,search_text)
+  SELECT search_id,NEW.summary FROM ai_memory_search_keys WHERE memory_id=NEW.memory_id;
+END;
+CREATE TRIGGER ai_memory_search_edit AFTER UPDATE OF summary ON ai_memories WHEN NEW.summary IS NOT OLD.summary BEGIN
+  UPDATE ai_memory_fts SET search_text=NEW.summary
+  WHERE rowid=(SELECT search_id FROM ai_memory_search_keys WHERE memory_id=OLD.memory_id);
+END;
+CREATE TRIGGER ai_memory_search_delete BEFORE DELETE ON ai_memories BEGIN
+  DELETE FROM ai_memory_fts WHERE rowid=(SELECT search_id FROM ai_memory_search_keys WHERE memory_id=OLD.memory_id);
+END;
+`;
+
+/** Check internal FTS structures on the writer plus the exact logical
+ * ownership mapping. The mapping check also runs on read-only backups. */
+export function verifyMemorySearchIndex(db: SqliteConnection, checkFts = false): void {
+  if (checkFts) db.exec("INSERT INTO ai_memory_fts(ai_memory_fts) VALUES('integrity-check')");
+  const mismatch = db.prepare(`SELECT 1 WHERE EXISTS (
+    SELECT 1 FROM ai_memories m LEFT JOIN ai_memory_search_keys k USING(memory_id)
+    LEFT JOIN ai_memory_fts f ON f.rowid=k.search_id WHERE f.rowid IS NULL
+  ) OR EXISTS (
+    SELECT 1 FROM ai_memory_fts f LEFT JOIN ai_memory_search_keys k ON k.search_id=f.rowid WHERE k.search_id IS NULL
+  )`).get();
+  if (mismatch !== undefined && mismatch !== null) throw new Error('Memory search index does not match confirmed memories');
+}
 
 export interface AiProviderRecord { config: ProviderConfig; revision: number; updatedAt: number }
 export interface AiProviderAssignment { petId: string; providerId: string; providerRevision: number; consentRef: string | null; assignedAt: number }
@@ -583,8 +625,18 @@ export class AiStateStorage {
   }
   listActionProposals(petId:string,now:number,limit=50):ActionProposal[] {
     const [take]=page(limit);return this.all('SELECT * FROM ai_action_proposals WHERE pet_id=? AND expires_at>? ORDER BY expires_at,proposal_id LIMIT ?',idSchema.parse(petId),time.parse(now),take)
-      .map(value=>{const proposal=actionProposalSchema.parse(parseJson(value.proposal_json));
-        if(proposal.proposalId!==value.proposal_id || proposal.petId!==value.pet_id || proposal.requestId!==value.request_id || proposal.conversationId!==value.conversation_id || proposal.expiresAt!==int(value.expires_at))throw new Error('Proposal projection mismatch');return proposal;});
+      .map(value=>this.proposalFromRow(value));
+  }
+  private proposalFromRow(value: Row): ActionProposal {
+    const proposal = actionProposalSchema.parse(parseJson(value.proposal_json));
+    if (proposal.proposalId !== value.proposal_id || proposal.petId !== value.pet_id || proposal.requestId !== value.request_id
+      || proposal.conversationId !== value.conversation_id || proposal.expiresAt !== int(value.expires_at)) throw new Error('Proposal projection mismatch');
+    return proposal;
+  }
+  getActionProposal(petId: string, proposalId: string, at: number): ActionProposal | null {
+    const value = this.get('SELECT * FROM ai_action_proposals WHERE pet_id=? AND proposal_id=? AND expires_at>?',
+      idSchema.parse(petId), idSchema.parse(proposalId), time.parse(at));
+    return value ? this.proposalFromRow(value) : null;
   }
   deleteActionProposal(petId:string,proposalId:string):boolean {return this.run('DELETE FROM ai_action_proposals WHERE pet_id=? AND proposal_id=?',idSchema.parse(petId),idSchema.parse(proposalId))===1;}
 
@@ -674,12 +726,27 @@ export class AiStateStorage {
   retrieveMemories(recipientPetId:string,query:string,now:number,limit:number=aiLimits.authorizedMemories):AuthorizedMemoryContext[]{
     const pet=idSchema.parse(recipientPetId),at=time.parse(now);if(typeof query!=='string'||query.length>aiLimits.userText||!Number.isSafeInteger(limit)||limit<0||limit>aiLimits.authorizedMemories)throw new RangeError('Invalid bounded memory query');
     if(limit===0)return [];const pets=this.existingPetIds();if(!pets.includes(pet))return [];
-    // Authorization is in SQL, before touching any source/summary or doing
-    // lexical ranking. FTS/embeddings are separate future work.
-    const records=this.all(`SELECT m.* FROM ai_memories m WHERE (m.owner_pet_id=? OR (m.scope='SHARED' AND EXISTS(
+    // Each source filters by pet, grant and expiry before selecting or ranking records.
+    // Keep corpus-wide BM25 scores and raw FTS metadata inside the database.
+    const scope = `(m.owner_pet_id=? OR (m.scope='SHARED' AND EXISTS(
       SELECT 1 FROM ai_memory_grants g WHERE g.memory_id=m.memory_id AND g.recipient_pet_id=?))) AND m.updated_at<=?
-      AND (m.expires_at IS NULL OR m.expires_at>?) ORDER BY m.pinned DESC,m.updated_at DESC,m.memory_id LIMIT ?`,pet,pet,at,at,memoryPolicyLimits.recordsToConsider)
-      .map(value=>this.memoryFromRow(value));
+      AND (m.expires_at IS NULL OR m.expires_at>?)`;
+    const order = 'ORDER BY m.pinned DESC,m.updated_at DESC,m.memory_id LIMIT ?';
+    const cap = memoryPolicyLimits.recordsToConsider;
+    const terms = memorySearchTerms(query);
+    const matching = terms.long.length ? this.all(`SELECT m.* FROM ai_memory_fts
+      JOIN ai_memory_search_keys k ON k.search_id=ai_memory_fts.rowid JOIN ai_memories m USING(memory_id)
+      WHERE ${scope} AND ai_memory_fts MATCH ? ${order}`,
+    pet, pet, at, at, terms.long.map(term => '"' + term.replaceAll('"', '""') + '"').join(' OR '), cap) : [];
+    const short = terms.short.length ? this.all(`SELECT m.* FROM ai_memories m WHERE ${scope}
+      AND (${terms.short.map(() => 'instr(lower(m.summary),?)>0').join(' OR ')}) ${order}`, pet, pet, at, at, ...terms.short, cap) : [];
+    const recent = this.all(`SELECT m.* FROM ai_memories m WHERE ${scope} ${order}`, pet, pet, at, at, cap);
+    const unique = new Map<unknown, Row>();
+    for (const row of [...recent.filter(row => row.pinned === 1 || row.pinned === 1n), ...matching, ...short, ...recent]) {
+      if (!unique.has(row.memory_id)) unique.set(row.memory_id, row);
+      if (unique.size === cap) break;
+    }
+    const records = [...unique.values()].map(value => this.memoryFromRow(value));
     return retrieveAuthorizedMemories({recipientPetId:pet,query,now:at,records,existingPetIds:pets,lookupSource:messageId=>this.lookupMessage(messageId),limit});
   }
 }

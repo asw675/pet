@@ -5,12 +5,15 @@ import { aiRequestSchema, aiResultSchema, credentialLookupSchema, credentialLook
 import { voiceServiceRequestSchema, voiceServiceResultSchema } from './voice-ipc';
 import { workspaceAuthorityRequestSchema,workspaceAuthorityResultSchema } from './workspace-ipc';
 import { voiceSettingsRequestSchema,voiceSettingsResultSchema } from './voice-settings-ipc';
+import { proactiveHostSchema, proactiveNoticeReadySchema, proactiveRequestSchema, proactiveResultSchema } from './proactive-ipc';
 
 /** Main↔utility only. No renderer may invoke credential replies or internal
  * cancellation directly; these never cross a renderer bridge. */
 import { hostAuthorityRequestSchema, hostAuthorityResultSchema } from './host-settings-ipc';
 
 export const featureInputSchema = z.discriminatedUnion('kind', [
+  z.strictObject({ kind: z.literal('proactive-host'), context: proactiveHostSchema }),
+  z.strictObject({ kind: z.literal('proactive-request'), request: proactiveRequestSchema }),
   z.strictObject({ kind: z.literal('host-authority-request'), requestId: idSchema, request: hostAuthorityRequestSchema }),
   z.strictObject({ kind:z.literal('ai-request'), request:aiRequestSchema }),
   z.strictObject({ kind:z.literal('voice-request'), requestId:idSchema, request:voiceServiceRequestSchema }),
@@ -21,6 +24,8 @@ export const featureInputSchema = z.discriminatedUnion('kind', [
 ]);
 export type FeatureInput=z.infer<typeof featureInputSchema>;
 export const featureOutputSchema=z.discriminatedUnion('kind',[
+  z.strictObject({ kind: z.literal('proactive-result'), result: proactiveResultSchema }),
+  z.strictObject({ kind: z.literal('proactive-ready'), event: proactiveNoticeReadySchema }),
   z.strictObject({ kind: z.literal('host-authority-result'), requestId: idSchema, result: hostAuthorityResultSchema }),
   z.strictObject({kind:z.literal('ai-result'),result:aiResultSchema}),
   z.strictObject({kind:z.literal('voice-result'),requestId:idSchema,result:voiceServiceResultSchema}),

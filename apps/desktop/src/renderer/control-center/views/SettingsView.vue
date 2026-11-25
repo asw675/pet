@@ -1,28 +1,35 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { RouterLink } from 'vue-router';
-import { hostSettingsResultSchema } from '../../../shared/host-settings-ipc';
+import { hostSettingsResultSchema, periodicBackupStatusSchema, restoreBackupResultSchema, restoreBackupStatusSchema } from '../../../shared/host-settings-ipc';
 import type { HostSettings } from '../../../shared/host-settings-ipc';
 import {
   backupViewResultSchema, hostPreferencesViewResultSchema, hostScalePercents, preferenceDraft, preferenceSaveMatches,
-  preferenceSavePayload, resolveHostPreferencesViewBridge, resolveHostSettingsViewBridge,
+  preferenceSavePayload, resolveBackupRestoreViewBridge, resolveHostPreferencesViewBridge, resolveHostSettingsViewBridge,
 } from '../../shared/host-settings-view-policy';
 import type { HostPreferenceEdit, HostPreferencesView, HostSettingsViewBridge } from '../../shared/host-settings-view-policy';
 import { useAppStore } from '../../shared/store';
 import { serviceStatusLabel } from '../../shared/presentation';
 import Icon from '../components/Icon.vue';
 import ModeControls from '../components/ModeControls.vue';
+import CharacterPacksPanel from '../components/CharacterPacksPanel.vue';
 
 const store = useAppStore();
 const bridge = resolveHostSettingsViewBridge(window.petDesktop);
 const preferencesBridge = resolveHostPreferencesViewBridge(window.petDesktop);
+const restoreBridge = resolveBackupRestoreViewBridge(window.petDesktop);
 const host = ref<HostSettings | null>(null);
 const hostBusy = ref(false), hostError = ref('');
 const preferences = ref<HostPreferencesView | null>(null), draft = ref<HostPreferenceEdit | null>(null);
 const preferenceBusy = ref(false), preferenceFeedback = ref('');
 const backupBusy = ref(false), backupFeedback = ref('');
+const restoreStatus = ref('');
+const automaticBackupStatus = ref('');
+const canRestore = computed(() => store.ready || (store.serviceStatus?.stage === 'UNAVAILABLE' && store.serviceStatus.generation > 0));
 let mounted = true, hostEpoch = 0;
-let preferenceEpoch = 0, backupEpoch = 0;
+let preferenceEpoch = 0, backupEpoch = 0, restoreStatusEpoch = 0;
+let automaticBackupEpoch = 0, automaticBackupPoll: number | undefined;
+let recoveryGeneration: number | null = null;
 const shortcutLabels = {
   OPEN_CONTROL_CENTER: '打开控制中心', TOGGLE_PET_VISIBILITY: '显示 / 隐藏桌宠', RESCUE_INTERACTION: '临时交互救援（20 秒）',
 };
@@ -140,9 +147,89 @@ async function exportBackup(): Promise<void> {
     if (mounted && epoch === backupEpoch) backupFeedback.value = '备份结果无法确认。请检查保存位置后再决定是否重试。';
   } finally { if (mounted && epoch === backupEpoch) backupBusy.value = false; }
 }
-watch(() => [store.ready, store.serviceStatus?.generation] as const, () => { refreshHost(); void readPreferences(); });
-onMounted(() => { refreshHost(); void readPreferences(); });
-onBeforeUnmount(() => { mounted = false; hostEpoch++; preferenceEpoch++; backupEpoch++; });
+async function readRestoreStatus(): Promise<void> {
+  const epoch = ++restoreStatusEpoch;
+  if (!restoreBridge || !store.ready) return;
+  const messages = {
+    NONE: '', PENDING: '备份已校验，等待本地服务重启后恢复。',
+    RESTORED: '上次恢复已完成。替换前的存档副本保留在应用数据目录。',
+    FAILED: '上次恢复未完成，当前存档已保留。',
+  };
+  try {
+    const result = restoreBackupStatusSchema.safeParse(await restoreBridge.getRestoreBackupStatus());
+    if (mounted && epoch === restoreStatusEpoch && store.ready) {
+      restoreStatus.value = result.success && result.data.ok ? messages[result.data.status] : '恢复状态暂不可用。';
+    }
+  } catch {
+    if (mounted && epoch === restoreStatusEpoch && store.ready) restoreStatus.value = '恢复状态暂不可用。';
+  }
+}
+async function readAutomaticBackupStatus(): Promise<void> {
+  const epoch = ++automaticBackupEpoch;
+  if (!restoreBridge?.getPeriodicBackupStatus || !store.ready) return;
+  try {
+    const parsed = periodicBackupStatusSchema.safeParse(await restoreBridge.getPeriodicBackupStatus());
+    if (!mounted || epoch !== automaticBackupEpoch || !store.ready) return;
+    if (!parsed.success || !parsed.data.ok) { automaticBackupStatus.value = '暂无法读取自动快照状态。'; return; }
+    const { status, lastCompletedAt } = parsed.data;
+    const latest = lastCompletedAt ? '最近的自动快照为 ' + new Date(lastCompletedAt).toLocaleString() + '。' : '';
+    automaticBackupStatus.value = status === 'FAILED' ? latest + '自动快照暂未完成。请检查本地磁盘可用空间及文件访问权限。'
+      : latest || '本地服务运行时会生成自动快照。';
+  } catch {
+    if (mounted && epoch === automaticBackupEpoch && store.ready) automaticBackupStatus.value = '暂无法读取自动快照状态。';
+  }
+}
+async function restoreBackup(): Promise<void> {
+  if (!restoreBridge || !canRestore.value || backupBusy.value || preferenceBusy.value || hostBusy.value) return;
+  const requestedGeneration = store.serviceStatus?.stage === 'UNAVAILABLE' ? store.serviceStatus.generation : null;
+  backupBusy.value = true; backupFeedback.value = '';
+  const epoch = ++backupEpoch;
+  try {
+    const result = restoreBackupResultSchema.safeParse(await restoreBridge.restoreBackup());
+    if (!mounted || epoch !== backupEpoch) return;
+    if (result.success && result.data.ok) {
+      if (requestedGeneration !== null) {
+        recoveryGeneration = requestedGeneration;
+        backupFeedback.value = '正在验证备份并尝试恢复本地服务。';
+        refreshRecoveryOutcome();
+      }
+      return;
+    }
+    const code = result.success && !result.data.ok ? result.data.code : undefined;
+    backupFeedback.value = code === 'CANCELLED' ? '已取消恢复。'
+      : code === 'RESTART_REQUIRED' ? '备份已校验。下次启动应用时会尝试恢复。'
+      : code === 'RESTORE_PREPARE_FAILED' ? '无法校验所选备份，请选择完整且版本兼容的 Pet Desktop 备份。'
+      : code === 'BUSY' ? '本地服务正在使用，请在当前操作结束后重试。' : '恢复请求结果暂无法确认，请查看恢复状态。';
+  } catch {
+    if (mounted && epoch === backupEpoch) backupFeedback.value = '恢复请求结果暂无法确认，请查看恢复状态。';
+  } finally {
+    if (mounted && epoch === backupEpoch) {
+      backupBusy.value = false;
+      if (store.ready) void readRestoreStatus();
+    }
+  }
+}
+function refreshRecoveryOutcome(): void {
+  const status = store.serviceStatus;
+  if (recoveryGeneration === null || !status || status.generation <= recoveryGeneration) return;
+  if (status.stage === 'READY') {
+    recoveryGeneration = null;
+    backupFeedback.value = '';
+  } else if (status.stage === 'UNAVAILABLE') {
+    recoveryGeneration = null;
+    backupFeedback.value = '恢复未完成。请确认备份完整、本地文件未被占用，再选择备份重试。';
+  }
+}
+function refreshSettings(): void { refreshRecoveryOutcome(); refreshHost(); void readPreferences(); void readRestoreStatus(); void readAutomaticBackupStatus(); }
+watch(() => [store.ready, store.serviceStatus?.generation] as const, refreshSettings);
+onMounted(() => {
+  refreshSettings();
+  if (restoreBridge?.getPeriodicBackupStatus) automaticBackupPoll = window.setInterval(() => { void readAutomaticBackupStatus(); }, 60_000);
+});
+onBeforeUnmount(() => {
+  mounted = false; hostEpoch++; preferenceEpoch++; backupEpoch++; restoreStatusEpoch++; automaticBackupEpoch++;
+  if (automaticBackupPoll !== undefined) window.clearInterval(automaticBackupPoll);
+});
 </script>
 
 <template>
@@ -165,6 +252,7 @@ onBeforeUnmount(() => { mounted = false; hostEpoch++; preferenceEpoch++; backupE
       <p v-if="preferenceFeedback" class="muted" role="status">{{ preferenceFeedback }}</p>
       <div class="settings-note"><p>宠物的显示/隐藏与主宠选择，可前往宠物馆管理。</p><RouterLink class="panel-link" to="/pets">前往宠物馆 <Icon name="arrow" /></RouterLink></div>
     </section>
+    <CharacterPacksPanel />
     <section class="panel side-panel">
       <header class="side-heading"><span class="panel-symbol accent-blue"><Icon name="refresh" /></span><div><h2>服务状态</h2><p>本地业务数据连接</p></div></header>
       <dl class="settings-list"><div><dt>当前连接</dt><dd>{{ serviceStatusLabel(store.serviceStatus) }}</dd></div><div><dt>快照版本</dt><dd>{{ store.snapshot?.revision ?? '未知' }}</dd></div></dl>
@@ -213,11 +301,14 @@ onBeforeUnmount(() => { mounted = false; hostEpoch++; preferenceEpoch++; backupE
       <div class="settings-note"><p>快捷收藏、明确批准的启动权限、习惯推荐开关和启动历史管理见快捷工作台。</p><RouterLink class="panel-link" to="/workspace">工作台与推荐隐私 <Icon name="arrow" /></RouterLink></div>
     </section>
     <section class="panel side-panel">
-      <header class="side-heading"><span class="panel-symbol accent-blue"><Icon name="report" /></span><div><h2>本地存档备份</h2><p>主动导出一致的本地数据库</p></div></header>
+      <header class="side-heading"><span class="panel-symbol accent-blue"><Icon name="report" /></span><div><h2>本地存档备份</h2><p>导出或恢复本地存档</p></div></header>
       <p class="muted">备份仅包含已提交的存档数据。文件可能包括私人对话、记忆和快捷入口记录，请选择你信任的本地保存位置。</p>
-      <button class="button button-secondary side-button" type="button" :disabled="!preferencesBridge || !store.ready || backupBusy || preferenceBusy || hostBusy" @click="exportBackup">{{ backupBusy ? '等待保存位置及备份结果…' : '导出本地备份' }}</button>
+      <button class="button button-secondary side-button" type="button" :disabled="!preferencesBridge || !store.ready || backupBusy || preferenceBusy || hostBusy" @click="exportBackup">导出本地备份</button>
+      <button v-if="restoreBridge" class="button button-secondary side-button" type="button" :disabled="!canRestore || backupBusy || preferenceBusy || hostBusy" @click="restoreBackup">从备份恢复</button>
+      <p v-if="backupBusy" class="muted" role="status">正在等待文件选择或校验。</p>
       <p v-if="backupFeedback" class="muted" role="status">{{ backupFeedback }}</p>
-      <p class="muted">存档恢复和资源管理仍需后续实现，目前不会执行覆盖或清除存档。</p>
+      <p v-if="restoreStatus" class="muted" role="status">{{ restoreStatus }}</p>
+      <p v-if="automaticBackupStatus" class="muted" role="status">{{ automaticBackupStatus }}</p>
     </section>
   </div>
 </template>

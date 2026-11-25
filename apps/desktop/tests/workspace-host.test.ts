@@ -1,6 +1,7 @@
 import type { BrowserWindow } from 'electron';
 import { describe, expect, it, vi } from 'vitest';
 import type { LaunchAuthorityAction, WorkspacePage, Routine, ApprovedQuickTarget } from '@pet-desktop/contracts/workspace';
+import type { QuickActionProposal } from '@pet-desktop/contracts/ai';
 import { WorkspaceHost } from '../src/main/workspace-host.js';
 import type { WorkspaceAuthorityRequest, WorkspaceAuthorityResult, WorkspaceIntent, WorkspaceResult } from '../src/shared/workspace-ipc.js';
 import type { QuickLaunchSender } from '../src/main/quick-launch-policy.js';
@@ -31,7 +32,7 @@ function setup() {
   const saved = action('one', url), second = action('two', url2);
   const routine: Routine = { id: 'routine-1', revision: 0, name: '工作台', mode: 'SEQUENTIAL', delayMs: 0,
     failurePolicy: 'CONTINUE', skipDuplicates: true, targetIds: ['one', 'two'] };
-  const state = { current: true, time: 1000,
+  const state = { current: true, time: 1000, suggestion: null as QuickActionProposal | null,
     actions: new Map<string, LaunchAuthorityAction>([['one', saved], ['two', second]]),
     page: { revision: 7, actions: [view(saved), view(second)], routines: [routine], settings: { enabled: false, retentionDays: 7 },
       history: [], preferences: [], recommendations: [], shownToday: 0 } as WorkspacePage };
@@ -54,6 +55,19 @@ function setup() {
         return { requestId: request.requestId, method: intent.method, ok: false, error: { code: 'CONFLICT' } };
       }
       case 'action/lookup': return success(request, state.actions.get(intent.payload.actionId) ?? null);
+      case 'suggestion/lookup': {
+        const proposal = state.suggestion;
+        return success(request, proposal?.petId === intent.payload.petId && proposal.proposalId === intent.payload.proposalId ? proposal : null);
+      }
+      case 'suggestion/consume': {
+        const proposal = state.suggestion;
+        if (!proposal || intent.payload.petId !== proposal.petId || intent.payload.proposalId !== proposal.proposalId
+          || intent.payload.targetId !== proposal.targetId || intent.payload.targetRevision !== proposal.targetRevision
+          || intent.payload.expiresAt !== proposal.expiresAt || state.time >= proposal.expiresAt
+          || state.actions.get(proposal.targetId)?.revision !== proposal.targetRevision) return success(request, null);
+        state.suggestion = null;
+        return success(request, intent.payload);
+      }
       case 'routine/plan': return success(request, { routine: state.page.routines[0], targets: state.page.routines[0]!.targetIds.map(targetId =>
         ({ targetId, action: state.actions.get(targetId) ?? null })) });
       case 'approved/add': {
@@ -107,6 +121,56 @@ function setup() {
 function code(result: WorkspaceResult | null) { return result && !result.ok ? result.error.code : null; }
 
 describe('workspace Main host public boundary and approved selections', () => {
+  const suggestion = {
+    type: 'QUICK_ACTION_SUGGESTION', targetId: 'one', targetRevision: 0, targetLabel: 'one-label',
+    petId: 'pet-one', proposalId: 'proposal-one', conversationId: 'conversation-one', requestId: 'turn-one',
+    reason: '打开已保存的应用', expiresAt: 10_000, confirmationRequired: true,
+  } as const satisfies QuickActionProposal;
+  const suggestionIntent = { method: 'suggestion/run', payload: { petId: suggestion.petId, proposalId: suggestion.proposalId } } as const;
+
+  it('executes an immutable suggested target only after native confirmation and one-time authority consumption', async () => {
+    const h = setup();
+    h.state.suggestion = suggestion;
+    expect(await h.ask(suggestionIntent)).toMatchObject({ ok: true, method: 'suggestion/run',
+      data: { petId: suggestion.petId, proposalId: suggestion.proposalId, targetId: 'one', outcome: 'ACCEPTED' } });
+    expect(h.nativeDialog.showMessageBox).toHaveBeenCalledExactlyOnceWith(h.parent, expect.objectContaining({
+      detail: expect.stringContaining(url), defaultId: 0, cancelId: 0,
+    }));
+    expect(h.calls('suggestion/consume')[0]![0].intent.payload).toEqual({ petId: suggestion.petId,
+      proposalId: suggestion.proposalId, targetId: 'one', targetRevision: 0, expiresAt: 10_000 });
+    expect(h.nativeShell.openExternal).toHaveBeenCalledExactlyOnceWith(url);
+    expect(h.calls('launch/record')[0]![0].intent.payload).toMatchObject({ source: 'SUGGESTION', targetId: 'one', outcome: 'ACCEPTED' });
+    expect(code(await h.ask(suggestionIntent))).toBe('APPROVAL_EXPIRED');
+    expect(h.nativeShell.openExternal).toHaveBeenCalledTimes(1);
+  });
+
+  it('leaves a declined suggestion unconsumed and never uses a target changed during native confirmation', async () => {
+    const h = setup();
+    h.state.suggestion = suggestion;
+    h.nativeDialog.showMessageBox.mockResolvedValueOnce({ response: 0 });
+    expect(await h.ask(suggestionIntent)).toMatchObject({ ok: false });
+    expect(h.state.suggestion).toEqual(suggestion);
+    h.nativeDialog.showMessageBox.mockImplementationOnce(async () => {
+      h.state.actions.set('one', { ...action('one', url3), revision: 1 });
+      return { response: 1 };
+    });
+    expect(await h.ask(suggestionIntent)).toMatchObject({ ok: false });
+    expect(h.calls('suggestion/consume')).toHaveLength(0);
+    expect(h.nativeShell.openExternal).not.toHaveBeenCalled();
+  });
+
+  it('denies a suggestion removed at the native dialog even when the target revision still matches', async () => {
+    const h = setup();
+    h.state.suggestion = suggestion;
+    h.nativeDialog.showMessageBox.mockImplementationOnce(async () => {
+      h.state.suggestion = null;
+      return { response: 1 };
+    });
+    expect(code(await h.ask(suggestionIntent))).toBe('APPROVAL_EXPIRED');
+    expect(h.calls('suggestion/consume')).toHaveLength(1);
+    expect(h.nativeShell.openExternal).not.toHaveBeenCalled();
+  });
+
   it('validates trusted role and closed payload before any worker or OS call', async () => {
     const h = setup();
     expect(await h.host.handle({ requestId: 'r', intent: { method: 'action/run', payload: { actionId: 'one', expectedRevision: 0, locator: url } } }, sender)).toBeNull();

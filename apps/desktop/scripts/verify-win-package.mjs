@@ -43,6 +43,12 @@ verifyExecutable(join(release, `Pet-Desktop-${version}-win-x64.exe`), false);
 verifyExecutable(join(unpacked, 'Pet Desktop.exe'), true);
 assert(statSync(join(resources, 'app.asar')).size > 0, 'Packaged Electron application is missing');
 assert(statSync(join(resources, 'native/voice/win-x64/whisper-LICENSE.txt')).size > 0, 'Whisper license is missing');
+const preview = join(resources, 'character-packs/star-singer-1.1.0');
+const previewManifest = JSON.parse(readFileSync(join(preview, 'manifest.json'), 'utf8'));
+assert.equal(previewManifest.characterId, 'star-singer');
+assert.equal(previewManifest.packVersion, '1.1.0');
+const portrait = readFileSync(join(preview, 'assets/portrait.png'));
+assert.equal(createHash('sha256').update(portrait).digest('hex'), previewManifest.files[0].sha256, 'Bundled portrait changed');
 const nativeAddonRoot = join(resources, 'app.asar.unpacked');
 const sqliteAddons = readdirSync(nativeAddonRoot, { recursive: true, withFileTypes: true })
   .filter(entry => entry.isFile() && entry.name === 'better_sqlite3.node');

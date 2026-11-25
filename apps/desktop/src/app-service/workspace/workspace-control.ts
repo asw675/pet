@@ -2,6 +2,7 @@ import { WorkspaceStorageError } from '@pet-desktop/app-service/workspace-storag
 import type { WorkspaceStorage } from '@pet-desktop/app-service/workspace-storage';
 import { workspaceLimits, workspacePageSchema } from '@pet-desktop/contracts/workspace';
 import type { AiQuickAction, LaunchAuthorityAction, WorkspacePage } from '@pet-desktop/contracts/workspace';
+import type { QuickActionProposal } from '@pet-desktop/contracts/ai';
 import {
   approvedActionAddSchema, approvedActionReapproveSchema, impressionRecordSchema, launchRecordSchema,
   routineLaunchPlanSchema, workspaceAuthorityRequestSchema, workspaceAuthorityResultSchema, workspaceManagementIntentSchema,
@@ -15,6 +16,8 @@ export interface WorkspaceControlOptions {
   /** Same transaction/single writer as the rest of the application. Never
    * catch a mutation failure within this callback and commit partial writes. */
   transaction<T>(run: (store: WorkspaceStorage) => T): T;
+  resolveQuickProposal?(scope: Pick<QuickActionProposal, 'petId' | 'proposalId'>, at: number,
+    consume?: Pick<QuickActionProposal, 'targetId' | 'targetRevision' | 'expiresAt'>): QuickActionProposal | null;
   now(): number;
   utcOffsetMinutes(): number;
   createId(kind: 'action' | 'routine' | 'impression'): string;
@@ -192,6 +195,12 @@ export class WorkspaceControl {
         case 'workspace/manage': data = this.manage(intent.payload.intent); break;
         case 'workspace/revision': data = this.workspaceRevision(); break;
         case 'action/lookup': data = this.getLaunchAction(intent.payload.actionId); break;
+        case 'suggestion/lookup': data = this.options.resolveQuickProposal?.(intent.payload, this.context().now) ?? null; break;
+        case 'suggestion/consume': {
+          const payload = intent.payload;
+          data = this.options.resolveQuickProposal?.(payload, this.context().now, payload) ? payload : null;
+          break;
+        }
         case 'routine/plan': data = this.getRoutinePlan(intent.payload.routineId); break;
         case 'approved/add': data = this.addApprovedAction(intent.payload); break;
         case 'approved/reapprove': data = this.reapproveAction(intent.payload); break;

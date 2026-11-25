@@ -7,6 +7,7 @@ import type { EquipmentSlot } from '@pet-desktop/contracts/inventory';
 import type { TripDepartureLoadout, TravelReportsQuery } from '@pet-desktop/contracts/travel';
 import type { TripDepartureLoadoutRecord } from './trip-departure-storage.js';
 import type { AiStateStorage } from './ai-state-storage.js';
+import type { AiProactiveStorage } from './ai-proactive-storage.js';
 import type { WorkspaceStorage } from './workspace-storage.js';
 import type { VoiceProfileStorage } from './voice-profile-storage.js';
 import type { HostPreferenceStorage } from './host-preference-storage.js';
@@ -199,6 +200,7 @@ export interface OutboxRecord {
 export interface AppTransaction {
   /** Same exclusive SQLite transaction and lifetime; neither view owns a connection. */
   aiState(): AiStateStorage;
+  proactive(): AiProactiveStorage;
   workspaceState(): WorkspaceStorage;
   voiceProfiles(): VoiceProfileStorage;
   hostPreferences(): HostPreferenceStorage;

@@ -13,10 +13,11 @@ import AiMemoryPanel from '../components/AiMemoryPanel.vue';
 import AiProposalPanel from '../components/AiProposalPanel.vue';
 import AiVoicePanel from '../components/AiVoicePanel.vue';
 import AiVoiceSettingsPanel from '../components/AiVoiceSettingsPanel.vue';
+import AiProactivePanel from '../components/AiProactivePanel.vue';
 import Icon from '../components/Icon.vue';
 const ctx = useAiProjection();
 const { bridge, generation, epoch, pets, pet, petId, conversationId, chatting, active, chatError, chatNotice, cancelPending, cancelChat } = ctx;
-const tab = ref<'CHAT'|'SETTINGS'|'MEMORY'|'SUGGESTIONS'>('CHAT');
+const tab = ref<'CHAT'|'SETTINGS'|'MEMORY'|'SUGGESTIONS'|'PROACTIVE'>('CHAT');
 const convOffset = ref(0), messageOffset = ref(0), convLimit = 12, messageLimit = 20;
 const title = ref(''), userText = ref(''), feedback = ref(''), creating = ref(false), voiceBusy = ref(false);
 const convQuery = computed<Extract<AiIntent, { method: 'conversations/list' }> | undefined>(() =>
@@ -123,7 +124,7 @@ const messageStatus = { COMPLETED: '已保存', PENDING: '等待回复', CANCELL
       <div class="panel ai-toolbar">
         <label>当前角色<select :value="petId" :disabled="creating || submitting" @change="ctx.selectPet(($event.target as HTMLSelectElement).value)"><option v-for="row in pets" :key="row.petId" :value="row.petId">{{ row.nickname }}（{{ row.petId }}）</option></select></label>
         <div class="ai-tabs" aria-label="对话中心区域">
-          <button v-for="entry in [{id:'CHAT',text:'会话'},{id:'SETTINGS',text:'服务与授权'},{id:'MEMORY',text:'记忆'},{id:'SUGGESTIONS',text:'建议'}] as const"
+          <button v-for="entry in [{id:'CHAT',text:'会话'},{id:'SETTINGS',text:'服务与授权'},{id:'MEMORY',text:'记忆'},{id:'SUGGESTIONS',text:'建议'},{id:'PROACTIVE',text:'主动陪伴'}] as const"
             :key="entry.id" type="button" class="button button-secondary" :class="{ selected: tab === entry.id }" :aria-pressed="tab === entry.id"
             :disabled="voiceBusy || submitting" @click="chooseTab(entry.id)">{{ entry.text }}</button>
         </div>
@@ -193,6 +194,7 @@ const messageStatus = { COMPLETED: '已保存', PENDING: '等待回复', CANCELL
       </template>
       <AiMemoryPanel v-else-if="tab === 'MEMORY'" :context="ctx" />
       <AiProposalPanel v-else-if="tab === 'SUGGESTIONS'" :context="ctx" />
+      <AiProactivePanel v-else-if="tab === 'PROACTIVE'" :context="ctx" />
       <AiConfirmDialog :quote="quote" :submitting="submitting" :attempted="attempted" :confirmable="confirmable" :error="confirmError" @confirm="commit" @cancel="close()" @modal-error="dialogError" />
     </template>
   </div>

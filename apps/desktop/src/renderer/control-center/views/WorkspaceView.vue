@@ -201,7 +201,7 @@ watch(generation, () => { replacing.value = null; website.value = ''; addLabel.v
         <div v-if="actionEdit?.actionId === action.id" class="edit-box">
           <label>名称<input v-model="actionEdit.label" maxlength="80" :disabled="!canAct" /></label>
           <label class="check-field"><input v-model="actionEdit.enabled" type="checkbox" :disabled="!canAct || !action.approved" />启用</label>
-          <label class="check-field"><input v-model="actionEdit.recommendable" type="checkbox" :disabled="!canAct || !action.approved" />允许推荐</label>
+          <label class="check-field"><input v-model="actionEdit.recommendable" type="checkbox" :disabled="!canAct || !action.approved" />允许本机推荐及快捷建议</label>
           <div class="workspace-buttons"><button class="button button-primary" type="button" :disabled="!canAct || !actionEdit.label.trim()" @click="reviewAction">确认修改</button><button class="button button-secondary" type="button" :disabled="busy" @click="actionEdit = null">取消</button></div>
         </div>
         <div v-else class="workspace-buttons"><button class="button button-primary" type="button" :disabled="!canAct || !actionCanRun(action)" @click="runAction(action.id)">{{ runningActionId === action.id ? '启动确认中…' : '启动' }}</button><button class="button button-secondary" type="button" :disabled="!canAct" @click="editAction(action)">编辑</button></div>

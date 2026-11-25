@@ -413,6 +413,21 @@ describe('validated terminal events and pending-only suggestions', () => {
     expect(result.reply.actionProposals.every(value => !('proposalId' in value))).toBe(true);
   });
 
+  it('binds a quick suggestion to the captured allowlisted label and revision and drops unknown model targets', async () => {
+    const config = { ...baseConfig, capabilities: { ...baseConfig.capabilities, nativeStructured: true } };
+    const f = fixture(config);
+    f.authority.transform = turn => { turn.context.quickActions = [{ targetId: 'editor', label: '编辑器', targetRevision: 7 }]; };
+    f.authority.allowed.add('QUICK_ACTION_SUGGESTION:unoffered');
+    f.coordinator.start(input(), f.receive);
+    await started(f);
+    const draft = { type: 'QUICK_ACTION_SUGGESTION', targetId: 'editor', reason: '准备编辑' } as const;
+    f.provider.calls[0]!.resolve(structureResult(input(), { ...structuredReply,
+      actionProposals: [draft, { ...draft, targetId: 'unoffered' }] }));
+    const result = await terminal(f);
+    expect(result).toMatchObject({ kind: 'COMPLETED', reply: { actionProposals: [draft] },
+      proposals: [{ ...draft, targetLabel: '编辑器', targetRevision: 7, confirmationRequired: true }] });
+  });
+
   it('denies all proposals without authority allowlist and removes same-target duplicates', async () => {
     const cfg = { ...baseConfig, capabilities: { ...baseConfig.capabilities, nativeStructured: true } };
     const reply = { ...structuredReply, actionProposals: [{ type: 'REST' as const, targetId:'self', reason:'休息' },

@@ -24,6 +24,7 @@
 | 004E-2 | SQLite v2 历史迁移、冻结 CG、权威图鉴及 IPC | 代码和数据库/传输测试通过 | [004e2-cg-authority](004e2-cg-authority.md) |
 | 004E-3 | 实际 CG 图鉴界面及精确资源回看 | 代码、专项测试与构建通过 | [004e3-gallery-ui](004e3-gallery-ui.md) |
 | 004F | Pixi WebGL 与 Canvas2D 降级接入桌宠窗口 | 专项测试与生产构建通过，Windows GPU 待验收 | [004f-pixi-desktop](004f-pixi-desktop.md) |
+| 004G | 本地角色资源包导入、版本切换与星咏新立绘预览 | 文件、权限和版本回退测试通过，Windows 图形验收待测 | [004g-character-pack-management](004g-character-pack-management.md) |
 | 004-Q | V1.1 功能及代码规模复核 | 产品覆盖约34.0% | [004-progress-audit](004-progress-audit.md) |
 | 005 | Windows 安装包与真机 P0 验收 | 按用户要求推迟至约90%开发覆盖 | — |
 | 006A-1 | 角色模板与获得规则、诺瓦内置资源 | 代码与专项测试通过 | [006a1-character-catalog](006a1-character-catalog.md) |
@@ -39,6 +40,8 @@
 | 006E-2B/C/D | v6三路线真实出发、物资与装备冻结、历史战报 | 数据库、专项、生产构建通过 | [006e2-travel-authority](006e2-travel-authority.md) |
 | 006E-3 | 在途地图读取冻结路线和实际节点进度 | 真实 SQLite 联合验证通过 | [006e3-active-travel-map](006e3-active-travel-map.md) |
 | 006E-4 | 新版回合战斗纯规则和敌人目录 | 4 项专项通过，旅行接入待开发 | [006e4-battle-rules](006e4-battle-rules.md) |
+| 006E-5 | 新旅程接入回合战斗、详细战报和战败恢复 | 集成、兼容及确定性测试通过 | [006e5-battle-integration](006e5-battle-integration.md) |
+| 006E-6 | 职业技能、遗迹首领和版本化回合表现 | 三版兼容及 SQLite 重启测试通过 | [006e6-battle-skills-and-boss](006e6-battle-skills-and-boss.md) |
 | 006F-1 | 随机剧情、分支冻结及六项原创事件 | 领域64项通过 | [006f1-event-engine](006f1-event-engine.md) |
 | 006F-2A | 事件待选、已提交效果与历史查询契约 | 5项专项通过，持久业务待接入 | [006f2a-event-projection](006f2a-event-projection.md) |
 | 006F-2B | 新增2个剧情CG、事件源图鉴、精确版本读取 | 实际PNG与专项测试通过，解锁事务待接入 | [006f2b-narrative-cg-assets](006f2b-narrative-cg-assets.md) |
@@ -62,6 +65,9 @@
 | 007E-2/008C/009D | AI、语音、工作台同一写入者及闭合真实业务传输、原生发行门禁 | 296项专项、生产构建通过；真实 Windows 待验收 | [007e2-feature-transport](007e2-feature-transport.md) |
 | 007E-3/008D/009F | 聊天、记忆、语音口型及工作台实际页面 | 专项及生产构建通过，实机待验收 | [007e3-user-interfaces](007e3-user-interfaces.md) |
 | 007F-1 | 主动陪伴存储与内部本地会话权限 | SQLite、契约和控制服务专项通过，调度与界面待接入 | [007f1-proactive-foundation](007f1-proactive-foundation.md) |
+| 007F-2 | 主动陪伴调度、角色配置和桌面文字问候 | SQLite、Mock 及进程路由测试通过，Windows 实机待验 | [007f2-proactive-integration](007f2-proactive-integration.md) |
+| 007G | AI 快捷建议、原生确认和一次性执行授权 | 权限、目标变化、重放和 SQLite 专项通过 | [007g-ai-quick-suggestions](007g-ai-quick-suggestions.md) |
+| 007H | SQLite v13 逐宠及授权共享记忆的 FTS5 检索 | 中文检索、迁移、撤回和旧备份专项通过 | [007h-memory-fts](007h-memory-fts.md) |
 | 007-Q | 固定 d20fc41 核心功能及代码规模核对 | 开发覆盖约82.7% | [007-progress-checkpoint](007-progress-checkpoint.md) |
 | 010A | SQLite v11、宿主显示偏好与手动备份 | SQLite 和宿主专项通过，Windows 真机待验收 | [010a-host-preferences-and-backup](010a-host-preferences-and-backup.md) |
 | 010B | Windows x64 原生构建及 NSIS 安装包工作流 | 配置与生产构建通过，Windows 打包待 CI | [010b-windows-package](010b-windows-package.md) |
@@ -71,5 +77,9 @@
 | 010F | Windows 验证日志及用户备份文件忽略 | 本地忽略规则验证通过 | [010f-windows-verification-log](010f-windows-verification-log.md) |
 | 010G | Windows 原生路径测试夹具 | 开发机专项通过，Windows CI 待复测 | [010g-windows-test-temp-paths](010g-windows-test-temp-paths.md) |
 | 010H | Windows 语音用例路径及原生打包诊断 | 开发机专项通过，Windows CI 待复测 | [010h-windows-voice-test-paths](010h-windows-voice-test-paths.md) |
+| 010I | 手动恢复存档、旧备份升级和损坏库冷启动恢复 | SQLite、恢复及宿主专项通过，Windows 安装版待验 | [010i-backup-restore](010i-backup-restore.md) |
+| 010J | 保留最近三份周期备份及失败重试 | 真实 SQLite、轮换边界及直接恢复测试通过 | [010j-periodic-snapshots](010j-periodic-snapshots.md) |
+| 010K | 跨会话恢复窗口位置 | 宿主和 SQLite 联合测试通过，混合 DPI 待验 | [010k-window-anchors](010k-window-anchors.md) |
+| 010L | 本地 Windows x64 测试包及隔离运行验证 | 安装包结构、原生 SQLite、双窗口及星咏预览首帧通过 | [010l-windows-preview](010l-windows-preview.md) |
 
 每份记录包含：日期、范围、设计依据、具体变更、测试命令与真实结果、已知限制、下一步。完整验收状态见 [POC 矩阵](../qa/poc-matrix.md)。

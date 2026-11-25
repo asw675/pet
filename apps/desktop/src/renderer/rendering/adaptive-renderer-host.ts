@@ -1,4 +1,4 @@
-import type { ResolvedPack, ResolvedPackVariant } from '../asset-packs/resolve-pack';
+import type { ResolvedPack, ResolvedPackVariant } from '../../shared/resolve-character-pack';
 import type { PetRenderer, RenderProfile, HitRegion, MouthSample, ActionRequest, ActionResult, RenderPose } from './contract';
 import type { PixiHealth } from './pixi-renderer';
 

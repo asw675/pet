@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue';
+import { computed, onBeforeUnmount, ref } from 'vue';
 import { RouterLink } from 'vue-router';
 import type { ActionProposal } from '@pet-desktop/contracts/ai';
 import type { AiIntent } from '../../../shared/ai-ipc';
@@ -12,7 +12,9 @@ import { useNow } from '../useNow';
 import AiConfirmDialog from './AiConfirmDialog.vue';
 const props = defineProps<{ context: AiProjection }>();
 const ctx = props.context, { petId, pet, generation, store } = ctx;
-const now = useNow(), feedback = ref('');
+const now = useNow(), feedback = ref(''), launching = ref(false);
+let disposed = false;
+onBeforeUnmount(() => { disposed = true; });
 const query = computed<Extract<AiIntent, { method: 'proposals/list' }> | undefined>(() =>
   generation.value !== null && pet.value ? { method: 'proposals/list', payload: { petId: petId.value } } : undefined);
 const { data, pending, error, version, refresh } = useAiQuery(ctx, 'proposals/list', query);
@@ -20,7 +22,30 @@ const { quote, submitting, attempted, confirmable, error: confirmError, begin, c
 function exact(row: ActionProposal) {
   return data.value?.rows.some(candidate => JSON.stringify(candidate) === JSON.stringify(row)) === true;
 }
-const available = computed(() => !!data.value && !pending.value && !submitting.value && !store.busy && !store.loading && store.ready && !ctx.chatting.value);
+const available = computed(() => !!data.value && !pending.value && !submitting.value && !launching.value
+  && !store.busy && !store.loading && store.ready && !ctx.chatting.value);
+
+async function runQuick(row: Extract<ActionProposal, { type: 'QUICK_ACTION_SUGGESTION' }>): Promise<void> {
+  const scope = ctx.token(), bridge = ctx.bridge;
+  if (!scope || !bridge || !available.value || row.petId !== scope.petId || row.expiresAt <= Date.now() || !exact(row)) return;
+  launching.value = true;
+  feedback.value = '';
+  try {
+    const response = await bridge.workspaceRequest({ method: 'suggestion/run', payload: { petId: row.petId, proposalId: row.proposalId } });
+    if (disposed || !ctx.isCurrent(scope)) return;
+    if (!response.ok || response.method !== 'suggestion/run' || response.data.targetId !== row.targetId
+      || response.data.petId !== row.petId || response.data.proposalId !== row.proposalId) {
+      feedback.value = '快捷建议已取消、过期或目标发生变化。请刷新后核对。';
+    } else {
+      const messages = { ACCEPTED: '系统已接收启动请求。', FAILED: '系统报告启动请求失败。',
+        UNKNOWN: '无法确定系统是否已接收请求。', SKIPPED: '已跳过启动。' };
+      feedback.value = messages[response.data.outcome];
+    }
+    refresh();
+  } catch {
+    if (!disposed && ctx.isCurrent(scope)) feedback.value = '无法核对快捷操作结果。';
+  } finally { if (!disposed) launching.value = false; }
+}
 function rest(row: ActionProposal) {
   const scope = ctx.token(), snapshot = store.snapshot, selected = pet.value, v = version.value;
   if (!available.value || !scope || !snapshot || !selected || !exact(row) || !canConfirmRest(row, selected.petId, snapshot, Date.now())) return;
@@ -61,12 +86,14 @@ function dismiss(row: ActionProposal) {
     <p v-else-if="!data" class="small muted">{{ pending ? '正在查询…' : '等待建议档案。' }}</p>
     <template v-if="data">
       <article v-for="row in data.rows" :key="row.proposalId" class="ai-box memory-row">
-        <strong>{{ row.type === 'REST' ? '休息建议' : row.type === 'TRIP_SUGGESTION' ? `探索：${routeName(row.targetId)}` : '快捷操作建议（不可执行）' }}</strong>
+        <strong>{{ row.type === 'REST' ? '休息建议' : row.type === 'TRIP_SUGGESTION' ? `探索：${routeName(row.targetId)}` : `快捷入口 · ${row.targetLabel}` }}</strong>
         <p class="ai-plain">{{ row.reason }}</p><p class="small muted">来源 {{ row.conversationId }} · 有效期 {{ formatTime(row.expiresAt) }}</p>
         <div class="ai-actions">
           <button type="button" class="button button-secondary" :disabled="!available" @click="dismiss(row)">移除</button>
           <button v-if="row.type === 'REST'" type="button" class="button button-primary" :disabled="!available || !canConfirmRest(row, petId, store.snapshot, now)" @click="rest(row)">核对休息互动</button>
           <RouterLink v-else-if="row.type === 'TRIP_SUGGESTION' && now < row.expiresAt" class="button button-secondary" to="/adventure/map">去冒险地图手动准备</RouterLink>
+          <button v-else-if="row.type === 'QUICK_ACTION_SUGGESTION'" type="button" class="button button-primary"
+            :disabled="!available || now >= row.expiresAt" @click="runQuick(row)">核对并运行</button>
         </div>
       </article>
       <p v-if="!data.rows.length" class="small muted">当前没有有效的已保存建议。</p>

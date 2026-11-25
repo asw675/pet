@@ -6,6 +6,8 @@ files:
   - out/**/*
   - package.json
 extraResources:
+  - from: content-packs
+    to: character-packs
   - from: native/publish/win-x64/voice
     to: native/voice/win-x64
     filter:

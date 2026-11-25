@@ -48,7 +48,7 @@ const subtitle = computed(() => String(route.meta.subtitle ?? ''));
       </header>
       <main class="content" id="main-content" :aria-busy="store.loading || store.busy">
         <div v-if="!store.ready" class="feedback feedback-warning" role="status">
-          <Icon name="clock" /><div><strong>{{ serviceStatusLabel(store.serviceStatus) }}</strong><p>{{ store.snapshot ? '当前快照仅供参考。服务恢复后再继续操作。' : '等待本地服务返回快照，操作暂不可用。' }}</p></div>
+          <Icon name="clock" /><div><strong>{{ serviceStatusLabel(store.serviceStatus) }}</strong><p>{{ store.serviceStatus?.stage === 'UNAVAILABLE' ? '如果本地服务持续不可用，可在设置中从备份恢复。' : store.snapshot ? '当前快照仅供参考。服务恢复后再继续操作。' : '等待本地服务返回快照。' }}</p></div>
         </div>
         <div v-if="store.error" class="feedback feedback-error" role="alert">
           <div><strong>暂时无法完成操作</strong><p>{{ store.error }}</p></div>

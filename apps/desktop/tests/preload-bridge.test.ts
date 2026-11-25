@@ -105,10 +105,12 @@ describe('role-specific preload bridges', () => {
     ];
     const pet = createPetBridge(ipc);
     const center = createControlCenterBridge(ipc);
-    expect(Object.keys(pet).sort()).toEqual([...commonKeys, 'setInteractive', 'reportVisualReady','subscribeVoiceMouth','subscribeHostRenderPreferences'].sort());
+    expect(Object.keys(pet).sort()).toEqual([...commonKeys, 'setInteractive', 'reportVisualReady','subscribeVoiceMouth','subscribeHostRenderPreferences','subscribeProactiveBubble',
+      'readCharacterPack', 'subscribeCharacterPackChanged'].sort());
     expect(Object.keys(center).sort()).toEqual([...commonKeys, 'listGallery', 'listCharacters', 'listInventory', 'listActiveTravel', 'listTravelCatalog', 'previewTravel', 'listTravelReports', 'listEvents',
-      'getHostSettings','setHostShortcutEnabled','setLoginStart','getHostPreferences','saveHostPreferences','exportBackup',
-      'aiRequest','subscribeChatEvents','saveProviderCredential','revokeProviderCredential','voiceRequest','voiceSettingsRequest','workspaceRequest','authorizeMicrophone','requestMic','revokeMic','cancelVoiceChat','publishMouth','subscribeSuspend'].sort());
+      'getHostSettings','setHostShortcutEnabled','setLoginStart','getHostPreferences','saveHostPreferences','exportBackup','restoreBackup','getRestoreBackupStatus','getPeriodicBackupStatus',
+      'aiRequest','subscribeChatEvents','saveProviderCredential','revokeProviderCredential','voiceRequest','voiceSettingsRequest','workspaceRequest','authorizeMicrophone','requestMic','revokeMic','cancelVoiceChat','publishMouth','subscribeSuspend',
+      'proactiveRequest','subscribeProactiveNotices','listCharacterPacks','importCharacterPack','activateCharacterPack'].sort());
     expect('reportVisualReady' in center).toBe(false);
     expect('listGallery' in pet).toBe(false);
     expect('listCharacters' in pet).toBe(false);
@@ -137,6 +139,30 @@ describe('role-specific preload bridges', () => {
     expect(await bridge.saveHostPreferences({ scalePercent: 101, reducedMotion: true, expectedRevision: 0 } as never))
       .toEqual({ ok: false, code: 'INVALID_REQUEST' });
     expect(spy).toHaveBeenCalledTimes(1);
+  });
+
+  it('uses pathless restore requests and rejects restore statuses containing host details', async () => {
+    const ipc = new FakeIpc();
+    const bridge = createControlCenterBridge(ipc);
+    const invoke = vi.spyOn(ipc, 'invoke').mockResolvedValueOnce({ ok: true })
+      .mockResolvedValueOnce({ ok: true, status: 'RESTORED', path: '/private/source.sqlite3' });
+    expect(await bridge.restoreBackup()).toEqual({ ok: true });
+    expect(await bridge.getRestoreBackupStatus()).toEqual({ ok: false, code: 'SERVICE_UNAVAILABLE' });
+    expect(invoke.mock.calls).toEqual([
+      [DESKTOP_IPC.hostRequest, { kind: 'restore-backup' }], [DESKTOP_IPC.hostRequest, { kind: 'restore-status' }],
+    ]);
+    expect('restoreBackup' in createPetBridge(ipc)).toBe(false);
+  });
+
+  it('reads periodic backup status without exposing paths or permitting the pet bridge to query it', async () => {
+    const ipc = new FakeIpc();
+    const bridge = createControlCenterBridge(ipc);
+    const valid = { ok: true, status: 'AVAILABLE', lastCompletedAt: '2026-11-25T12:00:00.000Z' };
+    const invoke = vi.spyOn(ipc, 'invoke').mockResolvedValueOnce(valid).mockResolvedValueOnce({ ...valid, path: '/private/automatic.sqlite3' });
+    expect(await bridge.getPeriodicBackupStatus()).toEqual(valid);
+    expect(await bridge.getPeriodicBackupStatus()).toEqual({ ok: false, code: 'SERVICE_UNAVAILABLE' });
+    expect(invoke).toHaveBeenNthCalledWith(1, DESKTOP_IPC.hostRequest, { kind: 'periodic-backup-status' });
+    expect('getPeriodicBackupStatus' in createPetBridge(ipc)).toBe(false);
   });
 
   it('exposes a closed inventory query only to the control center and rejects unrelated replies', async () => {

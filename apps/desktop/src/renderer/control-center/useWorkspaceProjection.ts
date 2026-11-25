@@ -86,8 +86,7 @@ export function useWorkspaceProjection() {
     if (!isCurrent(scope)) return false;
     let success = false;
     try {
-      if (response?.ok && response.method !== 'action/select' && response.method !== 'action/run' && response.method !== 'routine/run' && response.method !== 'routine/cancel'
-        && installPage(response.data)) { notice.value = message; success = true; }
+      if (response?.ok && 'revision' in response.data && installPage(response.data)) { notice.value = message; success = true; }
       else { error.value = problem(response); await readPage(scope, true); }
       return success;
     } finally { if (isCurrent(scope)) busy.value = false; }

@@ -205,6 +205,9 @@ export class WorkspaceStorage {
   }
   listQuickActions(): QuickActionView[] { return this.listActionRecords().map(actionView); }
   listAiActions(now?: number): AiQuickAction[] {
+    return this.listAiActionBindings(now).map(({ targetId, label }) => ({ targetId, label }));
+  }
+  listAiActionBindings(now?: number): Array<AiQuickAction & { targetRevision: number }> {
     if (now !== undefined) uint(now, MAX_TIME);
     const prefs = new Map(this.listRecommendationPreferences().map(pref => [pref.targetId, pref]));
     return this.listActionRecords().filter(action => action.approvedAt !== null && action.enabled && action.recommendable)
@@ -213,7 +216,7 @@ export class WorkspaceStorage {
         return !pref?.permanentlyExcluded && (pref?.ignoredUntil === undefined || pref.ignoredUntil === null
           || (now !== undefined && pref.ignoredUntil <= now));
       })
-      .map(action => parse(aiQuickActionSchema, { targetId: action.id, label: action.label }));
+      .map(action => ({ ...parse(aiQuickActionSchema, { targetId: action.id, label: action.label }), targetRevision: action.revision }));
   }
 
   /** Called only with a freshly consumed native Main approval. Renderer IDs

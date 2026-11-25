@@ -8,6 +8,7 @@ import type {
   ActionProposal, ActionProposalDraft, AiCancelReason, AiError, AiErrorCode, AiUsage, ChatMessage, ChatReply,
   ChatStreamEvent, PendingMemoryCandidate, ProviderConfig, ProviderOutputMode, TurnRequest,
 } from '@pet-desktop/contracts/ai';
+import type { AiQuickActionBinding } from '@pet-desktop/contracts/workspace';
 import { buildPendingMemoryCandidates } from '@pet-desktop/app-service/memory-policy';
 import { ModelProviderError, publicAiError } from './model-provider';
 import type { ModelProvider, TurnIdentity } from './model-provider';
@@ -48,7 +49,7 @@ export interface ChatAuthorityPort {
   /** Current durable record, not model-supplied historical content. */
   lookupMessage(messageId: string): ChatMessage | null;
   /** Optional authority-owned proposal allowlist. Absent/failing means deny. */
-  isProposalAllowed?(identity: TurnIdentity, draft: ActionProposalDraft): boolean;
+  isProposalAllowed?(identity: TurnIdentity, draft: ActionProposalDraft, binding?: AiQuickActionBinding, at?: number): boolean;
 }
 
 export interface ResolvedChatProvider { config: ProviderConfig; provider: ModelProvider; providerRevision: number }
@@ -365,7 +366,8 @@ export class ChatCoordinator {
       }
       const outputMode = chooseMode(config);
       const request = providerRequestSchema.parse({ providerId: config.providerId, modelId: config.modelId,
-        outputMode, maxOutputTokens: config.maxOutputTokens, turn: { ...turn, deadline: job.deadline } });
+        outputMode, maxOutputTokens: turn.trigger === 'PROACTIVE' ? Math.min(96, config.maxOutputTokens) : config.maxOutputTokens,
+        turn: { ...turn, deadline: job.deadline } });
       if (hasKnownCredential(request, credential)) throw new ModelProviderError('UNSUPPORTED');
       // No credential is persisted in a job or emitted. The trusted provider
       // receives only this one broker result, never a cross-provider fallback.
@@ -417,9 +419,13 @@ export class ChatCoordinator {
         if (seenProposals.has(key) || at > Number.MAX_SAFE_INTEGER - PROPOSAL_TTL_MS) continue;
         seenProposals.add(key);
         try {
-          if (!this.options.authority.isProposalAllowed?.(job.identity, draft)) continue;
+          const binding = draft.type === 'QUICK_ACTION_SUGGESTION'
+            ? turn.context.quickActions?.find(action => action.targetId === draft.targetId) : undefined;
+          if (draft.type === 'QUICK_ACTION_SUGGESTION' && !binding) continue;
+          if (!this.options.authority.isProposalAllowed?.(job.identity, draft, binding, at)) continue;
           const checked = actionProposalSchema.safeParse({ ...draft, ...job.identity, proposalId: this.createId('proposal'),
-            expiresAt: at + PROPOSAL_TTL_MS, confirmationRequired: true });
+            expiresAt: at + PROPOSAL_TTL_MS, confirmationRequired: true,
+            ...(binding ? { targetRevision: binding.targetRevision, targetLabel: binding.label } : {}) });
           if (checked.success && !seenProposalIds.has(checked.data.proposalId)) {
             seenProposalIds.add(checked.data.proposalId);
             proposals.push(checked.data);

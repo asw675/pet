@@ -29,7 +29,7 @@ describe('original, immutable heroine character definitions', () => {
   it('uses explicitly humanoid original heroines and distinct profession/personality/voice style metadata', () => {
     const mage = definition('star-singer'), ranger = definition('fluffy-ranger'), nova = definition('nova');
     expect([mage.species,ranger.species,nova.species]).toEqual(['魔族','人类','仿生机械人']);
-    expect(mage.background).toContain('绯粉长发');
+    expect(mage.background).toContain('人形星术师');
     expect(ranger.background).toContain('人形少女');
     expect(nova.background).toContain('人形少女');
     expect(new Set(CHARACTER_CATALOG.map(c => c.profession)).size).toBe(3);

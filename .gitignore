@@ -18,6 +18,8 @@ coverage/
 *.sqlite3-wal
 *.sqlite3-shm
 .pet-backup-*/
+.pet-restore/
+.pet-snapshots/
 *.db
 *.db-wal
 *.db-shm

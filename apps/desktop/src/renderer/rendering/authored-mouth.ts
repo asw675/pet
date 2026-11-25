@@ -1,4 +1,4 @@
-import type { ResolvedPack, ResolvedPackVariant } from '../asset-packs/resolve-pack';
+import type { ResolvedPack, ResolvedPackVariant } from '../../shared/resolve-character-pack';
 
 type Rect = readonly [number, number, number, number];
 export interface AuthoredMouthPatch { readonly source: Rect; readonly destination: Rect; readonly level: number }

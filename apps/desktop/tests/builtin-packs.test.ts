@@ -6,7 +6,7 @@ import { describe, expect, it } from 'vitest';
 import { characterPackManifestSchema } from '@pet-desktop/contracts';
 import { CHARACTER_CATALOG } from '@pet-desktop/domain/character-catalog';
 import { builtinPackIds, loadBuiltinPack } from '../src/renderer/asset-packs/builtin-registry';
-import { resolvePack } from '../src/renderer/asset-packs/resolve-pack';
+import { resolvePack } from '../src/shared/resolve-character-pack';
 
 const root = fileURLToPath(new URL('../src/renderer/asset-packs/builtin/', import.meta.url));
 const packIds = ['star-singer', 'fluffy-ranger', 'nova'];

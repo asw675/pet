@@ -82,6 +82,7 @@ class MemoryRepository implements AppRepository, AppTransaction {
 
   close(): void { this.closed = true; }
   aiState(): never { throw new Error('AI storage is not part of this game-only fake'); }
+  proactive(): never { throw new Error('Proactive storage is not part of this game-only fake'); }
   workspaceState(): never { throw new Error('Workspace storage is not part of this game-only fake'); }
   voiceProfiles(): never { throw new Error('Voice storage is not part of this game-only fake'); }
   hostPreferences(): never { throw new Error('Host preferences are not part of this game-only fake'); }

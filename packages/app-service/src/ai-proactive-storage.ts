@@ -1,5 +1,5 @@
 import {
-  proactiveLimits, proactiveNoticePageSchema, proactiveNoticeSchema, proactiveSettingsSchema, proactiveSettingsSetSchema,
+  proactiveLimits, proactiveNoticePageSchema, proactiveNoticeSchema, proactiveSettingsSchema, proactiveSettingsSetSchema, proactiveTriggerSchema,
 } from '@pet-desktop/contracts/proactive';
 import type {
   ProactiveGeneration,ProactiveNotice,ProactiveNoticePage,ProactiveSettings,ProactiveSettingsSet,ProactiveTrigger,
@@ -101,6 +101,7 @@ function defaultSettings(petId:string):ProactiveSettings{return proactiveSetting
 export interface ProactiveLowObservation {petId:string;low:boolean;episode:number;lowSince:number|null;observedAt:number}
 export interface ProactiveReserveInput {noticeId:string;petId:string;trigger:ProactiveTrigger;sourceKey:string;sourceAt:number;createdAt:number;text:string;generation:ProactiveGeneration|null}
 export interface ProactiveGenerationIdentity {petId:string;requestId:string;conversationId:string}
+export class ProactiveSettingsConflict extends Error {}
 
 /** Same active SQLite connection and transaction as the game authority. */
 export class AiProactiveStorage {
@@ -120,7 +121,7 @@ export class AiProactiveStorage {
   }
   setSettings(raw:ProactiveSettingsSet,at:number):ProactiveSettings{
     const input=proactiveSettingsSetSchema.parse(raw),now=integer(at),current=this.getSettings(input.petId);
-    if(input.expectedRevision!==current.revision||current.updatedAt!==null&&now<current.updatedAt)throw new Error('Proactive settings revision conflict');
+    if(input.expectedRevision!==current.revision||current.updatedAt!==null&&now<current.updatedAt)throw new ProactiveSettingsConflict('Proactive settings revision conflict');
     const {enabled,useLocalAi,quietHours}=input;
     if(enabled===current.enabled&&useLocalAi===current.useLocalAi&&same(quietHours,current.quietHours))return current;
     const next=proactiveSettingsSchema.parse({petId:input.petId,revision:current.revision+1,enabled,useLocalAi,quietHours,updatedAt:now,
@@ -162,9 +163,13 @@ export class AiProactiveStorage {
   /** Trusted AI utility authorization: no arbitrary PROACTIVE chat request
    * can begin without the exact durable pending notice and current opt-in. */
   isAuthorizedGeneration(identity:ProactiveGenerationIdentity):boolean{
-    return this.get(`SELECT 1 FROM proactive_notices n JOIN proactive_settings s ON s.pet_id=n.pet_id
+    return this.generationTrigger(identity)!==null;
+  }
+  generationTrigger(identity: ProactiveGenerationIdentity): ProactiveTrigger | null {
+    const found = this.get(`SELECT n.trigger FROM proactive_notices n JOIN proactive_settings s ON s.pet_id=n.pet_id
       WHERE n.pet_id=? AND n.generation_request_id=? AND n.generation_conversation_id=? AND n.delivery_status='PENDING'
-      AND s.enabled=1 AND s.local_ai=1`,id(identity.petId),id(identity.requestId),id(identity.conversationId))!==null;
+      AND s.enabled=1 AND s.local_ai=1`,id(identity.petId),id(identity.requestId),id(identity.conversationId));
+    return found ? proactiveTriggerSchema.parse(found.trigger) : null;
   }
   hasSource(petId:string,trigger:ProactiveTrigger,sourceKey:string):boolean{
     return this.get('SELECT 1 FROM proactive_notices WHERE pet_id=? AND trigger=? AND source_key=?',id(petId),trigger,sourceKey)!==null;

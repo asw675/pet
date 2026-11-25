@@ -3,7 +3,8 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { AI_STATE_MIGRATION_SQL, AiStateStorage } from '../src/ai-state-storage.ts';
+import { AI_MEMORY_FTS_MIGRATION_SQL, AI_STATE_MIGRATION_SQL, AiStateStorage, verifyMemorySearchIndex } from '../src/ai-state-storage.ts';
+import { memoryPolicyLimits } from '../src/memory-policy.ts';
 
 const NOW = 1000;
 const config = { providerId:'provider-mock', endpointKind:'MOCK', privacyBoundary:'MOCK', baseUrl:null, modelId:'mock',credentialRef:null,
@@ -47,12 +48,12 @@ function wrap(db) {
     catch(error){active=false;db.exec('ROLLBACK');throw error;}};
   return {db,tx};
 }
-function prepare(db) {
-  db.exec(`PRAGMA foreign_keys=ON; CREATE TABLE pets(pet_id TEXT PRIMARY KEY) STRICT;
+function prepare(db, withSearch = true) {
+  db.exec(`PRAGMA foreign_keys=ON; PRAGMA trusted_schema=OFF; CREATE TABLE pets(pet_id TEXT PRIMARY KEY) STRICT;
     INSERT INTO pets VALUES('pet-1'),('pet-2'),('pet-3');
     CREATE TABLE wallet(coins INTEGER NOT NULL) STRICT; INSERT INTO wallet VALUES(21);
     CREATE TABLE preferences(revision INTEGER NOT NULL) STRICT; INSERT INTO preferences VALUES(9);`);
-  db.exec('BEGIN IMMEDIATE');try{db.exec(AI_STATE_MIGRATION_SQL);db.exec('COMMIT');}catch(error){db.exec('ROLLBACK');throw error;}
+  db.exec('BEGIN IMMEDIATE');try{db.exec(AI_STATE_MIGRATION_SQL);if(withSearch)db.exec(AI_MEMORY_FTS_MIGRATION_SQL);db.exec('COMMIT');}catch(error){db.exec('ROLLBACK');throw error;}
   const fixture=wrap(db);
   fixture.tx(store=>{store.saveProviderConfig(config,null,0);for(const petId of ['pet-1','pet-2','pet-3']){
     store.setPetProviderAssignment({petId,providerId:config.providerId,providerRevision:1,consentRef:null,assignedAt:0});
@@ -193,6 +194,62 @@ describe('durable conversation turns and exact terminal compare-and-set',()=>{
 });
 
 describe('pending candidates, confirmed memories and explicit per-pet grants',()=>{
+  it('indexes only confirmed memory, backfills existing rows and synchronizes edits and source revocation transactionally', () => {
+    const db = new DatabaseSync(':memory:');
+    try {
+      const f = prepare(db, false);
+      createCandidate(f);
+      f.tx(store => {
+        expect(store.confirmMemory('pet-1', 'candidate-turn-1', 'memory-tea', NOW + 10, {
+          kind: 'CONFIRM', scope: 'SHARED', recipientPetIds: ['pet-2'], editedSummary: '用户喜欢茉莉花茶',
+        }).ok).toBe(true);
+      });
+      createCandidate(f, 'turn-pending', 'pet-1', NOW + 100);
+      db.exec(AI_MEMORY_FTS_MIGRATION_SQL);
+      verifyMemorySearchIndex(db, true);
+      const matches = text => db.prepare('SELECT rowid,search_text FROM ai_memory_fts WHERE ai_memory_fts MATCH ?').all(`"${text}"`);
+      expect(matches('茉莉花')).toMatchObject([{ search_text: null }]);
+      expect(db.prepare('SELECT count(*) AS n FROM ai_memory_search_keys').get().n).toBe(1);
+      f.tx(store => {
+        const at = NOW + 105;
+        expect(store.retrieveMemories('pet-1', '茉莉花茶', at)).toMatchObject([{ memoryId: 'memory-tea' }]);
+        expect(store.retrieveMemories('pet-2', '花茶', at)).toMatchObject([{ memoryId: 'memory-tea' }]);
+        expect(store.retrieveMemories('pet-3', '茉莉花茶', at)).toEqual([]);
+        expect(store.retrieveMemories('pet-3', '" OR NEAR(茉莉花茶)', at)).toEqual([]);
+        expect(store.editMemory('pet-1', 'memory-tea', {
+          kind: 'EDIT', scope: 'SHARED', recipientPetIds: ['pet-2'], summary: '用户喜欢乌龙岩茶', expiresAt: null, pinned: false,
+        }, at)).toMatchObject({ summary: '用户喜欢乌龙岩茶' });
+        expect(matches('茉莉花')).toEqual([]);
+        expect(matches('乌龙岩')).toHaveLength(1);
+        expect(store.revokeMemoryGrant('pet-1', 'memory-tea', 'pet-2', at + 1)).toBe(true);
+        expect(store.retrieveMemories('pet-2', '乌龙岩茶', at + 1)).toEqual([]);
+        expect(store.editUserMessage('pet-1', 'conv-pet-1', 'user-turn-1', '我改变了偏好', at + 2)).toBe(true);
+        expect(matches('乌龙岩')).toEqual([]);
+      });
+      verifyMemorySearchIndex(db, true);
+      expect(db.prepare('SELECT count(*) AS n FROM ai_memory_search_keys').get().n).toBe(0);
+    } finally { db.close(); }
+  });
+
+  it('recalls a matching authorized older fact beyond the bounded recent-candidate window', () => withMemory(f => {
+    createCandidate(f);
+    f.tx(store => {
+      expect(store.confirmMemory('pet-1', 'candidate-turn-1', 'older-tea', NOW + 10, {
+        kind: 'CONFIRM', scope: 'PRIVATE', editedSummary: '用户喜欢茉莉花茶',
+      }).ok).toBe(true);
+      const cap = memoryPolicyLimits.recordsToConsider;
+      f.db.prepare(`WITH RECURSIVE fixtures(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM fixtures WHERE n<?)
+        INSERT INTO ai_memory_ids(memory_id) SELECT 'search-fixture-'||n FROM fixtures`).run(cap);
+      f.db.prepare(`INSERT INTO ai_memories(memory_id,owner_pet_id,source_conversation_id,scope,type,summary,confidence,created_at,updated_at,pinned)
+        SELECT memory_id,'pet-1','conv-pet-1','PRIVATE','HISTORY','阅读训练记录',1,?,?,0
+        FROM ai_memory_ids WHERE memory_id LIKE 'search-fixture-%'`).run(NOW + 11, NOW + 11);
+      f.db.exec(`INSERT INTO ai_memory_sources(memory_id,message_id,source_revision)
+        SELECT memory_id,'user-turn-1',0 FROM ai_memories WHERE memory_id LIKE 'search-fixture-%'`);
+      expect(store.retrieveMemories('pet-1', '茉莉花茶', NOW + 12)).toMatchObject([{ memoryId: 'older-tea' }]);
+      expect(store.retrieveMemories('pet-2', '茉莉花茶', NOW + 12)).toEqual([]);
+    });
+  }));
+
   it('only accepts actual USER source; confirmation creates private fact only via explicit operation',()=>withMemory(f=>{
     createCandidate(f);f.tx(store=>{expect(store.getPendingCandidate('pet-2','candidate-turn-1')).toBeNull();
       expect(store.confirmMemory('pet-2','candidate-turn-1','memory-a',NOW+100,{kind:'CONFIRM',scope:'PRIVATE'})).toEqual({ok:false,reason:'NOT_FOUND'});

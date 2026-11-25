@@ -5,7 +5,7 @@ import {
 } from '@pet-desktop/contracts';
 import type { CharacterPackManifest, SpriteAtlas } from '@pet-desktop/contracts';
 
-/** A capability for one already selected local pack, not an arbitrary file API. */
+/** A capability for one already selected local pack. */
 export interface PackSource {
   /** Exact asset paths (manifest.json is provided separately); no absolute paths. */
   paths(): readonly string[];
@@ -130,7 +130,8 @@ function crc32(bytes: Uint8Array, from: number, until: number): number {
   return (crc ^ 0xffffffff) >>> 0;
 }
 
-/** 004A built-in baseline: non-interlaced, 8bpc RGBA PNG, no ancillary chunks.
+/** Non-interlaced, 8bpc RGBA PNG. Only bounded, non-rendered provenance
+ * metadata may precede the pixel data.
  * Checks container/CRC/dimensions before any image decoder can allocate pixels.
  * IDAT decompression/pixel decoding is deliberately delegated to the renderer adapter.
  */
@@ -140,6 +141,7 @@ function inspectPng(bytes: Uint8Array): PackImageSize {
   let offset = 8;
   let chunks = 0;
   let compressedBytes = 0;
+  let provenance = false;
   let size: PackImageSize | undefined;
   while (offset <= bytes.length - 12 && ++chunks <= MAX_PNG_CHUNKS) {
     const length = view.getUint32(offset);
@@ -157,6 +159,9 @@ function inspectPng(bytes: Uint8Array): PackImageSize {
         || bytes[data + 8] !== 8 || bytes[data + 9] !== 6 || bytes[data + 10] !== 0
         || bytes[data + 11] !== 0 || bytes[data + 12] !== 0) fail('INVALID_PNG');
       size = Object.freeze({ w, h });
+    } else if (type === 0x63614258) { // caBX Content Credentials metadata
+      if (provenance || compressedBytes !== 0 || length === 0 || length > 256 * 1024) fail('INVALID_PNG');
+      provenance = true;
     } else if (type === 0x49444154) { // IDAT; zero-size adjacent chunks are legal.
       compressedBytes += length;
     } else if (type === 0x49454e44) { // IEND

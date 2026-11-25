@@ -58,11 +58,18 @@ export function compilePrompt(rawConfig: ProviderConfig, rawRequest: ProviderReq
   const context = turn.context;
   const messages = [...context.recentMessages];
   const memories = [...context.authorizedMemories];
+  const actions = turn.trigger === 'USER' && config.privacyBoundary !== 'CLOUD' && request.outputMode !== 'TEXT'
+    ? (context.quickActions ?? []).map(({ targetId, label }) => ({ targetId, label })) : [];
   let summary = context.historySummary;
-  const system = trustedInstructions(request.outputMode);
+  const base = trustedInstructions(request.outputMode);
+  const system = turn.trigger === 'PROACTIVE'
+    ? `${base}\nWrite one brief, optional in-character greeting for the provided proactive reason. Do not add proposed actions or memory candidates.`
+    : actions.length ? `${base}\nA QUICK_ACTION_SUGGESTION may reference only a targetId in quickActions and does not run the action.` : base;
   const make = (): PromptMessage[] => [{ role: 'system', content: system }, {
     role: 'user', content: JSON.stringify({ kind: 'PET_TURN_CONTEXT_DATA', trigger: turn.trigger,
+      ...(turn.proactiveReason ? { proactiveReason: turn.proactiveReason } : {}),
       persona: context.persona, game: context.game, recentMessages: messages,
+      ...(actions.length ? { quickActions: actions } : {}),
       authorizedMemories: memories, historySummary: summary,
       currentUserMessage: turn.userText === null ? null : { messageId: turn.userMessageId, text: turn.userText } }),
   }];
@@ -74,6 +81,7 @@ export function compilePrompt(rawConfig: ProviderConfig, rawRequest: ProviderReq
     if (summary !== null) summary = null;
     else if (memories.length > 0) memories.pop();
     else if (messages.length > 0) messages.shift();
+    else if (actions.length > 0) actions.pop();
     else throw new ModelProviderError('CONTEXT_LIMIT');
     prompt = make();
     estimate = estimatePromptTokens(prompt);

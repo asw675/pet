@@ -1,7 +1,8 @@
 import { DatabaseSync } from 'node:sqlite';
 import { describe, expect, it } from 'vitest';
 import { AiAuthorityService } from '../src/ai-authority-service.ts';
-import { AI_STATE_MIGRATION_SQL, AiStateStorage } from '../src/ai-state-storage.ts';
+import { AI_MEMORY_FTS_MIGRATION_SQL, AI_STATE_MIGRATION_SQL, AiStateStorage } from '../src/ai-state-storage.ts';
+import { WORKSPACE_MIGRATION_SQL, WorkspaceStorage } from '../src/workspace-storage.ts';
 
 const NOW=1000;
 const mock={providerId:'mock-one',endpointKind:'MOCK',privacyBoundary:'MOCK',baseUrl:null,modelId:'mock',credentialRef:null,
@@ -24,15 +25,19 @@ function withFixture(action){
   try{
     db.exec("PRAGMA foreign_keys=ON; CREATE TABLE pets(pet_id TEXT PRIMARY KEY) STRICT; INSERT INTO pets VALUES('pet-1'),('pet-2'),('pet-3'),('pet-4'); CREATE TABLE wallet(coins INTEGER); INSERT INTO wallet VALUES(987);");
     db.exec(AI_STATE_MIGRATION_SQL);
+    db.exec(AI_MEMORY_FTS_MIGRATION_SQL);
+    db.exec(WORKSPACE_MIGRATION_SQL);
     let serial=0, active=false;
     const state={snapshot:initialSnapshot(),events:[],contextReadCount:0};
+    const workspace = () => new WorkspaceStorage(db, () => active);
     const game={snapshot:()=>{if(!active)throw new Error('Game projection outside transaction');state.contextReadCount++;return structuredClone(state.snapshot);},
+      quickActions: at => workspace().listAiActionBindings(at),
       recentEvents:petId=>{if(!active)throw new Error('Unsafe event lookup');return state.events.filter(event=>event.petId===petId);}};
     const transaction=fn=>{expect(active).toBe(false);db.exec('BEGIN IMMEDIATE');active=true;
       try{const value=fn(new AiStateStorage(db,()=>active),game);active=false;db.exec('COMMIT');return value;}
       catch(error){active=false;db.exec('ROLLBACK');throw error;}};
     const service=new AiAuthorityService({transaction,createId:kind=>`${kind}-${++serial}`});
-    const f={service,state,db,transaction,conv1:service.createConversation({petId:'pet-1',title:'对话一'},0),conv2:service.createConversation({petId:'pet-2',title:'对话二'},0)};
+    const f={service,state,db,transaction,workspace: run => transaction(() => run(workspace())),conv1:service.createConversation({petId:'pet-1',title:'对话一'},0),conv2:service.createConversation({petId:'pet-2',title:'对话二'},0)};
     return action(f);
   }finally{db.close();}
 }
@@ -179,6 +184,42 @@ describe('live authority revisions, permitted suggestions and explicit memories'
     expect(f.service.dismissActionProposal('pet-2','proposal-request-1-0')).toBe(false);
     expect(f.service.dismissActionProposal('pet-1','proposal-request-1-0')).toBe(true);
     expect(f.service.listActionProposals('pet-1',NOW+60011)).toEqual([]);
+  }));
+  it('stores an opted-in shortcut version, rechecks revocation, and permits exactly one privileged consume', () => withFixture(f => {
+    assignMock(f);
+    const target = { kind: 'HTTPS', locator: 'https://example.com/tea', fingerprint: { kind: 'HTTPS', canonicalUrl: 'https://example.com/tea' } };
+    f.workspace(store => store.addApprovedAction({ id: 'tea', target, label: '茶单', recommendable: true, approvedAt: 2, enabled: true }, 0));
+    const draft = { type: 'QUICK_ACTION_SUGGESTION', targetId: 'tea', reason: '继续查看茶单' };
+    function completeShortcut(turn, revision = 0, targetLabel = '茶单') {
+      const proposal = { ...fields(turn.turn), ...draft, targetRevision: revision, targetLabel, proposalId: `proposal-${turn.turn.requestId}`,
+        expiresAt: NOW + 2_000, confirmationRequired: true };
+      expect(f.service.finishTurn(terminal(turn, NOW + 13, { ...basicReply, actionProposals: [draft] }, [proposal]))).toBe(true);
+      return proposal;
+    }
+    const begun = start(f);
+    const binding = { targetId: 'tea', label: '茶单', targetRevision: 0 };
+    expect(begun.turn.context.quickActions).toEqual([binding]);
+    expect(f.service.isProposalAllowed(begun.turn, draft, binding, NOW + 1)).toBe(true);
+    expect(f.service.isProposalAllowed(begun.turn, draft, { ...binding, targetRevision: 1 }, NOW + 1)).toBe(false);
+    const proposal = completeShortcut(begun);
+    const at = NOW + 14;
+    expect(f.service.resolveQuickProposal('pet-2', proposal.proposalId, at)).toBeNull();
+    expect(f.service.resolveQuickProposal('pet-1', proposal.proposalId, proposal.expiresAt)).toBeNull();
+    expect(f.service.resolveQuickProposal('pet-1', proposal.proposalId, at, { ...proposal, targetRevision: 1 })).toBeNull();
+    expect(f.service.resolveQuickProposal('pet-1', proposal.proposalId, at)).toEqual(proposal);
+    expect(f.service.resolveQuickProposal('pet-1', proposal.proposalId, at, proposal)).toEqual(proposal);
+    expect(f.service.resolveQuickProposal('pet-1', proposal.proposalId, at, proposal)).toBeNull();
+
+    const second = completeShortcut(start(f, f.conv1, 'revision', NOW + 11));
+    f.workspace(store => store.updateActionMetadata('tea', 0, { label: '新茶单', recommendable: true, enabled: true }));
+    expect(f.service.resolveQuickProposal('pet-1', second.proposalId, at)).toBeNull();
+    expect(f.service.listActionProposals('pet-1', at)).toEqual([]);
+    const thirdTurn = start(f, f.conv1, 'source', NOW + 12);
+    const third = completeShortcut(thirdTurn, 1, '新茶单');
+    expect(f.service.editUserMessage('pet-1', f.conv1.conversationId, thirdTurn.turn.userMessageId, '已经不想查看茶单。', at)).toBe(true);
+    expect(f.service.resolveQuickProposal('pet-1', third.proposalId, at)).toBeNull();
+    assignCloud(f, 'pet-2', NOW);
+    expect(start(f, f.conv2, 'cloud-shortcut').turn.context).not.toHaveProperty('quickActions');
   }));
   it('rechecks proposal against game state at terminal and never authorizes unsupported motion or duplicate targets',()=>withFixture(f=>{
     assignMock(f);const begun=start(f),rest={type:'REST',targetId:'self',reason:'休息一下'};

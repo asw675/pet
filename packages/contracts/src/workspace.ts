@@ -114,6 +114,9 @@ export const quickActionViewSchema = z.strictObject({ ...identityFields, kind: q
 export type QuickActionView = z.infer<typeof quickActionViewSchema>;
 export const aiQuickActionSchema = z.strictObject({ targetId: id, label });
 export type AiQuickAction = z.infer<typeof aiQuickActionSchema>;
+/** Private turn binding; provider-visible context strips the revision. */
+export const aiQuickActionBindingSchema = aiQuickActionSchema.extend({ targetRevision: uint });
+export type AiQuickActionBinding = z.infer<typeof aiQuickActionBindingSchema>;
 
 const uniqueTargetIds = z.array(id).max(workspaceLimits.actions).refine(values => new Set(values).size === values.length, 'Duplicate target ID');
 const routineFields = { name: label, targetIds: uniqueTargetIds.min(1).max(workspaceLimits.routineTargets),

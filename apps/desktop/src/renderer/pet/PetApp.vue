@@ -7,6 +7,7 @@ import PetCanvas from './PetCanvas.vue';
 import { createInteractionLease } from '../shared/interaction-lease';
 import type { PetVisualReady } from '../../shared/protocol';
 import type { VoiceMouthNotification } from '../../shared/voice-ipc';
+import type { ProactiveDesktopBubble } from '../../shared/proactive-ipc';
 import { MOUTH_STALE_MS, VoiceMouthProjection } from '../rendering/voice-mouth-projection';
 import type { MouthProjectionResult } from '../rendering/voice-mouth-projection';
 
@@ -21,6 +22,23 @@ const reducedMotion = ref(false);
 const hostError = ref<string | null>(null);
 const openingCenter = ref(false);
 const canHit = computed(() => !quietMotion.value && pet.value?.presence === 'HOME' && pet.value.visibility === 'VISIBLE');
+const proactiveBubble = ref<string | null>(null);
+let unsubscribeProactive: (() => void) | undefined;
+let proactiveTimeout: number | undefined;
+
+function clearProactive(): void {
+  if (proactiveTimeout !== undefined) window.clearTimeout(proactiveTimeout);
+  proactiveTimeout = undefined;
+  proactiveBubble.value = null;
+}
+
+function showProactive(message: ProactiveDesktopBubble): void {
+  if (message !== null && message.petId !== petId) return;
+  clearProactive();
+  if (!message || !canHit.value || pet.value?.activity !== 'IDLE' || document.visibilityState !== 'visible') return;
+  proactiveBubble.value = message.text;
+  proactiveTimeout = window.setTimeout(clearProactive, 8_000);
+}
 
 // Visual-only audio-clock samples from the trusted host. The pet renderer
 // owns no microphone, playback source, raw audio or AI/provider requests.
@@ -55,7 +73,10 @@ function onVoiceMouth(event: VoiceMouthNotification): void {
   if (!result.changed) return;
   applyMouth(result); scheduleMouthWatchdog();
 }
-function onVoiceVisibility(): void { if (document.visibilityState !== 'visible') clearVoiceMouth(); }
+function onVoiceVisibility(): void {
+  if (document.visibilityState !== 'visible') { clearVoiceMouth(); clearProactive(); }
+}
+watch(() => canHit.value && pet.value?.activity === 'IDLE', eligible => { if (!eligible) clearProactive(); }, { flush: 'sync' });
 watch(canHit, enabled => { if (!enabled) clearVoiceMouth(); }, { flush: 'sync' });
 watch(() => pet.value?.characterId, () => clearVoiceMouth(), { flush: 'sync' });
 watch(() => store.serviceStatus?.generation, () => clearVoiceMouth(), { flush: 'sync' });
@@ -143,6 +164,7 @@ watch(canHit, (enabled) => enabled ? hitTest() : leave(), { flush: 'sync' });
 onMounted(() => {
   unsubscribeRenderPreferences = bridge?.subscribeHostRenderPreferences(value => { reducedMotion.value = value.reducedMotion; });
   unsubscribeMouth = bridge?.subscribeVoiceMouth(onVoiceMouth);
+  unsubscribeProactive = bridge?.subscribeProactiveBubble(showProactive);
   document.addEventListener('visibilitychange', onVoiceVisibility);
   document.addEventListener('mousemove', onMouseMove);
   document.documentElement.addEventListener('mouseleave', leave);
@@ -155,6 +177,7 @@ onMounted(() => {
 onBeforeUnmount(() => {
   unsubscribeRenderPreferences?.();
   unsubscribeMouth?.(); unsubscribeMouth = undefined;
+  unsubscribeProactive?.(); clearProactive();
   clearVoiceMouth(); mouth?.dispose(); mouth = null;
   document.removeEventListener('visibilitychange', onVoiceVisibility);
   visualReportEpoch += 1;
@@ -186,6 +209,7 @@ async function openControlCenter(): Promise<void> {
 
 function interact(interaction: Interaction): void {
   if (!pet.value || !canAct.value) return;
+  clearProactive();
   hostError.value = null;
   if (interaction === 'PET') petCanvas.value?.playSemantic('tap.head');
   void store.dispatch({ type: 'PET_INTERACT', payload: { petId: pet.value.petId, interaction } },
@@ -205,6 +229,7 @@ function interact(interaction: Interaction): void {
       <div class="portrait-surface">
         <PetCanvas ref="petCanvas" :character-id="pet.characterId" :activity="pet.activity" :paused="quietMotion" :reduced-motion="reducedMotion" :interactive="canAct && canHit" @touch="interact('PET')" @visual="visual = $event" />
       </div>
+      <p v-if="proactiveBubble" class="proactive-bubble" role="status">{{ proactiveBubble }}</p>
       <div class="state" data-hit>
         <span class="dot" :class="{ muted: !store.ready }"></span>
         {{ store.ready ? petStatus(pet) : serviceStatusLabel(store.serviceStatus) }}
@@ -238,7 +263,8 @@ function interact(interaction: Interaction): void {
 * { box-sizing: border-box; }
 html, body, #app { width: 100%; height: 100%; margin: 0; background: transparent; overflow: hidden; }
 body { user-select: none; }
-.pet-shell { width: 100%; height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 5px; gap: 5px; pointer-events: none; }
+.pet-shell { position: relative; width: 100%; height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 5px; gap: 5px; pointer-events: none; }
+.proactive-bubble { position: absolute; z-index: 1; top: 44px; left: 12px; right: 12px; max-height: 5.7em; margin: 0; padding: 7px 9px; overflow: hidden; overflow-wrap: anywhere; background: #352b43f2; border: 1px solid #b4a4d199; border-radius: 10px; color: #fff3df; font-size: 12px; line-height: 1.45; pointer-events: none; }
 [data-hit] { pointer-events: auto; }
 .plate { display: inline-flex; align-items: center; gap: 6px; min-height: 27px; padding: 1px 3px 1px 7px; background: #352b43eb; border: 1px solid #b4a4d16b; border-radius: 11px; box-shadow: 0 2px 8px #1b172149; max-width: 100%; }
 .drag-handle { -webkit-app-region: drag; app-region: drag; padding: 4px 2px 4px 0; font-size: 12px; font-weight: 700; cursor: move; white-space: nowrap; text-overflow: ellipsis; overflow: hidden; max-width: 130px; }

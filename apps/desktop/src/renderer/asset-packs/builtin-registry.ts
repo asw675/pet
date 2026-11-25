@@ -1,7 +1,8 @@
 /// <reference types="vite/client" />
 
 import { version as appVersion } from '../../../package.json';
-import { resolvePack, type PackSource, type ResolvedPack } from './resolve-pack';
+import { builtinPackVersion, builtinCharacterIds } from '../../shared/character-pack-ipc';
+import { resolvePack, type PackSource, type ResolvedPack } from '../../shared/resolve-character-pack';
 
 // Only the application's built-in data is registered here. No arbitrary URL,
 // absolute paths, directory browsing, dynamically supplied JS or fetch(file:).
@@ -10,12 +11,6 @@ import { resolvePack, type PackSource, type ResolvedPack } from './resolve-pack'
 const manifests = import.meta.glob<unknown>('./builtin/*/manifest.json', { import: 'default' });
 const atlasFiles = import.meta.glob<string>('./builtin/*/assets/**/*.json', { query: '?raw', import: 'default' });
 const imageFiles = import.meta.glob<string>('./builtin/*/assets/**/*.png', { query: '?inline', import: 'default' });
-
-const BUILTIN_VERSIONS = new Map([
-  ['star-singer', '1.0.1'],
-  ['fluffy-ranger', '1.0.1'],
-  ['nova', '1.0.0'],
-]);
 
 function decodePngDataUrl(url: string): Uint8Array<ArrayBuffer> {
   const prefix = 'data:image/png;base64,';
@@ -26,10 +21,10 @@ function decodePngDataUrl(url: string): Uint8Array<ArrayBuffer> {
   return bytes;
 }
 
-export function builtinPackIds(): readonly string[] { return [...BUILTIN_VERSIONS.keys()]; }
+export function builtinPackIds(): readonly string[] { return [...builtinCharacterIds]; }
 
 export async function loadBuiltinPack(characterId: string, signal?: AbortSignal): Promise<ResolvedPack> {
-  const packVersion = BUILTIN_VERSIONS.get(characterId);
+  const packVersion = builtinPackVersion(characterId);
   if (packVersion === undefined) throw new Error('Built-in character pack unavailable');
   signal?.throwIfAborted();
   const prefix = `./builtin/${characterId}/`;

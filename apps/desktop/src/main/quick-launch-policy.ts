@@ -121,6 +121,11 @@ export type QuickAddApproval = { readonly ok: true; readonly token: string; read
 export type QuickAddResult = { readonly ok: true; readonly target: ApprovedQuickTarget; readonly expectedRevision: number } | QuickLaunchFailure;
 export type QuickRunApproval = { readonly ok: true; readonly token: string; readonly expiresAt: number } | QuickLaunchFailure;
 export type QuickRunResult = { readonly ok: true; readonly outcome: AdapterLaunchOutcome } | QuickLaunchFailure;
+interface QuickRunGuard {
+  /** Trusted Main-only, after native consent and after target validation. */
+  consume(): Promise<boolean>;
+  current(): boolean;
+}
 
 const validId = (value: unknown): value is string => typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(value);
 const uint = (value: unknown): value is number => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
@@ -463,7 +468,7 @@ export class QuickLaunchPolicy {
 
   /** With a fresh authority lookup and target fingerprint revalidation, pass
    * precisely one locator to the fixed adapter. No arbitrary shell or args. */
-  async executeSavedRun(token: string, context: QuickLaunchContext): Promise<QuickRunResult> {
+  async executeSavedRun(token: string, context: QuickLaunchContext, guard?: QuickRunGuard): Promise<QuickRunResult> {
     const taken = this.take(token, 'RUN', context);
     if (!taken.ok) return taken;
     const { approval } = taken;
@@ -484,13 +489,14 @@ export class QuickLaunchPolicy {
       const finalSender = await this.authorize(context);
       if (finalSender) return finalSender;
       if (!this.current(approval)) return fail('APPROVAL_EXPIRED');
+      if (guard && (!guard.current() || await guard.consume() !== true)) return fail('APPROVAL_EXPIRED');
       const target = fresh.target;
       // Never automatically retry or terminate the user's program on timeout;
       // this race is for reporting ambiguous acceptance only.
       const result = await bounded<AdapterLaunchOutcome | 'cancelled'>(quickLaunchLimits.launchTimeoutMs, () => {
         // A queued document revocation/shutdown may have run between the
         // previous await and this adapter invocation's microtask.
-        if (!this.current(approval)) return 'cancelled';
+        if (!this.current(approval) || (guard && !guard.current())) return 'cancelled';
         return target.kind === 'WIN32_EXE' ? this.ports.launcher.launchExecutable(target.locator)
           : target.kind === 'FOLDER' ? this.ports.launcher.openFolder(target.locator) : this.ports.launcher.openHttps(target.locator);
       });
@@ -503,11 +509,11 @@ export class QuickLaunchPolicy {
   }
 
   /** One-click convenience for a saved action; token stays in Main. */
-  async launchSavedAction(actionId: string, context: QuickLaunchContext): Promise<QuickRunResult> {
+  async launchSavedAction(actionId: string, context: QuickLaunchContext, guard?: QuickRunGuard): Promise<QuickRunResult> {
     if (!validContext(context)) return fail('INVALID_REQUEST');
     context = copyContext(context);
     const prepared = await this.prepareSavedRun(actionId, context);
-    return prepared.ok ? this.executeSavedRun(prepared.token, context) : prepared;
+    return prepared.ok ? this.executeSavedRun(prepared.token, context, guard) : prepared;
   }
 
   /** Host calls on document destruction/reload, or service shutdown. */

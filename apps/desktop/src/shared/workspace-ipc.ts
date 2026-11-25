@@ -9,10 +9,13 @@ import {
   workspaceRecommendationPreferenceIntentSchema, workspaceClearHistoryIntentSchema,
 } from '@pet-desktop/contracts/workspace';
 import type { WorkspacePage, RoutineDefinition } from '@pet-desktop/contracts/workspace';
+import { quickActionProposalSchema } from '@pet-desktop/contracts/ai';
 
 const id = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u);
 const revision = z.number().int().min(0).max(Number.MAX_SAFE_INTEGER);
 const empty = z.strictObject({});
+const quickProposalScope = z.strictObject({ petId: id, proposalId: id });
+const quickProposalConsume = quickProposalScope.extend({ targetId: id, targetRevision: revision, expiresAt: revision.min(1) });
 const label = z.string().min(1).max(workspaceLimits.label).refine(value => value.trim().length > 0 && !/[/\\\u0000-\u001f\u007f-\u009f\p{Cf}]/u.test(value));
 const preview = z.string().min(1).max(260).refine(value => value.trim().length > 0 && !/[/\\\u0000-\u001f\u007f-\u009f\p{Cf}]/u.test(value));
 const intent = <M extends string, S extends z.ZodType>(method: M, payload: S) => z.strictObject({ method: z.literal(method), payload });
@@ -32,6 +35,7 @@ export type WorkspaceManagementIntent = z.infer<typeof workspaceManagementIntent
 const nativeIntents = [
   intent('action/select', workspaceNativeSelectIntentSchema), intent('action/add', workspaceFinalizeAddIntentSchema),
   intent('action/reapprove', workspaceReapproveIntentSchema), intent('action/run', workspaceRunActionIntentSchema),
+  intent('suggestion/run', quickProposalScope),
   intent('routine/run', workspaceRunRoutineIntentSchema), intent('routine/cancel', z.strictObject({ routineId: id })),
   // A presentation observation, not an impression fact: Main verifies the
   // visible current card IDs/revision and creates private impression IDs.
@@ -69,10 +73,11 @@ export type RoutineRunResult = z.infer<typeof routineRunResultSchema>;
 const success = <M extends string, S extends z.ZodType>(method: M, data: S) => z.strictObject({ requestId: id, method: z.literal(method), ok: z.literal(true), data });
 const managementMethods = ['workspace/list','action/metadata','action/revoke','action/delete','routine/create','routine/update','routine/delete',
   'recommendation/settings','recommendation/preference','history/clear'] as const;
-const resultMethods = [...managementMethods, 'action/select', 'action/add', 'action/reapprove', 'action/run', 'routine/run', 'routine/cancel', 'recommendation/seen'] as const;
+const resultMethods = [...managementMethods, 'action/select', 'action/add', 'action/reapprove', 'action/run', 'suggestion/run', 'routine/run', 'routine/cancel', 'recommendation/seen'] as const;
 const pageSuccess = z.strictObject({ requestId: id, method: z.enum([...managementMethods, 'action/add', 'action/reapprove', 'recommendation/seen']), ok: z.literal(true), data: workspacePageSchema });
 export const workspaceResultSchema = z.union([
   pageSuccess, success('action/select', workspaceSelectionSchema), success('action/run', workspaceRunActionResultSchema),
+  success('suggestion/run', workspaceRunActionResultSchema.extend(quickProposalScope.shape)),
   success('routine/run', routineRunResultSchema), success('routine/cancel', z.strictObject({ cancelled: z.boolean() })),
   z.strictObject({ requestId: id, method: z.enum(resultMethods), ok: z.literal(false), error: workspaceErrorSchema }),
 ]);
@@ -114,6 +119,8 @@ export function workspaceResultMatches(request: WorkspaceRequest, result: Worksp
   switch (result.method) {
     case 'action/select': return input.method === 'action/select' && result.data.kind === input.payload.kind;
     case 'action/run': return input.method === 'action/run' && result.data.targetId === input.payload.actionId;
+    case 'suggestion/run': return input.method === 'suggestion/run' && result.data.petId === input.payload.petId
+      && result.data.proposalId === input.payload.proposalId;
     case 'routine/run': return input.method === 'routine/run' && result.data.routineId === input.payload.routineId && result.data.routineRevision === input.payload.expectedRevision;
     case 'routine/cancel': return true;
     case 'recommendation/seen': return input.method === 'recommendation/seen' && result.data.revision === input.payload.expectedRevision;
@@ -151,16 +158,18 @@ export type ImpressionRecord = z.infer<typeof impressionRecordSchema>;
 export const workspaceAuthorityIntentSchema = z.discriminatedUnion('method', [
   intent('workspace/manage', z.strictObject({ intent: workspaceManagementIntentSchema })), intent('workspace/revision', empty),
   intent('action/lookup', z.strictObject({ actionId: id })), intent('routine/plan', z.strictObject({ routineId: id })),
+  intent('suggestion/lookup', quickProposalScope), intent('suggestion/consume', quickProposalConsume),
   intent('approved/add', approvedActionAddSchema), intent('approved/reapprove', approvedActionReapproveSchema),
   intent('launch/record', launchRecordSchema), intent('impression/record', impressionRecordSchema),
 ]);
 export type WorkspaceAuthorityIntent = z.infer<typeof workspaceAuthorityIntentSchema>;
 export const workspaceAuthorityRequestSchema = z.strictObject({ requestId: id, intent: workspaceAuthorityIntentSchema });
 export type WorkspaceAuthorityRequest = z.infer<typeof workspaceAuthorityRequestSchema>;
-const authorityMethods = ['workspace/manage','workspace/revision','action/lookup','routine/plan','approved/add','approved/reapprove','launch/record','impression/record'] as const;
+const authorityMethods = ['workspace/manage','workspace/revision','action/lookup','routine/plan','approved/add','approved/reapprove','launch/record','impression/record','suggestion/lookup','suggestion/consume'] as const;
 export const workspaceAuthorityResultSchema = z.union([
   z.strictObject({ requestId: id, method: z.enum(['workspace/manage','approved/add','approved/reapprove']), ok: z.literal(true), data: workspacePageSchema }),
   success('workspace/revision', revision), success('action/lookup', launchAuthorityActionSchema.nullable()),
+  success('suggestion/lookup', quickActionProposalSchema.nullable()), success('suggestion/consume', quickProposalConsume.nullable()),
   success('routine/plan', routineLaunchPlanSchema.nullable()), success('launch/record', z.strictObject({ recorded: z.boolean() })),
   success('impression/record', z.strictObject({ recorded: revision.max(workspaceLimits.impressionsPerDay) })),
   z.strictObject({ requestId: id, method: z.enum(authorityMethods), ok: z.literal(false), error: workspaceErrorSchema }),
@@ -171,6 +180,14 @@ export function workspaceAuthorityResultMatches(request: WorkspaceAuthorityReque
   if (request.requestId !== result.requestId || input.method !== result.method) return false;
   if (!result.ok) return true;
   if (result.method === 'action/lookup') return input.method === 'action/lookup' && (result.data === null || result.data.id === input.payload.actionId);
+  if (result.method === 'suggestion/lookup') return input.method === 'suggestion/lookup' && (result.data === null
+    || (result.data.petId === input.payload.petId && result.data.proposalId === input.payload.proposalId));
+  if (result.method === 'suggestion/consume') {
+    if (input.method !== 'suggestion/consume') return false;
+    const { data } = result, expected = input.payload;
+    return data === null || (data.petId === expected.petId && data.proposalId === expected.proposalId
+      && data.targetId === expected.targetId && data.targetRevision === expected.targetRevision && data.expiresAt === expected.expiresAt);
+  }
   if (result.method === 'routine/plan') return input.method === 'routine/plan' && (result.data === null || result.data.routine.id === input.payload.routineId);
   if (result.method === 'workspace/manage') return input.method === 'workspace/manage' && managementPageMatches(input.payload.intent, result.data);
   if (result.method === 'approved/add') return input.method === 'approved/add' && result.data.revision === input.payload.expectedRevision + 1

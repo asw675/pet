@@ -349,6 +349,31 @@ export class WorkspaceHost {
           await this.record({ targetId: actionId, actionRevision: expectedRevision, runId, source: 'MANUAL', outcome: resolved });
           return { requestId: request.requestId, method: 'action/run', ok: true, data: { runId, targetId: actionId, outcome: resolved } };
         }
+        case 'suggestion/run': {
+          const found = await this.request({ method: 'suggestion/lookup', payload: intent.payload }, undefined, sender);
+          if (!found?.ok || found.method !== 'suggestion/lookup') return fail(request, 'SERVICE_UNAVAILABLE');
+          const proposal = found.data;
+          if (!proposal || proposal.expiresAt <= this.now() || !await this.current(sender)) return fail(request, 'APPROVAL_EXPIRED');
+
+          const { targetId, targetRevision, expiresAt, petId, proposalId } = proposal;
+          const runId = this.createRunId();
+          if (!ID.test(runId)) return fail(request, 'SERVICE_UNAVAILABLE');
+          const monotonicExpiry = performance.now() + Math.max(0, expiresAt - this.now());
+          const current = () => this.boundCurrent(sender) && this.now() < expiresAt && performance.now() < monotonicExpiry;
+          const result = await this.policy.launchSavedAction(targetId, { sender, expectedRevision: targetRevision }, {
+            current,
+            consume: async () => {
+              if (!current() || !await this.current(sender)) return false;
+              const consumed = await this.request({ method: 'suggestion/consume',
+                payload: { petId, proposalId, targetId, targetRevision, expiresAt } }, undefined, sender);
+              return consumed?.ok === true && consumed.method === 'suggestion/consume' && consumed.data !== null;
+            },
+          });
+          if (!result.ok) return fail(request, result.code);
+          const resolved = outcome(result.outcome);
+          await this.record({ targetId, actionRevision: targetRevision, runId, source: 'SUGGESTION', outcome: resolved });
+          return { requestId: request.requestId, method: 'suggestion/run', ok: true, data: { runId, targetId, petId, proposalId, outcome: resolved } };
+        }
         case 'routine/run': {
           const result = await this.routines.run(intent.payload, sender);
           return result.ok ? { requestId: request.requestId, method: 'routine/run', ok: true, data: result.result }

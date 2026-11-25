@@ -162,7 +162,7 @@ describe('memory and action suggestions require explicit bounded user intent',()
     expect(canConfirmRest(proposal,'star',snapshot,1999)).toBe(true);
     expect(canConfirmRest(proposal,'star',snapshot,2000)).toBe(false);
     expect(canConfirmRest(proposal,'ranger',snapshot,1999)).toBe(false);
-    for(const edit of [{type:'TRIP_SUGGESTION' as const},{type:'QUICK_ACTION_SUGGESTION' as const},{targetId:'arbitrary'}])
+    for(const edit of [{type:'TRIP_SUGGESTION' as const},{type:'QUICK_ACTION_SUGGESTION' as const,targetRevision:0,targetLabel:'editor'},{targetId:'arbitrary'}])
       expect(canConfirmRest({...proposal,...edit},'star',snapshot,1999)).toBe(false);
     const offsite:AppSnapshot={...snapshot,pets:[{...star,presence:'AWAY',activity:null,trip:{tripId:'trip',routeId:'mist-forest',status:'TRAVELING',expectedReturnAt:5000}},ranger,nova]};
     expect(canConfirmRest(proposal,'star',offsite,1999)).toBe(false);

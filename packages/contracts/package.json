@@ -19,7 +19,9 @@
     "#characters": "./src/characters.ts",
     "#inventory": "./src/inventory.ts",
     "#travel": "./src/travel.ts",
-    "#events": "./src/events.ts"
+    "#events": "./src/events.ts",
+    "#workspace": "./src/workspace.ts",
+    "#proactive": "./src/proactive.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",

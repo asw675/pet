@@ -36,6 +36,11 @@ export interface HostPreferencesViewBridge {
   saveHostPreferences(edit: HostPreferenceSave): Promise<unknown>;
   exportBackup(): Promise<unknown>;
 }
+export interface BackupRestoreViewBridge {
+  restoreBackup(): Promise<unknown>;
+  getRestoreBackupStatus(): Promise<unknown>;
+  getPeriodicBackupStatus?(): Promise<unknown>;
+}
 const controlCenter = (raw: unknown): raw is Record<string, unknown> =>
   typeof raw === 'object' && raw !== null && (raw as Record<string, unknown>).role === 'control-center';
 function call(port: Record<string, unknown>, name: string, args: unknown[]): Promise<unknown> {
@@ -61,5 +66,14 @@ export function resolveHostPreferencesViewBridge(raw: unknown): HostPreferencesV
     getHostPreferences: () => call(raw, 'getHostPreferences', []),
     saveHostPreferences: edit => call(raw, 'saveHostPreferences', [edit]),
     exportBackup: () => call(raw, 'exportBackup', []),
+  };
+}
+
+export function resolveBackupRestoreViewBridge(raw: unknown): BackupRestoreViewBridge | null {
+  if (!controlCenter(raw) || typeof raw.restoreBackup !== 'function' || typeof raw.getRestoreBackupStatus !== 'function') return null;
+  return {
+    restoreBackup: () => call(raw, 'restoreBackup', []),
+    getRestoreBackupStatus: () => call(raw, 'getRestoreBackupStatus', []),
+    ...(typeof raw.getPeriodicBackupStatus === 'function' ? { getPeriodicBackupStatus: () => call(raw, 'getPeriodicBackupStatus', []) } : {}),
   };
 }

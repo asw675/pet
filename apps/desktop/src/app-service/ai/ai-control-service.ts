@@ -217,7 +217,7 @@ export class AiControlService {
           return success(request,{changed});
         }
         case 'chat/start':{
-          this.coordinator.cancelProactiveForPet(intent.payload.petId);
+          for (const petId of this.proactiveRequests.keys()) this.coordinator.cancelProactiveForPet(petId);
           const started=this.coordinator.start(intent.payload,event=>this.event(event));
           return started.accepted?success(request,cloneIdentity(started)):failure(request,started.error.code);
         }

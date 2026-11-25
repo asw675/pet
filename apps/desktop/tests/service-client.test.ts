@@ -92,6 +92,41 @@ describe('ServiceClient', () => {
   beforeEach(() => { vi.useFakeTimers(); });
   afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); });
 
+  it('restarts for restore only after observing writer exit and without using crash retries', () => {
+    const { client, current, spawn } = setup({ maxRestarts: 0 });
+    expect(client.restart()).toBe(false);
+    client.start();
+    const old = current();
+    old.bootstrap(4);
+    expect(client.restart()).toBe(true);
+    expect(client.getStatus()).toEqual({ stage: 'RESTARTING', generation: 1 });
+    expect(client.restart()).toBe(false);
+    expect(old.messages.at(-1)).toEqual({ kind: 'shutdown' });
+    old.message({ kind: 'stopped' });
+    expect(spawn).toHaveBeenCalledTimes(1);
+    old.exit(0);
+    expect(spawn).toHaveBeenCalledTimes(2);
+    current().bootstrap(1);
+    expect(client.getStatus()).toEqual({ stage: 'READY', generation: 2 });
+  });
+
+  it('forks a single explicitly requested recovery utility after startup failure and verified exit', () => {
+    const { client, current, spawn } = setup({ maxRestarts: 0 });
+    const source = 'selected-backup.sqlite3';
+    client.start();
+    const old = current();
+    old.message({ kind: 'fatal', code: 'STARTUP_FAILED' });
+    expect(client.getStatus().stage).toBe('UNAVAILABLE');
+    expect(client.recover(source)).toBe(false);
+    old.exit(1);
+    expect(client.recover(source)).toBe(true);
+    expect(client.recover(source)).toBe(false);
+    expect(spawn).toHaveBeenCalledTimes(2);
+    expect(spawn).toHaveBeenLastCalledWith(source);
+    current().bootstrap(1);
+    expect(client.getStatus()).toEqual({ stage: 'READY', generation: 2 });
+  });
+
   it('correlates a gallery query by ID and method before publishing its snapshot', async () => {
     const { client, current } = setup();
     const revisions: number[] = [];

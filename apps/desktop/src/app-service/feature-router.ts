@@ -14,6 +14,8 @@ import type { WorkspaceControl } from './workspace/workspace-control';
 import { workspaceAuthorityResultSchema,workspaceAuthorityResultMatches } from '../shared/workspace-ipc';
 import type {VoiceSettingsService} from './voice/voice-settings-service';
 import {voiceSettingsResultSchema,voiceSettingsResultMatchesRequest} from '../shared/voice-settings-ipc';
+import { proactiveFailure, proactiveResultMatches } from '../shared/proactive-ipc';
+import type { ProactiveCompanion } from './ai/proactive-companion';
 
 /** Utility-side pending credential lookups. Never directly read the OS vault
  * or keep a secret after resolving this bounded, exact job request. */
@@ -47,7 +49,9 @@ export interface UtilityFeatures {
 /** Same utility process as the SQLite writer. Async provider completions are
  * awaited outside transactions, then authority performs short CAS writes. */
 export function createUtilityFeatureRouter(options:{ai:Pick<AiControlService,'handleRequest'|'cancelInternal'|'close'>;
-  voice:Pick<VoiceService,'handle'|'dispose'>;voiceSettings:Pick<VoiceSettingsService,'handle'|'dispose'>;workspace:Pick<WorkspaceControl,'handleAuthority'>;host?: (request: HostAuthorityRequest) => HostAuthorityResult;broker:UtilityCredentialBroker;send:(value:FeatureOutput)=>void;fault:()=>void}):UtilityFeatures {
+  voice:Pick<VoiceService,'handle'|'dispose'>;voiceSettings:Pick<VoiceSettingsService,'handle'|'dispose'>;workspace:Pick<WorkspaceControl,'handleAuthority'>;host?: (request: HostAuthorityRequest) => HostAuthorityResult;
+  proactive?: Pick<ProactiveCompanion, 'updateHost' | 'handle' | 'close'>;
+  broker:UtilityCredentialBroker;send:(value:FeatureOutput)=>void;fault:()=>void}):UtilityFeatures {
   let closed=false;
   const send=(message:FeatureOutput)=>{if(!closed)options.send(featureOutputSchema.parse(message));};
   return{
@@ -55,6 +59,15 @@ export function createUtilityFeatureRouter(options:{ai:Pick<AiControlService,'ha
       if(closed)return;
       const input=featureInputSchema.parse(raw);
       switch(input.kind){
+        case 'proactive-host':
+          options.proactive?.updateHost(input.context.petId);
+          break;
+        case 'proactive-request': {
+          const result = options.proactive?.handle(input.request) ?? proactiveFailure(input.request);
+          if (!proactiveResultMatches(input.request, result)) { options.fault(); return; }
+          send({ kind: 'proactive-result', result });
+          break;
+        }
         case 'host-authority-request':
           send({ kind: 'host-authority-result', requestId: input.requestId,
             result: options.host?.(input.request) ?? hostAuthorityFailure(input.request) });
@@ -96,6 +109,11 @@ export function createUtilityFeatureRouter(options:{ai:Pick<AiControlService,'ha
         }
       }
     },
-    close(){if(closed)return;closed=true;options.broker.close();try{options.ai.close();}finally{try{options.voiceSettings.dispose();}finally{options.voice.dispose();}}},
+    close(){
+      if(closed)return;closed=true;options.broker.close();
+      // Stop unsolicited display before closing the model and writer.
+      options.proactive?.close();
+      try{options.ai.close();}finally{try{options.voiceSettings.dispose();}finally{options.voice.dispose();}}
+    },
   };
 }

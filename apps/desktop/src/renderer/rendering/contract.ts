@@ -1,4 +1,4 @@
-import type { ResolvedPack } from '../asset-packs/resolve-pack';
+import type { ResolvedPack } from '../../shared/resolve-character-pack';
 
 /** A renderer-only profile; CSS coordinates stay independent of resolution. */
 export interface RenderProfile {

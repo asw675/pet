@@ -290,8 +290,7 @@ export interface RetrieveAuthorizedMemoryInput {
   readonly query: string;
   readonly now: number;
   readonly existingPetIds: readonly string[];
-  /** Current authority records, with revoked/deleted grants already absent.
-   * A future FTS index is only a candidate source, never an authorization. */
+  /** Current authorized candidates; the search source is not authorization. */
   readonly records: readonly MemoryRecord[];
   readonly lookupSource: MemorySourceLookup;
   readonly limit?: number;
@@ -324,6 +323,20 @@ function lexicalQuery(query: string): LexicalQuery {
   const compact = canonical(normalized);
   return { han, words: usefulWords, phrase: han.size > 0 && compact.length <= 64 ? compact : null };
 }
+
+/** FTS5 trigram needs at least three Unicode code points. The repository
+ * binds these programs' terms, never raw user text or MATCH operators. */
+export function memorySearchTerms(query: string): { long: string[]; short: string[] } {
+  const { han, words, phrase } = lexicalQuery(query);
+  const terms = new Set([...(phrase === null ? [] : [phrase]), ...han.keys(), ...words]);
+  const long: string[] = [], short: string[] = [];
+  for (const term of terms) {
+    const length = Array.from(term).length;
+    if (length >= 3 && length <= 80 && long.length < 32) long.push(term);
+    if (length > 0 && length < 3 && short.length < 16) short.push(term);
+  }
+  return { long, short };
+}
 function lexicalScore(query: LexicalQuery, summary: string): number {
   const compact = canonical(summary);
   const summaryWords = new Set(words(summary));
@@ -338,7 +351,7 @@ const byId = (a: string, b: string): number => a < b ? -1 : a > b ? 1 : 0;
 
 /** Authorize BEFORE parsing/scoring summaries or looking up their raw sources.
  * Never expose another pet's source message, recipient list, source conversation
- * or unconfirmed draft. This is bounded lexical ranking, not FTS/embeddings. */
+ * or unconfirmed draft. Ranking uses only the already scoped records. */
 export function retrieveAuthorizedMemories(input: RetrieveAuthorizedMemoryInput): AuthorizedMemoryContext[] {
   const { recipientPetId, query, now, records, lookupSource } = input;
   const existing = petIds(input.existingPetIds), limit = input.limit ?? aiLimits.authorizedMemories;

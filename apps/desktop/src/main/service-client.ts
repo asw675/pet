@@ -11,6 +11,8 @@ import type { AiCancelReason,ChatStreamEvent } from '@pet-desktop/contracts/ai';
 import type { VoiceOwnedJob,VoiceServiceRequest,VoiceServiceResult } from '../shared/voice-ipc';
 import type { WorkspaceAuthorityRequest,WorkspaceAuthorityResult } from '../shared/workspace-ipc';
 import type {VoiceSettingsRequest,VoiceSettingsResult} from '../shared/voice-settings-ipc';
+import { proactiveFailure } from '../shared/proactive-ipc';
+import type { ProactiveNoticeReady, ProactiveRequest, ProactiveResult } from '../shared/proactive-ipc';
 
 /** Narrow adapter over Electron UtilityProcess; no Electron APIs needed in tests. */
 export interface ServiceChild {
@@ -21,7 +23,7 @@ export interface ServiceChild {
 }
 
 export interface ServiceClientOptions {
-  spawn: () => ServiceChild;
+  spawn: (recoverySource?: string) => ServiceChild;
   requestTimeoutMs?: number;
   startupTimeoutMs?: number;
   shutdownTimeoutMs?: number;
@@ -74,7 +76,7 @@ function duration(value: number | undefined, fallback: number): number {
 /** Main's only app-service connection. A closing session retains ownership until
  * the actual child exit event, even if shutdown acknowledgement or kill arrives. */
 export class ServiceClient {
-  private readonly spawn: () => ServiceChild;
+  private readonly spawn: ServiceClientOptions['spawn'];
   private readonly requestTimeoutMs: number;
   private readonly startupTimeoutMs: number;
   private readonly shutdownTimeoutMs: number;
@@ -83,6 +85,7 @@ export class ServiceClient {
   private readonly snapshotListeners = new Set<SnapshotListener>();
   private readonly statusListeners = new Set<StatusListener>();
   private readonly chatListeners = new Set<(event:ChatStreamEvent)=>void>();
+  private readonly proactiveListeners = new Set<(event: ProactiveNoticeReady) => void>();
   private readonly credential: ServiceClientOptions['credential'];
   private status: ServiceStatus = { stage: 'UNAVAILABLE', generation: 0 };
   private current: Session | undefined;
@@ -91,6 +94,7 @@ export class ServiceClient {
   private started = false;
   private spawning = false;
   private stopping = false;
+  private restartAfterExit = false;
   private stopPromise: Promise<void> | undefined;
   private resolveStop: (() => void) | undefined;
 
@@ -125,6 +129,18 @@ export class ServiceClient {
   }
 
   subscribeChat(listener:(event:ChatStreamEvent)=>void):()=>void{this.chatListeners.add(listener);return()=>{this.chatListeners.delete(listener);};}
+  subscribeProactive(listener: (event: ProactiveNoticeReady) => void): () => void {
+    this.proactiveListeners.add(listener);
+    return () => { this.proactiveListeners.delete(listener); };
+  }
+  setProactiveHost(petId: string | null): void {
+    if (this.current?.phase === 'online' && !this.stopping) this.current.features?.setProactiveHost(petId);
+  }
+  requestProactive(request: ProactiveRequest): Promise<ProactiveResult> {
+    const session = this.current;
+    if (session?.phase !== 'online' || this.stopping || !session.features) return Promise.resolve(proactiveFailure(request));
+    return session.features.requestProactive(request);
+  }
   requestAi(request:AiRequest):Promise<AiResult>{
     const session=this.current;
     if(!session||session.phase!=='online'||this.stopping||!session.features)return Promise.resolve({ok:false,requestId:request.requestId,method:request.intent.method,error:{code:'UNAVAILABLE',message:'AI 服务暂不可用。',retryable:true}});
@@ -185,6 +201,25 @@ export class ServiceClient {
     });
   }
 
+  /** Deliberate maintenance restart. A replacement still requires the
+   * current process's exit event and does not spend the crash retry budget. */
+  restart(): boolean {
+    const session = this.current;
+    if (this.stopping || session?.phase !== 'online') return false;
+    this.restartAfterExit = true;
+    this.setStatus('RESTARTING');
+    this.closeSession(session);
+    return true;
+  }
+
+  /** A failed startup may leave no authority to receive a restore request.
+   * Recovery still uses the utility entry and requires confirmed writer exit. */
+  recover(source: string): boolean {
+    if (!this.started || this.stopping || this.spawning || this.current || this.restartTimer || this.status.stage !== 'UNAVAILABLE') return false;
+    this.spawnNext(source);
+    return true;
+  }
+
   stop(): Promise<void> {
     if (this.stopPromise) return this.stopPromise;
     this.stopPromise = new Promise<void>((resolve) => { this.resolveStop = resolve; });
@@ -214,7 +249,7 @@ export class ServiceClient {
     }
   }
 
-  private spawnNext(): void {
+  private spawnNext(recoverySource?: string): void {
     if (this.current || this.spawning || this.stopping) return;
     const generation = this.status.generation + 1;
     this.setStatus(generation === 1 ? 'STARTING' : 'RESTARTING', generation);
@@ -223,7 +258,7 @@ export class ServiceClient {
     this.spawning = true;
     let child: ServiceChild;
     try {
-      child = this.spawn();
+      child = recoverySource ? this.spawn(recoverySource) : this.spawn();
     } catch {
       this.spawning = false;
       if (this.stopping) this.finishStop();
@@ -238,9 +273,12 @@ export class ServiceClient {
     };
     session.features=new FeatureClient({post:message=>this.post(session,message),onChat:event=>{
       if(this.current===session&&session.phase==='online')for(const listener of [...this.chatListeners])try{listener(event);}catch{/* isolated */}
+    },onProactive:event=>{
+      if(this.current===session&&session.phase==='online')for(const listener of [...this.proactiveListeners])try{listener(event);}catch{/* isolated */}
     },...(this.credential?{credential:this.credential}:{}),fault:()=>this.failSession(session)});
     this.current = session;
-    session.startupTimer = setTimeout(() => { this.failSession(session); }, this.startupTimeoutMs);
+    const timeout = recoverySource ? Math.max(this.startupTimeoutMs, 180_000) : this.startupTimeoutMs;
+    session.startupTimer = setTimeout(() => { this.failSession(session); }, timeout);
     child.on('exit', () => { this.onExit(session); });
     child.on('message', (message) => { this.onMessage(session, message); });
     if (this.stopping) this.closeSession(session);
@@ -285,6 +323,8 @@ export class ServiceClient {
         this.publishSnapshot(session, message.snapshot);
         break;
       case 'ai-result':case 'voice-result':case 'chat-event':case 'credential-lookup':case 'workspace-authority-result':case 'voice-settings-result':case 'host-authority-result':
+      case 'proactive-result':
+      case 'proactive-ready':
         if(session.phase==='online')session.features?.receive(message);
         break;
       case 'fatal':
@@ -374,6 +414,10 @@ export class ServiceClient {
     session.features?.close();
     this.current = undefined;
     if (this.stopping) this.finishStop();
+    else if (this.restartAfterExit) {
+      this.restartAfterExit = false;
+      this.spawnNext();
+    }
     else this.scheduleRestart();
   }
 

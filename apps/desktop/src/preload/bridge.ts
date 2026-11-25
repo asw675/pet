@@ -7,6 +7,8 @@ import type {
   IpcResult, SnapshotIpcResult, InventoryIpcResult, TravelCatalogIpcResult, TravelPreviewIpcResult, TravelReportsIpcResult, EventsIpcResult,
 } from '@pet-desktop/contracts';
 import type { EventListQuery } from '@pet-desktop/contracts/events';
+import { characterPackChangedSchema, characterPackRequestSchema, characterPackResultMatches, characterPackResultSchema } from '../shared/character-pack-ipc';
+import type { CharacterPackChanged, CharacterPackResult } from '../shared/character-pack-ipc';
 import { chatStreamEventSchema } from '@pet-desktop/contracts/ai';
 import { aiIntentSchema,aiResultMatches,aiResultSchema,credentialSaveSchema,credentialRevokeSchema } from '../shared/ai-ipc';
 import type { AiIntent,AiRequest,AiResult,CredentialSave,CredentialRevoke } from '../shared/ai-ipc';
@@ -18,6 +20,10 @@ import {voiceSettingsRequestSchema,voiceSettingsResultSchema,voiceSettingsResult
 import type {VoiceSettingsRequest,VoiceSettingsResult} from '../shared/voice-settings-ipc';
 import {workspaceIntentSchema,workspaceResultSchema,workspaceResultMatches} from '../shared/workspace-ipc';
 import type {WorkspaceIntent,WorkspaceRequest,WorkspaceResult} from '../shared/workspace-ipc';
+import {
+  proactiveDesktopBubbleSchema, proactiveFailure, proactiveIntentSchema, proactiveNoticeReadySchema, proactiveResultMatches, proactiveResultSchema,
+} from '../shared/proactive-ipc';
+import type { ProactiveDesktopBubble, ProactiveIntent, ProactiveNoticeReady, ProactiveRequest, ProactiveResult } from '../shared/proactive-ipc';
 import type { TripPreparationPayload, TravelReportsQuery } from '@pet-desktop/contracts/travel';
 import {
   DESKTOP_IPC, hostActionResultSchema, petVisualReadySchema, serviceStatusSchema,
@@ -28,22 +34,25 @@ import type {
 
 import {
   backupViewResultSchema, hostPreferencesViewResultSchema, hostRendererRequestSchema, hostRenderPreferencesSchema, hostSettingsResultSchema,
+  periodicBackupStatusSchema, restoreBackupResultSchema, restoreBackupStatusSchema,
 } from '../shared/host-settings-ipc';
 import type { HostPreferenceSave, HostRenderPreferences } from '../shared/host-settings-ipc';
 
-type InvokeChannel = typeof DESKTOP_IPC.hostRequest | typeof DESKTOP_IPC.request | typeof DESKTOP_IPC.getStatus
+type InvokeChannel = typeof DESKTOP_IPC.characterPackRequest | typeof DESKTOP_IPC.hostRequest | typeof DESKTOP_IPC.request | typeof DESKTOP_IPC.getStatus
   | typeof DESKTOP_IPC.openControlCenter | typeof DESKTOP_IPC.petInteractive
   | typeof DESKTOP_IPC.petVisualReady | typeof DESKTOP_IPC.aiRequest | typeof DESKTOP_IPC.credentialSave | typeof DESKTOP_IPC.credentialRevoke
   | typeof DESKTOP_IPC.voiceRequest | typeof DESKTOP_IPC.micAuthorize | typeof DESKTOP_IPC.micRequest | typeof DESKTOP_IPC.micRevoke
+  | typeof DESKTOP_IPC.proactiveRequest
   | typeof DESKTOP_IPC.voiceChatCancel | typeof DESKTOP_IPC.voiceMouth | typeof DESKTOP_IPC.voiceSettingsRequest | typeof DESKTOP_IPC.workspaceRequest;
-type PushChannel = typeof DESKTOP_IPC.hostRenderPreferences | typeof DESKTOP_IPC.snapshot | typeof DESKTOP_IPC.status | typeof DESKTOP_IPC.chatEvent | typeof DESKTOP_IPC.voiceMouth | typeof DESKTOP_IPC.voiceSuspend;
+type PushChannel = typeof DESKTOP_IPC.hostRenderPreferences | typeof DESKTOP_IPC.snapshot | typeof DESKTOP_IPC.status | typeof DESKTOP_IPC.chatEvent | typeof DESKTOP_IPC.voiceMouth | typeof DESKTOP_IPC.voiceSuspend
+  | typeof DESKTOP_IPC.proactiveNotice | typeof DESKTOP_IPC.proactiveBubble;
 type PushListener = (event: unknown, ...args: unknown[]) => void;
 
 /** Internal transport seam; only the explicit bridge below crosses contextBridge. */
 export interface DesktopIpcPort {
   invoke(channel: InvokeChannel, ...args: unknown[]): Promise<unknown>;
-  on(channel: PushChannel, listener: PushListener): unknown;
-  removeListener(channel: PushChannel, listener: PushListener): unknown;
+  on(channel: PushChannel | typeof DESKTOP_IPC.characterPackChanged, listener: PushListener): unknown;
+  removeListener(channel: PushChannel | typeof DESKTOP_IPC.characterPackChanged, listener: PushListener): unknown;
 }
 
 type Parser<T> = {
@@ -86,7 +95,7 @@ function failure(requestId: string, code: IpcErrorCode, retryable: boolean): Ext
 }
 
 /** Each subscription owns its own wrapper and can be disposed independently. */
-function subscribe<T>(ipc: DesktopIpcPort, channel: PushChannel, schema: Parser<T>,
+function subscribe<T>(ipc: DesktopIpcPort, channel: PushChannel | typeof DESKTOP_IPC.characterPackChanged, schema: Parser<T>,
   listener: (value: T) => void): () => void {
   if (typeof listener !== 'function') throw new TypeError('A listener function is required.');
   let notify: ((value: T) => void) | undefined = listener;
@@ -231,13 +240,28 @@ const unavailableSetting = { ok: false, code: 'SERVICE_UNAVAILABLE', settings: n
 const invalidPreference = { ok: false, code: 'INVALID_REQUEST' } as const;
 const unavailablePreference = { ok: false, code: 'SERVICE_UNAVAILABLE' } as const;
 
+async function characterPackRequest(ipc: DesktopIpcPort, input: unknown): Promise<CharacterPackResult> {
+  const request = parse(characterPackRequestSchema, input);
+  if (!request) return { ok: false, code: 'INVALID_REQUEST' };
+  try {
+    const result = parse(characterPackResultSchema, await ipc.invoke(DESKTOP_IPC.characterPackRequest, request));
+    if (result && characterPackResultMatches(request, result)) return result;
+  } catch { /* An untrusted reply must not be exposed as pack data. */ }
+  return { ok: false, code: 'STORAGE_ERROR' };
+}
+
 export function createPetBridge(ipc: DesktopIpcPort, requestId = newRequestId): PetDesktopBridge {
   return Object.freeze({
     role: 'pet',
     ...baseBridge(ipc, requestId),
+    readCharacterPack: (characterId: string) => characterPackRequest(ipc, { kind: 'read', characterId }),
+    subscribeCharacterPackChanged: (listener: (change: CharacterPackChanged) => void) =>
+      subscribe(ipc, DESKTOP_IPC.characterPackChanged, characterPackChangedSchema, listener),
     subscribeHostRenderPreferences: (listener: (value: HostRenderPreferences) => void) =>
       subscribe(ipc, DESKTOP_IPC.hostRenderPreferences, hostRenderPreferencesSchema, listener),
     subscribeVoiceMouth:(listener:(event:VoiceMouthNotification)=>void)=>subscribe(ipc,DESKTOP_IPC.voiceMouth,voiceMouthNotificationSchema,listener),
+    subscribeProactiveBubble: (listener: (bubble: ProactiveDesktopBubble) => void) =>
+      subscribe(ipc, DESKTOP_IPC.proactiveBubble, proactiveDesktopBubbleSchema, listener),
     async setInteractive(interactive: boolean): Promise<HostActionResult> {
       if (typeof interactive !== 'boolean') return { ok: false, code: 'INVALID_REQUEST' };
       return hostAction(ipc, DESKTOP_IPC.petInteractive, interactive);
@@ -253,12 +277,21 @@ export function createPetBridge(ipc: DesktopIpcPort, requestId = newRequestId): 
 export function createControlCenterBridge(ipc: DesktopIpcPort, requestId = newRequestId): ControlCenterBridge {
   return Object.freeze({
     role: 'control-center',
+    listCharacterPacks: () => characterPackRequest(ipc, { kind: 'list' }),
+    importCharacterPack: () => characterPackRequest(ipc, { kind: 'import' }),
+    activateCharacterPack: (change: CharacterPackChanged) => {
+      const parsed = parse(characterPackChangedSchema, change);
+      return characterPackRequest(ipc, parsed ? { ...parsed, kind: 'activate' } : undefined);
+    },
     getHostSettings: () => hostRequest(ipc, { kind: 'settings' }, hostSettingsResultSchema, invalidSetting, unavailableSetting),
     setHostShortcutEnabled: (enabled: boolean) => hostRequest(ipc, { kind: 'shortcuts', enabled }, hostSettingsResultSchema, invalidSetting, unavailableSetting),
     setLoginStart: (enabled: boolean) => hostRequest(ipc, { kind: 'login', enabled }, hostSettingsResultSchema, invalidSetting, unavailableSetting),
     getHostPreferences: () => hostRequest(ipc, { kind: 'preferences' }, hostPreferencesViewResultSchema, invalidPreference, unavailablePreference),
     saveHostPreferences: (payload: HostPreferenceSave) => hostRequest(ipc, { kind: 'save', edit: payload }, hostPreferencesViewResultSchema, invalidPreference, unavailablePreference),
     exportBackup: () => hostRequest(ipc, { kind: 'backup' }, backupViewResultSchema, invalidPreference, unavailablePreference),
+    restoreBackup: () => hostRequest(ipc, { kind: 'restore-backup' }, restoreBackupResultSchema, invalidPreference, unavailablePreference),
+    getRestoreBackupStatus: () => hostRequest(ipc, { kind: 'restore-status' }, restoreBackupStatusSchema, invalidPreference, unavailablePreference),
+    getPeriodicBackupStatus: () => hostRequest(ipc, { kind: 'periodic-backup-status' }, periodicBackupStatusSchema, invalidPreference, unavailablePreference),
     ...baseBridge(ipc, requestId),
     listGallery: (query: GalleryQuery) => sendRequest(ipc, requestId, 'gallery/list', query),
     async listCharacters(...args: unknown[]): Promise<CharactersIpcResult> {
@@ -291,6 +324,18 @@ export function createControlCenterBridge(ipc: DesktopIpcPort, requestId = newRe
       }catch{return fail('UNAVAILABLE',intent.method);}
     },
     subscribeChatEvents:(listener:(event:ChatStreamEvent)=>void)=>subscribe(ipc,DESKTOP_IPC.chatEvent,chatStreamEventSchema,listener),
+    async proactiveRequest(raw: ProactiveIntent): Promise<ProactiveResult> {
+      const id = requestId(), intent = parse(proactiveIntentSchema, raw);
+      if (!intent) return proactiveFailure({ requestId: id, intent: { method: 'settings/get' } }, 'INVALID_REQUEST');
+      const request: ProactiveRequest = { requestId: id, intent };
+      try {
+        const result = parse(proactiveResultSchema, await ipc.invoke(DESKTOP_IPC.proactiveRequest, request));
+        if (result && proactiveResultMatches(request, result)) return result;
+      } catch { /* reader waits for the next explicit refresh */ }
+      return proactiveFailure(request);
+    },
+    subscribeProactiveNotices: (listener: (event: ProactiveNoticeReady) => void) =>
+      subscribe(ipc, DESKTOP_IPC.proactiveNotice, proactiveNoticeReadySchema, listener),
     async saveProviderCredential(payload:CredentialSave):Promise<HostActionResult>{const value=parse(credentialSaveSchema,payload);return value?hostAction(ipc,DESKTOP_IPC.credentialSave,value):{ok:false,code:'INVALID_REQUEST'};},
     async revokeProviderCredential(payload:CredentialRevoke):Promise<HostActionResult>{const value=parse(credentialRevokeSchema,payload);return value?hostAction(ipc,DESKTOP_IPC.credentialRevoke,value):{ok:false,code:'INVALID_REQUEST'};},
     async voiceRequest(raw:VoiceServiceRequest):Promise<VoiceServiceResult>{

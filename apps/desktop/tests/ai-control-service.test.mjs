@@ -1,7 +1,7 @@
 import { DatabaseSync } from 'node:sqlite';
 import { describe,expect,it,vi } from 'vitest';
 import { AiAuthorityService } from '../../../packages/app-service/src/ai-authority-service.ts';
-import { AI_STATE_MIGRATION_SQL,AiStateStorage } from '../../../packages/app-service/src/ai-state-storage.ts';
+import { AI_MEMORY_FTS_MIGRATION_SQL, AI_STATE_MIGRATION_SQL,AiStateStorage } from '../../../packages/app-service/src/ai-state-storage.ts';
 import { AiControlService } from '../src/app-service/ai/ai-control-service';
 import { aiRequestSchema,aiResultMatches,aiResultSchema } from '../src/shared/ai-ipc';
 import { chatStreamEventSchema } from '@pet-desktop/contracts/ai';
@@ -28,6 +28,7 @@ async function fixture(run,{fetch:fetcher,broker,authorityOverride,authorizeProa
   try{
     db.exec("PRAGMA foreign_keys=ON; CREATE TABLE pets(pet_id TEXT PRIMARY KEY) STRICT; INSERT INTO pets VALUES('pet-1'),('pet-2'); CREATE TABLE wallet(coins INTEGER); INSERT INTO wallet VALUES(21);");
     db.exec(AI_STATE_MIGRATION_SQL);
+    db.exec(AI_MEMORY_FTS_MIGRATION_SQL);
     let active=false,serial=0,invoke=0,clock=NOW;
     const game={snapshot};const transaction=fn=>{
       expect(active).toBe(false);active=true;db.exec('BEGIN IMMEDIATE');

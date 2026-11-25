@@ -27,6 +27,16 @@ export const proactiveResultSchema=z.union([
 export type ProactiveResult=z.infer<typeof proactiveResultSchema>;
 export const proactiveNoticeReadySchema=z.strictObject({kind:z.literal('notice-ready'),notice:proactiveNoticeSchema.refine(value=>value.deliveryStatus==='READY')});
 export type ProactiveNoticeReady=z.infer<typeof proactiveNoticeReadySchema>;
+export const PROACTIVE_PULSE_MS = 15_000;
+export const proactiveHostSchema = z.strictObject({ petId: idSchema.nullable() });
+export const proactiveDesktopBubbleSchema = z.strictObject({ petId: idSchema, text: z.string().min(1).max(proactiveLimits.noticeText) }).nullable();
+export type ProactiveDesktopBubble = z.infer<typeof proactiveDesktopBubbleSchema>;
+export function proactiveFailure(request: { requestId: string; intent: { method: ProactiveIntent['method'] } }, code: ProactiveErrorCode = 'UNAVAILABLE'): ProactiveResult {
+  return {
+    ok: false, requestId: request.requestId, method: request.intent.method,
+    error: { code, message: code === 'CONFLICT' ? '设置已更新，请重新读取。' : '主动陪伴操作未完成。', retryable: code !== 'INVALID_REQUEST' },
+  };
+}
 export function proactiveResultMatches(request:ProactiveRequest,result:ProactiveResult):boolean{
   if(request.requestId!==result.requestId||request.intent.method!==result.method)return false;
   if(!result.ok)return true;

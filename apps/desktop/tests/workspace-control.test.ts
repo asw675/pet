@@ -33,7 +33,7 @@ function setup() {
     const request = workspaceRequestSchema.parse({ requestId: `manage-${++sequence}`, intent });
     const result = workspaceResultSchema.parse(control.handleIntent(request));
     expect(workspaceResultMatches(request, result)).toBe(true);
-    if (!result.ok || result.method === 'action/select' || result.method === 'action/run' || result.method === 'routine/run' || result.method === 'routine/cancel') throw new Error('expected management page');
+    if (!result.ok || !('revision' in result.data)) throw new Error('expected management page');
     return result.data;
   }
   function add(target: ApprovedQuickTarget, label: string, recommendable = true): string {

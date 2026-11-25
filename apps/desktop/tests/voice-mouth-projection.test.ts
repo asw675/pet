@@ -1,7 +1,7 @@
 import { inflateSync } from 'node:zlib';
 import { describe, expect, it, beforeAll } from 'vitest';
 import { loadBuiltinPack } from '../src/renderer/asset-packs/builtin-registry';
-import type { ResolvedPack } from '../src/renderer/asset-packs/resolve-pack';
+import type { ResolvedPack } from '../src/shared/resolve-character-pack';
 import { authoredMouthPatch } from '../src/renderer/rendering/authored-mouth';
 import { VoiceMouthProjection, MOUTH_STALE_MS } from '../src/renderer/rendering/voice-mouth-projection';
 import type { VoiceOwnedJob } from '../src/shared/voice-ipc';

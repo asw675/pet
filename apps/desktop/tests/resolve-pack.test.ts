@@ -1,8 +1,8 @@
 import { createHash } from 'node:crypto';
 import { deflateSync } from 'node:zlib';
 import { describe, expect, it, vi } from 'vitest';
-import { resolvePack } from '../src/renderer/asset-packs/resolve-pack';
-import type { PackSource, ResolvePackOptions } from '../src/renderer/asset-packs/resolve-pack';
+import { resolvePack } from '../src/shared/resolve-character-pack';
+import type { PackSource, ResolvePackOptions } from '../src/shared/resolve-character-pack';
 
 const thumbnailPath = 'assets/thumbnail.png';
 const atlasPath = 'assets/atlas.json';

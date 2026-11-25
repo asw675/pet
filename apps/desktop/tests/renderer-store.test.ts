@@ -49,6 +49,9 @@ function testBridge() {
   const listTravelReports = vi.fn<ControlCenterBridge['listTravelReports']>();
   const listEvents = vi.fn<ControlCenterBridge['listEvents']>();
   const bridge: ControlCenterBridge = {
+    listCharacterPacks: vi.fn<ControlCenterBridge['listCharacterPacks']>(),
+    importCharacterPack: vi.fn<ControlCenterBridge['importCharacterPack']>(),
+    activateCharacterPack: vi.fn<ControlCenterBridge['activateCharacterPack']>(),
     listActiveTravel: vi.fn<ControlCenterBridge['listActiveTravel']>(),
     getHostSettings: vi.fn<ControlCenterBridge['getHostSettings']>(),
     setHostShortcutEnabled: vi.fn<ControlCenterBridge['setHostShortcutEnabled']>(),
@@ -56,9 +59,13 @@ function testBridge() {
     getHostPreferences: vi.fn<ControlCenterBridge['getHostPreferences']>(),
     saveHostPreferences: vi.fn<ControlCenterBridge['saveHostPreferences']>(),
     exportBackup: vi.fn<ControlCenterBridge['exportBackup']>(),
+    restoreBackup: vi.fn<ControlCenterBridge['restoreBackup']>(),
+    getRestoreBackupStatus: vi.fn<ControlCenterBridge['getRestoreBackupStatus']>(),
+    getPeriodicBackupStatus: vi.fn<ControlCenterBridge['getPeriodicBackupStatus']>(),
     role: 'control-center', getServiceStatus, getSnapshot, dispatch, listGallery, listCharacters, listInventory,
     listTravelCatalog, previewTravel, listTravelReports, listEvents,
     aiRequest:vi.fn<ControlCenterBridge['aiRequest']>(),subscribeChatEvents:()=>()=>undefined,
+    proactiveRequest: vi.fn<ControlCenterBridge['proactiveRequest']>(), subscribeProactiveNotices: () => () => undefined,
     saveProviderCredential:vi.fn<ControlCenterBridge['saveProviderCredential']>(),revokeProviderCredential:vi.fn<ControlCenterBridge['revokeProviderCredential']>(),
     voiceRequest:vi.fn<ControlCenterBridge['voiceRequest']>(),authorizeMicrophone:vi.fn<ControlCenterBridge['authorizeMicrophone']>(),
     voiceSettingsRequest:vi.fn<ControlCenterBridge['voiceSettingsRequest']>(),workspaceRequest:vi.fn<ControlCenterBridge['workspaceRequest']>(),

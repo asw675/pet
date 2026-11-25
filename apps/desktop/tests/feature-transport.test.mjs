@@ -8,6 +8,7 @@ import { FeatureClient } from '../src/main/feature-client.ts';
 import { startUtilityTransport } from '../src/app-service/transport.ts';
 import { openPersistentService } from '../src/app-service/database.ts';
 import { UtilityCredentialBroker } from '../src/app-service/feature-router.ts';
+import { SCHEMA_VERSION } from '@pet-desktop/app-service';
 
 const config={providerId:'mock-one',endpointKind:'MOCK',privacyBoundary:'MOCK',baseUrl:null,modelId:'mock',credentialRef:null,
   capabilities:{streamText:true,nativeStructured:false,jsonMode:false,usage:false,embeddings:false},maxContextTokens:8000,maxOutputTokens:400,timeoutMs:30000};
@@ -23,6 +24,77 @@ function inProcessChild(path,resources){
   return child;
 }
 describe('feature transport over the single durable utility writer',()=>{
+  it('schedules an opted-in greeting from a committed return, honors quiet hours, and does not redeliver after restart', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pet-proactive-transport-'));
+    const path = join(dir, 'test.sqlite3');
+    const startedAt = Date.UTC(2026, 7, 20, 10);
+    const create = () => new ServiceClient({ spawn: () => inProcessChild(path, dir), startupTimeoutMs: 5000, maxRestarts: 0 });
+    let client;
+    const send = (id, method, payload) => client.requestProactive(request(id, method, payload));
+    const snapshot = id => client.request({ schemaVersion: 1, requestId: id, method: 'snapshot/get', payload: {} });
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(startedAt);
+    try {
+      client = create();
+      client.start();
+      await vi.waitFor(() => expect(client.getStatus().stage).toBe('READY'));
+      const initial = await snapshot('proactive-initial');
+      const petId = initial.snapshot.primaryPetId;
+      const other = initial.snapshot.pets.find(pet => pet.petId !== petId).petId;
+      const settings = await send('proactive-read', 'settings/get', { petId });
+      expect(settings).toMatchObject({ ok: true, data: { enabled: false, revision: 0 } });
+      const save = await client.requestAi(request('proactive-mock', 'provider/save', { config, expectedRevision: null }));
+      expect(save.ok).toBe(true);
+      expect(await client.requestAi(request('proactive-assign', 'provider/assign', {
+        petId, providerId: config.providerId, providerRevision: save.data.revision, allowCloudContext: false,
+      }))).toMatchObject({ ok: true });
+      expect(await send('proactive-enable', 'settings/set', {
+        petId, expectedRevision: 0, enabled: true, useLocalAi: true, quietHours: { startMinute: 0, endMinute: 23 * 60 + 59 },
+      })).toMatchObject({ ok: true, data: { revision: 1 } });
+      const departed = await client.request({ schemaVersion: 1, requestId: 'proactive-trip', method: 'command/dispatch', payload: {
+        command: { commandId: 'proactive-trip-send', issuedAt: startedAt, type: 'TRIP_START', payload: { petId, routeId: 'morning-dew-meadow' } },
+      } });
+      expect(departed).toMatchObject({ ok: true });
+      let back;
+      for (let minute = 17; minute <= 50; minute++) {
+        vi.setSystemTime(startedAt + minute * 60_000);
+        back = (await snapshot(`proactive-return-${minute}`)).snapshot.pets.find(pet => pet.petId === petId);
+        if (back.activity === 'IDLE') break;
+      }
+      expect(back).toMatchObject({ activity: 'IDLE', trip: { status: 'SETTLED' } });
+      const pushes = [];
+      client.subscribeProactive(event => pushes.push(event));
+      client.setProactiveHost(petId);
+      const list = { petId, offset: 0, limit: 10, filter: 'UNREAD' };
+      expect(await send('proactive-quiet', 'notices/list', list)).toMatchObject({ ok: true, data: { rows: [] } });
+      expect(pushes).toHaveLength(0);
+      expect(await send('proactive-allow', 'settings/set', {
+        petId, expectedRevision: 1, enabled: true, useLocalAi: true, quietHours: null,
+      })).toMatchObject({ ok: true, data: { revision: 2 } });
+      client.setProactiveHost(other);
+      expect(await send('proactive-wrong-pet', 'notices/list', list)).toMatchObject({ ok: true, data: { rows: [] } });
+      client.setProactiveHost(petId);
+      await vi.waitFor(() => expect(pushes).toHaveLength(1));
+      expect(pushes[0].notice).toMatchObject({ petId, trigger: 'RETURNED', sourceKey: `return:${back.trip.tripId}`, responseKind: 'MOCK' });
+      const { noticeId } = pushes[0].notice;
+      await client.stop();
+      client = create();
+      client.start();
+      await vi.waitFor(() => expect(client.getStatus().stage).toBe('READY'));
+      client.subscribeProactive(event => pushes.push(event));
+      client.setProactiveHost(petId);
+      expect((await send('proactive-restarted', 'notices/list', list)).data.rows.map(row => row.noticeId)).toEqual([noticeId]);
+      expect(pushes).toHaveLength(1);
+      expect(await send('proactive-foreign-ack', 'notice/acknowledge', { petId: other, noticeId })).toMatchObject({ ok: true, data: { changed: false } });
+      expect(await send('proactive-ack', 'notice/acknowledge', { petId, noticeId })).toMatchObject({ ok: true, data: { changed: true } });
+      expect(await send('proactive-read-after', 'notices/list', list)).toMatchObject({ ok: true, data: { rows: [] } });
+    } finally {
+      await client?.stop();
+      vi.useRealTimers();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 20_000);
+
   it('actual mock conversation completes through Main and utility routers and survives a writer restart',async()=>{
     const dir=mkdtempSync(join(tmpdir(),'pet-feature-transport-'));const path=join(dir,'test.sqlite3');
     let client;
@@ -59,12 +131,21 @@ describe('feature transport over the single durable utility writer',()=>{
         values: { scalePercent: 125, reducedMotion: true, hotkeysEnabled: true } } } });
       expect(await client.requestHost({ kind: 'save', edit: { expectedRevision: 0, scalePercent: 150, reducedMotion: false } }))
         .toEqual({ kind: 'preferences', result: { ok: false, code: 'REVISION_CONFLICT' } });
+      const anchor = { role: 'pet', petId, displayId: -8, offsetX: 170, offsetY: 490,
+        x: -1430, y: 490, width: 325, height: 369, displayScale1000: 1500, observedAt: 10 };
+      expect(await client.requestHost({ kind: 'save-window-anchor', anchor })).toEqual({
+        kind: 'save-window-anchor', result: { ok: true },
+      });
+      expect(await client.requestHost({ kind: 'save-window-anchor', anchor: { ...anchor, observedAt: 9 } })).toEqual({
+        kind: 'save-window-anchor', result: { ok: false, code: 'SERVICE_UNAVAILABLE' },
+      });
       expect(await client.requestHost({ kind: 'backup', destination: join(realpathSync.native(dir), 'synthetic-export.sqlite3') }))
-        .toEqual({ kind: 'backup', result: { ok: true, schemaVersion: 11 } });
+        .toEqual({ kind: 'backup', result: { ok: true, schemaVersion: SCHEMA_VERSION } });
       detach();await client.stop();client=create();client.start();await vi.waitFor(()=>expect(client.getStatus().stage).toBe('READY'),{timeout:5000});
       expect(await client.requestAi(request('read-new-gen','messages/list',{petId,conversationId,offset:0,limit:10}))).toEqual({...messages,requestId:'read-new-gen'});
       expect(await client.requestVoiceSettings({kind:'get',petId})).toEqual(muted);
       expect(await client.requestHost({ kind: 'preferences' })).toEqual(preferences);
+      expect(await client.requestHost({ kind: 'window-anchors' })).toEqual({ kind: 'window-anchors', result: { ok: true, anchors: [anchor] } });
       expect(await client.requestWorkspace(request('workspace-new-gen','workspace/manage',{intent:{method:'workspace/list',payload:{}}}))).toEqual({...optedIn,requestId:'workspace-new-gen'});
     }finally{await client?.stop();rmSync(dir,{recursive:true,force:true});}
   },20_000);

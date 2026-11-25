@@ -36,11 +36,24 @@ jobs:
           npm install --global pnpm@10.30.3
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           pnpm install --frozen-lockfile
-      - name: Check and test
+      - name: Typecheck
+        run: pnpm typecheck
+      - name: Test on Windows
+        env:
+          NO_COLOR: '1'
         run: |
-          pnpm typecheck
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          pnpm test
+          $testLog = Join-Path $env:RUNNER_TEMP 'pet-test-output.txt'
+          pnpm test 2>&1 | Tee-Object -FilePath $testLog
+          $testExit = $LASTEXITCODE
+          if ($testExit -ne 0) {
+            $failures = Select-String -Path $testLog -Pattern 'FAIL\s+.*[/\]test[s]?[/\]|error TS[0-9]+|Error: Cannot find|ERR_PNPM' |
+              Select-Object -First 12
+            foreach ($failure in $failures) {
+              $message = $failure.Line.Replace('%','%25').Replace("`r",'%0D').Replace("`n",'%0A')
+              Write-Output "::error title=Windows test failure::$message"
+            }
+          }
+          exit $testExit
       - name: Build Windows native helpers
         run: ./apps/desktop/scripts/stage-win-native.ps1
       - name: Build and verify NSIS installer

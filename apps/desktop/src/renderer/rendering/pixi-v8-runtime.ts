@@ -1,5 +1,7 @@
 import type { AuthoredMouthPatch } from './authored-mouth';
 import type { ModelGeometry, Size } from './geometry';
+// Pixi ships static shader and uniform synchronizers for strict CSP.
+import 'pixi.js/unsafe-eval';
 import { VERSION, WebGLRenderer, Container, Sprite, ImageSource, Texture, Rectangle } from 'pixi.js';
 
 export const PINNED_PIXI_VERSION = '8.23.0';

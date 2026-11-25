@@ -1,0 +1,98 @@
+{
+  "schemaVersion": 1,
+  "characterId": "star-singer",
+  "packVersion": "1.0.0",
+  "minAppVersion": "0.0.0",
+  "displayName": {
+    "zh-CN": "星咏"
+  },
+  "thumbnail": "assets/thumbnail.png",
+  "variants": [
+    {
+      "id": "sprite",
+      "renderer": "sprite",
+      "entry": "assets/atlas.json"
+    },
+    {
+      "id": "still",
+      "renderer": "static",
+      "entry": "assets/idle.png"
+    }
+  ],
+  "anchor": {
+    "x": 0.5,
+    "y": 1
+  },
+  "logicalSize": {
+    "w": 128,
+    "h": 128
+  },
+  "hitRegions": [
+    {
+      "id": "head",
+      "rect": [
+        0.3,
+        0.35,
+        0.4,
+        0.24
+      ]
+    },
+    {
+      "id": "body",
+      "rect": [
+        0.35,
+        0.67,
+        0.3,
+        0.2
+      ]
+    }
+  ],
+  "actions": {
+    "idle": {
+      "sprite": "idle",
+      "still": "idle"
+    },
+    "sleep": {
+      "sprite": "sleep"
+    },
+    "happy": {
+      "sprite": "happy"
+    },
+    "tap.head": {
+      "sprite": "tap.head"
+    },
+    "talk": {
+      "sprite": "talk"
+    },
+    "walk": {
+      "sprite": "walk"
+    }
+  },
+  "cgIds": [],
+  "license": {
+    "owner": "Pet Desktop",
+    "reference": "original-poc-fixture"
+  },
+  "files": [
+    {
+      "path": "assets/atlas.png",
+      "bytes": 25771,
+      "sha256": "64f940de8d3fa130c807ba4a1d67e0c57018a1f4a682e4f390e54685d0b71969"
+    },
+    {
+      "path": "assets/atlas.json",
+      "bytes": 3955,
+      "sha256": "701f66b111a4d07dd616e86121bec5631176027e1d3e66f70c9717940ffdbc56"
+    },
+    {
+      "path": "assets/idle.png",
+      "bytes": 3089,
+      "sha256": "c5f292dc0d5a5de3fcfddf2d83f142c9415989e9cb2fde9bbcd0abbef00906bf"
+    },
+    {
+      "path": "assets/thumbnail.png",
+      "bytes": 3089,
+      "sha256": "c5f292dc0d5a5de3fcfddf2d83f142c9415989e9cb2fde9bbcd0abbef00906bf"
+    }
+  ]
+}

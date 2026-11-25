@@ -227,3 +227,5 @@ export interface AppBridge {
   dispatch(command: DomainCommand): Promise<IpcResult>;
   subscribeSnapshot(listener: (snapshot: AppSnapshot) => void): () => void;
 }
+
+export * from './character-pack.js';

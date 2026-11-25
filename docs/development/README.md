@@ -65,5 +65,6 @@
 | 010A | SQLite v11、宿主显示偏好与手动备份 | SQLite 和宿主专项通过，Windows 真机待验收 | [010a-host-preferences-and-backup](010a-host-preferences-and-backup.md) |
 | 010B | Windows x64 原生构建及 NSIS 安装包工作流 | 配置与生产构建通过，Windows 打包待 CI | [010b-windows-package](010b-windows-package.md) |
 | 010C | Windows 构建检查诊断与 Pixi CSP 兼容接线 | 开发机专项和生产构建通过，Windows CI 待复跑 | [010c-package-qualification](010c-package-qualification.md) |
+| 010D | Mac 生产运行及 Windows 迁移测试夹具 | Mac 实际运行通过，Windows 待 CI 复测 | [010d-runtime-and-windows-ci](010d-runtime-and-windows-ci.md) |
 
 每份记录包含：日期、范围、设计依据、具体变更、测试命令与真实结果、已知限制、下一步。完整验收状态见 [POC 矩阵](../qa/poc-matrix.md)。

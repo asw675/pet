@@ -1198,6 +1198,9 @@ describe.skipIf(!supported)('shared equipment economy in actual SQLite', () => {
         db.prepare('INSERT INTO schema_migrations VALUES (?, ?, ?)').run(versionNumber, checksum, initialTime);
         db.exec(`PRAGMA user_version=${versionNumber}`);
       }
+      // Seed the archived rows as one commit. This test verifies migration
+      // and pagination, so hundreds of independent disk flushes aren't needed.
+      db.exec('BEGIN');
       db.prepare('INSERT INTO pets VALUES (?, ?, ?, ?)').run(petId, 'star-singer', '星咏', 0);
       db.prepare('INSERT INTO pet_states VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
         .run(petId, 'HOME', 'IDLE', 'CALM', 'NORMAL', 'VISIBLE', 500, 1000, 1000, 0);
@@ -1212,6 +1215,7 @@ describe.skipIf(!supported)('shared equipment economy in actual SQLite', () => {
       stack.run('apprentice-staff', 7);
       for (let i = 0; i < 260; i++) stack.run(`legacy-${String(i).padStart(3,'0')}`, i % 5);
       stack.run('ration', 2);
+      db.exec('COMMIT');
     } finally { db.close(); }
 
     const beforeMigration = (source, from) => {

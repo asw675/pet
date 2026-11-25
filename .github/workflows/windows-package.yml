@@ -46,7 +46,7 @@ jobs:
           pnpm test 2>&1 | Tee-Object -FilePath $testLog
           $testExit = $LASTEXITCODE
           if ($testExit -ne 0) {
-            $failures = Select-String -Path $testLog -Pattern 'FAIL\s+.*[/\]test[s]?[/\]|error TS[0-9]+|Error: Cannot find|ERR_PNPM' |
+            $failures = Select-String -Path $testLog -Pattern 'FAIL\s+.*[/\]test[s]?[/\]|error TS[0-9]+|(?:Assertion|Type|Range|Syntax)?Error:|timed out|ERR_PNPM' |
               Select-Object -First 12
             foreach ($failure in $failures) {
               $message = $failure.Line.Replace('%','%25').Replace("`r",'%0D').Replace("`n",'%0A')

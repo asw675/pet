@@ -11,7 +11,7 @@
     "typecheck": "tsc -p tsconfig.node.json --noEmit && vue-tsc -p tsconfig.renderer.json --noEmit && tsc -p tsconfig.test.json --noEmit",
     "test": "vitest run",
     "rebuild:native": "electron-builder install-app-deps",
-    "package:win": "node scripts/native-artifact-pins.mjs --require-all && pnpm run build && electron-builder --win --x64"
+    "package:win": "node scripts/native-artifact-pins.mjs --require-all && pnpm run build && electron-builder --win --x64 --publish never && node scripts/verify-win-package.mjs"
   },
   "dependencies": {
     "@pet-desktop/app-service": "workspace:*",

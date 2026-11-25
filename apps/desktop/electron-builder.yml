@@ -6,17 +6,22 @@ files:
   - out/**/*
   - package.json
 extraResources:
-  - from: native/publish/win-x64
-    to: native
+  - from: native/publish/win-x64/voice
+    to: native/voice/win-x64
     filter:
-      - voice/whisper-cli.exe
-      - voice/pet-desktop-sapi.exe
-      - launch-inspect/launch-inspect.exe
+      - whisper-cli.exe
+      - pet-desktop-sapi.exe
+      - whisper-LICENSE.txt
+  - from: native/publish/win-x64/launch-inspect
+    to: native/launch-inspect
+    filter:
+      - launch-inspect.exe
 asarUnpack:
   - '**/*.node'
   - '**/better-sqlite3/**'
 npmRebuild: true
 win:
+  artifactName: Pet-Desktop-${version}-win-${arch}.${ext}
   target:
     - target: nsis
       arch: x64

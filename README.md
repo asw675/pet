@@ -43,3 +43,17 @@ Electron 的运行时二进制及 native addon 必须在当前平台安装、重
 ## 目标环境
 
 Windows 11 x64 优先，Windows 10 22H2 x64 作为兼容性验证环境。分阶段支持序列帧、经授权的 Live2D、AI、语音和快捷入口。
+
+### Windows x64 安装包
+
+GitHub Actions 的 `Windows x64 package` 在 Windows 运行测试、构建原生辅助程序和 NSIS 安装包。可在 Actions 手动运行，成功后下载 `Pet-Desktop-Windows-x64` 工件。构建产物为未签名的测试安装包。
+
+在本机打包需使用 Windows x64、PowerShell 7、Visual Studio 2022 C++ 工具、CMake、.NET 10 SDK 和项目锁定的 Node/pnpm。在仓库根目录执行：
+
+```powershell
+pnpm install --frozen-lockfile
+./apps/desktop/scripts/stage-win-native.ps1
+pnpm --filter @pet-desktop/desktop package:win
+```
+
+安装器输出到 `apps/desktop/release/`。Whisper 语音识别还需要安装对应的模型文件，打包流程只构建并包含 CLI。

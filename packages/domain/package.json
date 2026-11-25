@@ -7,7 +7,9 @@
     ".": "./src/index.ts",
     "./cg-catalog": "./src/cg-catalog.ts",
     "./character-catalog": "./src/character-catalog.ts",
-    "./home-simulation": "./src/home-simulation.ts"
+    "./home-simulation": "./src/home-simulation.ts",
+    "./progression": "./src/progression.ts",
+    "./equipment-rules": "./src/equipment-rules.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",

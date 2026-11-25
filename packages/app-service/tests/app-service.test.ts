@@ -84,6 +84,7 @@ class MemoryRepository implements AppRepository, AppTransaction {
   aiState(): never { throw new Error('AI storage is not part of this game-only fake'); }
   workspaceState(): never { throw new Error('Workspace storage is not part of this game-only fake'); }
   voiceProfiles(): never { throw new Error('Voice storage is not part of this game-only fake'); }
+  hostPreferences(): never { throw new Error('Host preferences are not part of this game-only fake'); }
   getPreferences(): PreferencesRecord | null { return copy(this.state.preferences); }
   savePreferences(record: PreferencesRecord): void { this.state.preferences = copy(record); }
   listPets(): PetRecord[] { return copy(this.state.pets); }

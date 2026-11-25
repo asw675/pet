@@ -14,18 +14,19 @@ import { canonicalTripDepartureLoadout, validateTripDepartureLoadoutRecord } fro
 import { AI_STATE_MIGRATION_SQL, AiStateStorage } from '#ai-state-storage';
 import { WORKSPACE_MIGRATION_SQL, WorkspaceStorage } from '#workspace-storage';
 import { VOICE_PROFILE_MIGRATION_SQL, VoiceProfileStorage } from '#voice-profile-storage';
+import { HOST_PREFERENCES_MIGRATION_SQL, HostPreferenceStorage } from '#host-preference-storage';
 import { advanceTrip, MAX_TRIP_FACTS, MAX_TRIP_NODES } from '@pet-desktop/domain';
 import type { RewardDraft, TripCheckpoint, TripFact, TripSnapshot } from '@pet-desktop/domain';
 import type {
   AppRepository, AppTransaction, CgUnlock, CgUnlockInput, CommandOutcome, CommandReceipt, CommerceMaterialAmount, CommerceOperationRecord,
-  EventCgUnlock, EventFinalizationRecord, EventOccurrenceRecord, EventTriggerReceipt, InventoryItem, ItemInstanceRecord, OutboxRecord, PetEquipmentRecord,
+  BackupExportIo, BackupExportStage, EventCgUnlock, EventFinalizationRecord, EventOccurrenceRecord, EventTriggerReceipt, InventoryItem, ItemInstanceRecord, OutboxRecord, PetEquipmentRecord,
   HomeScheduleRecord, PetAcquisitionRecord, PetRecord, PreferencesRecord, RewardLine, SettlementRecord, SqliteConnection, TripCgAssetPin, TripDepartureLoadoutRecord, TripRecord,
 } from './ports.js';
 
 const MAX_SAFE = Number.MAX_SAFE_INTEGER;
 const UINT32_MAX = 0xffff_ffff;
 const BUSY_TIMEOUT_MS = 5_000;
-const SCHEMA_VERSION = 10;
+export const SCHEMA_VERSION = 11;
 const JSON_SCHEMA_VERSION = 1;
 const MIGRATION_001_JSON_SCHEMA_VERSION = 1;
 const MIGRATION_001_MAX_TRIP_FACTS = 14;
@@ -932,6 +933,7 @@ const MIGRATIONS = Object.freeze([
   { version: 8, sql: AI_STATE_MIGRATION_SQL },
   { version: 9, sql: WORKSPACE_MIGRATION_SQL },
   { version: 10, sql: VOICE_PROFILE_MIGRATION_SQL },
+  { version: 11, sql: HOST_PREFERENCES_MIGRATION_SQL },
 ]);
 
 /** FNV-1a is a migration-change detector, not a security signature. */
@@ -1630,6 +1632,7 @@ class SQLiteTransaction implements AppTransaction {
   aiState(): AiStateStorage { return new AiStateStorage(this.db, this.inScope); }
   workspaceState(): WorkspaceStorage { return new WorkspaceStorage(this.db, this.inScope); }
   voiceProfiles(): VoiceProfileStorage { return new VoiceProfileStorage(this.db, this.inScope); }
+  hostPreferences(): HostPreferenceStorage { return new HostPreferenceStorage(this.db, this.inScope); }
 
   getPreferences(): PreferencesRecord | null {
     const value = this.db.prepare('SELECT * FROM preferences WHERE singleton = 1').get();
@@ -2437,6 +2440,7 @@ function migrate(db: SqliteConnection, persistent: boolean, beforeMigration?: (f
         'pets','trips','cg_unlocks','commands','reward_ledger','event_trigger_receipts','event_occurrences','event_finalizations','event_effects','event_cg_unlocks',
         ...(migration.version>=9?['ai_provider_configs','ai_pet_provider_assignments','ai_conversations','ai_turns','ai_messages','ai_memories','ai_memory_grants']:[]),
         ...(migration.version>=10?['workspace_settings','quick_actions','routines','routine_targets','launch_history','recommendation_preferences','recommendation_impressions']:[]),
+        ...(migration.version>=11?['voice_profiles']:[]),
       ].map(table=>[table,rowCount(db,`SELECT count(*) AS count FROM ${table}`)])):null;
       db.exec(migration.sql);
       if (oldCounts !== null && (oldCounts.trips !== rowCount(db, 'SELECT count(*) AS count FROM trips')
@@ -2485,6 +2489,10 @@ function migrate(db: SqliteConnection, persistent: boolean, beforeMigration?: (f
       }
       if(migration.version===10&&rowCount(db,'SELECT count(*) AS count FROM voice_profiles')!==0){
         throw new Error('Voice migration must not invent voice preferences or consent');
+      }
+      if(migration.version===11&&(rowCount(db,'SELECT count(*) AS count FROM host_preferences WHERE singleton=1 AND revision=0 AND hotkeys_enabled=1 AND scale_percent=100 AND reduced_motion=0 AND updated_at IS NULL')!==1
+        ||rowCount(db,'SELECT count(*) AS count FROM host_window_anchors')!==0)){
+        throw new Error('Host migration must not invent window placement or prior explicit settings');
       }
       db.prepare('INSERT INTO schema_migrations (version, checksum, applied_at) VALUES (?, ?, ?)')
         .run(migration.version, migrationChecksum(migration.sql), Date.now());
@@ -2551,6 +2559,44 @@ export class SQLiteRepository implements AppRepository {
     } finally {
       inScope = false;
       this.active = false;
+    }
+  }
+
+  /** A committed snapshot export, outside any transaction, using the existing
+   * sole writer. Publish only after a separate read-only verifier confirms
+   * integrity, current contiguous migration checksums and all foreign keys.
+   * No source file copies and no renderer-selected destination path. */
+  exportBackup(destination: string, io: BackupExportIo): {schemaVersion:number} {
+    if (this.closed || this.broken) throw Object.assign(new Error('Repository is unavailable'), {name:'RepositoryUnavailableError'});
+    if (this.active) throw new Error('Backup export requires an idle repository');
+    if (typeof destination !== 'string' || !destination.trim() || destination.length > 4096 || destination.includes('\0')) throw new Error('Invalid trusted backup destination');
+    this.active=true;
+    let stage: BackupExportStage | undefined;
+    let published = false;
+    try {
+      verifyMigrationHistory(this.db,SCHEMA_VERSION);
+      stage=io.stage(destination);
+      if(typeof stage.filename!=='string'||!stage.filename||stage.filename===destination||stage.filename.includes('\0'))throw new Error('Backup export requires unique staging');
+      this.db.prepare('VACUUM INTO ?').run(stage.filename);
+      const verifier=io.openReadOnly(stage.filename);
+      try {
+        const integrity=verifier.prepare('PRAGMA integrity_check').all();
+        if(integrity.length!==1||object(integrity[0],'backup integrity').integrity_check!=='ok')throw new Error('Backup integrity verification failed');
+        verifyMigrationHistory(verifier,SCHEMA_VERSION);
+      }finally{verifier.close();}
+      stage.publishVerified();
+      published = true;
+      return { schemaVersion: SCHEMA_VERSION };
+    } finally {
+      try {
+        stage?.dispose();
+      } catch (error) {
+        // Publication is the commit point. A subsequent staging cleanup
+        // failure must not report a committed backup as missing.
+        if (!published) throw error;
+      } finally {
+        this.active = false;
+      }
     }
   }
 

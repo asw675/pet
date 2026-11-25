@@ -1,6 +1,6 @@
 import { describe,it,expect,vi } from 'vitest';
 import { DatabaseSync } from 'node:sqlite';
-import { mkdtempSync,rmSync } from 'node:fs';
+import { mkdtempSync,realpathSync,rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ServiceClient } from '../src/main/service-client.ts';
@@ -54,9 +54,17 @@ describe('feature transport over the single durable utility writer',()=>{
       expect(workspace).toMatchObject({ok:true,data:{actions:[],routines:[],history:[],settings:{enabled:false}}});
       const optedIn=await client.requestWorkspace(request('workspace-opt-in','workspace/manage',{intent:{method:'recommendation/settings',payload:{expectedRevision:workspace.data.revision,settings:{...workspace.data.settings,enabled:true},clearHistory:false}}}));
       expect(optedIn).toMatchObject({ok:true,data:{settings:{enabled:true}}});
+      const preferences = await client.requestHost({ kind: 'save', edit: { expectedRevision: 0, scalePercent: 125, reducedMotion: true } });
+      expect(preferences).toMatchObject({ kind: 'preferences', result: { ok: true, preferences: { revision: 1,
+        values: { scalePercent: 125, reducedMotion: true, hotkeysEnabled: true } } } });
+      expect(await client.requestHost({ kind: 'save', edit: { expectedRevision: 0, scalePercent: 150, reducedMotion: false } }))
+        .toEqual({ kind: 'preferences', result: { ok: false, code: 'REVISION_CONFLICT' } });
+      expect(await client.requestHost({ kind: 'backup', destination: join(realpathSync(dir), 'synthetic-export.sqlite3') }))
+        .toEqual({ kind: 'backup', result: { ok: true, schemaVersion: 11 } });
       detach();await client.stop();client=create();client.start();await vi.waitFor(()=>expect(client.getStatus().stage).toBe('READY'),{timeout:5000});
       expect(await client.requestAi(request('read-new-gen','messages/list',{petId,conversationId,offset:0,limit:10}))).toEqual({...messages,requestId:'read-new-gen'});
       expect(await client.requestVoiceSettings({kind:'get',petId})).toEqual(muted);
+      expect(await client.requestHost({ kind: 'preferences' })).toEqual(preferences);
       expect(await client.requestWorkspace(request('workspace-new-gen','workspace/manage',{intent:{method:'workspace/list',payload:{}}}))).toEqual({...optedIn,requestId:'workspace-new-gen'});
     }finally{await client?.stop();rmSync(dir,{recursive:true,force:true});}
   },20_000);

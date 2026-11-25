@@ -26,12 +26,17 @@ import type {
   ControlCenterBridge, DesktopBridgeBase, HostActionResult, PetDesktopBridge, PetVisualReady, ServiceStatus,
 } from '../shared/protocol.js';
 
-type InvokeChannel = typeof DESKTOP_IPC.request | typeof DESKTOP_IPC.getStatus
+import {
+  backupViewResultSchema, hostPreferencesViewResultSchema, hostRendererRequestSchema, hostRenderPreferencesSchema, hostSettingsResultSchema,
+} from '../shared/host-settings-ipc';
+import type { HostPreferenceSave, HostRenderPreferences } from '../shared/host-settings-ipc';
+
+type InvokeChannel = typeof DESKTOP_IPC.hostRequest | typeof DESKTOP_IPC.request | typeof DESKTOP_IPC.getStatus
   | typeof DESKTOP_IPC.openControlCenter | typeof DESKTOP_IPC.petInteractive
   | typeof DESKTOP_IPC.petVisualReady | typeof DESKTOP_IPC.aiRequest | typeof DESKTOP_IPC.credentialSave | typeof DESKTOP_IPC.credentialRevoke
   | typeof DESKTOP_IPC.voiceRequest | typeof DESKTOP_IPC.micAuthorize | typeof DESKTOP_IPC.micRequest | typeof DESKTOP_IPC.micRevoke
   | typeof DESKTOP_IPC.voiceChatCancel | typeof DESKTOP_IPC.voiceMouth | typeof DESKTOP_IPC.voiceSettingsRequest | typeof DESKTOP_IPC.workspaceRequest;
-type PushChannel = typeof DESKTOP_IPC.snapshot | typeof DESKTOP_IPC.status | typeof DESKTOP_IPC.chatEvent | typeof DESKTOP_IPC.voiceMouth | typeof DESKTOP_IPC.voiceSuspend;
+type PushChannel = typeof DESKTOP_IPC.hostRenderPreferences | typeof DESKTOP_IPC.snapshot | typeof DESKTOP_IPC.status | typeof DESKTOP_IPC.chatEvent | typeof DESKTOP_IPC.voiceMouth | typeof DESKTOP_IPC.voiceSuspend;
 type PushListener = (event: unknown, ...args: unknown[]) => void;
 
 /** Internal transport seam; only the explicit bridge below crosses contextBridge. */
@@ -212,10 +217,24 @@ async function hostAction(ipc: DesktopIpcPort, ...call: HostActionInvoke): Promi
   return { ok: false, code: 'SERVICE_UNAVAILABLE' };
 }
 
+async function hostRequest<T>(ipc: DesktopIpcPort, raw: unknown, schema: Parser<T>, invalid: T, unavailable: T): Promise<T> {
+  const request = parse(hostRendererRequestSchema, raw);
+  if (!request) return invalid;
+  try { return parse(schema, await ipc.invoke(DESKTOP_IPC.hostRequest, request)) ?? unavailable; }
+  catch { return unavailable; }
+}
+
+const invalidSetting = { ok: false, code: 'INVALID_REQUEST', settings: null } as const;
+const unavailableSetting = { ok: false, code: 'SERVICE_UNAVAILABLE', settings: null } as const;
+const invalidPreference = { ok: false, code: 'INVALID_REQUEST' } as const;
+const unavailablePreference = { ok: false, code: 'SERVICE_UNAVAILABLE' } as const;
+
 export function createPetBridge(ipc: DesktopIpcPort, requestId = newRequestId): PetDesktopBridge {
   return Object.freeze({
     role: 'pet',
     ...baseBridge(ipc, requestId),
+    subscribeHostRenderPreferences: (listener: (value: HostRenderPreferences) => void) =>
+      subscribe(ipc, DESKTOP_IPC.hostRenderPreferences, hostRenderPreferencesSchema, listener),
     subscribeVoiceMouth:(listener:(event:VoiceMouthNotification)=>void)=>subscribe(ipc,DESKTOP_IPC.voiceMouth,voiceMouthNotificationSchema,listener),
     async setInteractive(interactive: boolean): Promise<HostActionResult> {
       if (typeof interactive !== 'boolean') return { ok: false, code: 'INVALID_REQUEST' };
@@ -232,6 +251,12 @@ export function createPetBridge(ipc: DesktopIpcPort, requestId = newRequestId): 
 export function createControlCenterBridge(ipc: DesktopIpcPort, requestId = newRequestId): ControlCenterBridge {
   return Object.freeze({
     role: 'control-center',
+    getHostSettings: () => hostRequest(ipc, { kind: 'settings' }, hostSettingsResultSchema, invalidSetting, unavailableSetting),
+    setHostShortcutEnabled: (enabled: boolean) => hostRequest(ipc, { kind: 'shortcuts', enabled }, hostSettingsResultSchema, invalidSetting, unavailableSetting),
+    setLoginStart: (enabled: boolean) => hostRequest(ipc, { kind: 'login', enabled }, hostSettingsResultSchema, invalidSetting, unavailableSetting),
+    getHostPreferences: () => hostRequest(ipc, { kind: 'preferences' }, hostPreferencesViewResultSchema, invalidPreference, unavailablePreference),
+    saveHostPreferences: (payload: HostPreferenceSave) => hostRequest(ipc, { kind: 'save', edit: payload }, hostPreferencesViewResultSchema, invalidPreference, unavailablePreference),
+    exportBackup: () => hostRequest(ipc, { kind: 'backup' }, backupViewResultSchema, invalidPreference, unavailablePreference),
     ...baseBridge(ipc, requestId),
     listGallery: (query: GalleryQuery) => sendRequest(ipc, requestId, 'gallery/list', query),
     async listCharacters(...args: unknown[]): Promise<CharactersIpcResult> {

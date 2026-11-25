@@ -105,8 +105,9 @@ describe('role-specific preload bridges', () => {
     ];
     const pet = createPetBridge(ipc);
     const center = createControlCenterBridge(ipc);
-    expect(Object.keys(pet).sort()).toEqual([...commonKeys, 'setInteractive', 'reportVisualReady','subscribeVoiceMouth'].sort());
+    expect(Object.keys(pet).sort()).toEqual([...commonKeys, 'setInteractive', 'reportVisualReady','subscribeVoiceMouth','subscribeHostRenderPreferences'].sort());
     expect(Object.keys(center).sort()).toEqual([...commonKeys, 'listGallery', 'listCharacters', 'listInventory', 'listTravelCatalog', 'previewTravel', 'listTravelReports', 'listEvents',
+      'getHostSettings','setHostShortcutEnabled','setLoginStart','getHostPreferences','saveHostPreferences','exportBackup',
       'aiRequest','subscribeChatEvents','saveProviderCredential','revokeProviderCredential','voiceRequest','voiceSettingsRequest','workspaceRequest','authorizeMicrophone','requestMic','revokeMic','cancelVoiceChat','publishMouth','subscribeSuspend'].sort());
     expect('reportVisualReady' in center).toBe(false);
     expect('listGallery' in pet).toBe(false);
@@ -125,6 +126,17 @@ describe('role-specific preload bridges', () => {
     expect(center.role).toBe('control-center');
     expect(Object.isFrozen(pet)).toBe(true);
     expect(Object.isFrozen(center)).toBe(true);
+  });
+
+  it('sends only a pathless backup request and strips unexpected path replies', async () => {
+    const ipc = new FakeIpc();
+    const bridge = createControlCenterBridge(ipc);
+    const spy = vi.spyOn(ipc, 'invoke').mockResolvedValue({ ok: true, schemaVersion: 11, path: '/private/save.sqlite3' });
+    expect(await bridge.exportBackup()).toEqual({ ok: false, code: 'SERVICE_UNAVAILABLE' });
+    expect(spy).toHaveBeenCalledExactlyOnceWith(DESKTOP_IPC.hostRequest, { kind: 'backup' });
+    expect(await bridge.saveHostPreferences({ scalePercent: 101, reducedMotion: true, expectedRevision: 0 } as never))
+      .toEqual({ ok: false, code: 'INVALID_REQUEST' });
+    expect(spy).toHaveBeenCalledTimes(1);
   });
 
   it('exposes a closed inventory query only to the control center and rejects unrelated replies', async () => {

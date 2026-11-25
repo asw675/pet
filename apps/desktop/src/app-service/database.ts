@@ -11,6 +11,9 @@ import { WorkspaceControl } from './workspace/workspace-control';
 import { createUtilityFeatureRouter,UtilityCredentialBroker } from './feature-router';
 import type { UtilityFeatures } from './feature-router';
 import type { FeatureOutput } from '../shared/feature-protocol';
+import { HostPreferenceStorageError } from '@pet-desktop/app-service/host-preference-storage';
+import { createBackupExportIo } from './backup-export-io';
+import type { HostAuthorityRequest, HostAuthorityResult } from '../shared/host-settings-ipc';
 import {nativeArtifactPins} from '../shared/native-artifact-pins';
 
 function requireSupportedSQLite(connection: SqliteConnection): string {
@@ -76,7 +79,37 @@ export function openPersistentService(databasePath: string, open: (filename: str
         reset:(petId,expectedRevision,at)=>service.withFeatureTransaction(tx=>tx.voiceProfiles().reset(petId,expectedRevision,at))},providers,now:Date.now});
       const workspace=new WorkspaceControl({transaction:run=>service.withFeatureTransaction(tx=>run(tx.workspaceState())),now:Date.now,
         utcOffsetMinutes:()=>-new Date().getTimezoneOffset(),createId:kind=>`${kind}-${randomUUID()}`});
-      return createUtilityFeatureRouter({ai,voice,voiceSettings,workspace,broker,send,fault});
+      const backupIo = createBackupExportIo(filename => open(filename, true));
+      const host = (request: HostAuthorityRequest): HostAuthorityResult => {
+        if (request.kind === 'backup') {
+          try {
+            return { kind: 'backup', result: { ok: true, ...repository.exportBackup(request.destination, backupIo) } };
+          } catch {
+            return { kind: 'backup', result: { ok: false, code: 'EXPORT_FAILED' } };
+          }
+        }
+        try {
+          const stored = service.withFeatureTransaction(tx => {
+            const storage = tx.hostPreferences();
+            const { hotkeysEnabled, scalePercent, reducedMotion, ...metadata } = storage.getPreferences();
+            if (request.kind === 'preferences') return { hotkeysEnabled, scalePercent, reducedMotion, ...metadata };
+            const values = request.kind === 'save'
+              ? { hotkeysEnabled, scalePercent: request.edit.scalePercent, reducedMotion: request.edit.reducedMotion }
+              : { hotkeysEnabled: request.enabled, scalePercent, reducedMotion };
+            const at = Math.max(Date.now(), metadata.updatedAt ?? 0);
+            return storage.savePreferences(values, request.kind === 'save' ? request.edit.expectedRevision : request.expectedRevision, at);
+          });
+          const { revision, updatedAt, ...values } = stored;
+          return { kind: 'preferences', result: { ok: true, preferences: {
+            values, revision, updatedAt: updatedAt === null ? null : new Date(updatedAt).toISOString(),
+          } } };
+        } catch (error) {
+          const code = error instanceof HostPreferenceStorageError && error.code === 'REVISION_CONFLICT'
+            ? 'REVISION_CONFLICT' : 'SERVICE_UNAVAILABLE';
+          return { kind: 'preferences', result: { ok: false, code } };
+        }
+      };
+      return createUtilityFeatureRouter({ai,voice,voiceSettings,workspace,host,broker,send,fault});
     };
     return { service, sqliteVersion,createFeatures:factory };
   } catch (error) {

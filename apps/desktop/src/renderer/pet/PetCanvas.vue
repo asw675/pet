@@ -13,6 +13,7 @@ const props = defineProps<{
   characterId: string;
   activity: Activity | null;
   paused: boolean;
+  reducedMotion: boolean;
   interactive: boolean;
 }>();
 const emit = defineEmits<{
@@ -75,7 +76,7 @@ function syncAnimation(): void {
 }
 
 function syncQuality(): void {
-  const reducedMotion = motionPreference?.matches ?? false;
+  const reducedMotion = props.reducedMotion || (motionPreference?.matches ?? false);
   profile = { maxFps: reducedMotion ? 15 : 30, resolutionScale: 1, reducedMotion };
   renderer?.setQuality(profile);
   resize();
@@ -141,6 +142,7 @@ defineExpose({ hitTestClient, playSemantic, setVoiceMouth });
 watch(() => props.characterId, () => { void replacePack(); });
 watch(() => props.activity, (activity) => renderer?.setBaseAction(semanticIdForActivity(activity)));
 watch(() => props.paused, syncAnimation);
+watch(() => props.reducedMotion, syncQuality);
 
 onMounted(() => {
   const stage = surface.value;

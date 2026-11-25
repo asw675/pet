@@ -2,7 +2,7 @@ import { mkdirSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { isAbsolute, join } from 'node:path';
 import {
-  app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, powerMonitor, safeStorage, screen, session, shell, Tray, utilityProcess,
+  app, BrowserWindow, dialog, globalShortcut, ipcMain, Menu, nativeImage, powerMonitor, safeStorage, screen, session, shell, Tray, utilityProcess,
 } from 'electron';
 import type { IpcMainInvokeEvent, PermissionRequest, Rectangle, WebContents } from 'electron';
 import type { AppSnapshot } from '@pet-desktop/contracts';
@@ -32,6 +32,10 @@ import type {WorkspaceResult} from '../shared/workspace-ipc';
 import type {QuickLaunchSender} from './quick-launch-policy';
 import { voiceSettingsRequestSchema, voiceSettingsResultSchema, voiceSettingsResultMatchesRequest } from '../shared/voice-settings-ipc';
 import type { VoiceSettingsResult } from '../shared/voice-settings-ipc';
+
+import { HostShortcutController } from './host-shortcuts';
+import { hostRendererRequestSchema } from '../shared/host-settings-ipc';
+import type { BackupViewResult, HostPreferencesView, HostPreferencesViewResult, HostSettingsResult } from '../shared/host-settings-ipc';
 
 const CENTER_KEY = 'control-center';
 const PET_SIZE = { width: 260, height: 295 };
@@ -72,7 +76,7 @@ type FeatureStamp = { record: WindowRecord; documentEpoch: number; featureEpoch:
 interface VoiceOwner { stamp: FeatureStamp; job: VoiceOwnedJob; reserved: boolean; micUsed: boolean; durationMs?: number; mouthStarted: boolean }
 interface MicLease { stamp: FeatureStamp; grant: VoiceMicGrant; consumed: boolean; revoking: boolean; timer: ReturnType<typeof setTimeout> }
 interface MouthRun { owner: VoiceOwner; target: WindowRecord; durationMs: number; lastAtMs: number; lastHostAt: number; timer: ReturnType<typeof setTimeout> }
-type HostService = Pick<ServiceClient, 'getStatus'|'start'|'stop'|'request'|'subscribeStatus'|'subscribeSnapshot'|'subscribeChat'|'requestAi'|'requestVoice'|'requestVoiceSettings'|'ownsVoice'|'cancelVoiceChat'|'revokeFeatureDocument'|'requestWorkspace'>;
+type HostService = Pick<ServiceClient, 'getStatus'|'start'|'stop'|'request'|'subscribeStatus'|'subscribeSnapshot'|'subscribeChat'|'requestAi'|'requestVoice'|'requestVoiceSettings'|'ownsVoice'|'cancelVoiceChat'|'revokeFeatureDocument'|'requestWorkspace'|'requestHost'>;
 type HostVault = Pick<CredentialVault,'save'|'resolve'|'revoke'>;
 interface NativeWalkRun {
   readonly senderId: number;
@@ -143,6 +147,9 @@ export class DesktopHost {
   private micLease: MicLease | undefined;
   private voiceOwner: VoiceOwner | undefined;
   private mouthRun: MouthRun | undefined;
+  private hostPreferences: HostPreferencesView | undefined;
+  private shortcuts: HostShortcutController | undefined;
+  private backupInProgress = false;
   private nativePrompt = false;
   private workspaceHost:WorkspaceHost|undefined;
   private voiceSettingsMutation: FeatureStamp | undefined;
@@ -187,6 +194,13 @@ export class DesktopHost {
       this.acceptSnapshot(snapshot);
     });
     this.service.subscribeStatus((status) => {
+      const refreshPreferences = status.stage === 'READY'
+        && (this.status.stage !== 'READY' || this.status.generation !== status.generation);
+      if (status.stage !== 'READY') {
+        this.shortcuts?.close();
+        this.shortcuts = undefined;
+        this.hostPreferences = undefined;
+      }
       if (status.generation !== this.status.generation || status.stage !== 'READY') {
         this.invalidateFeatures();
         this.micConsent = undefined;
@@ -196,6 +210,7 @@ export class DesktopHost {
       }
       this.status = status;
       this.broadcastStatus();
+      if (refreshPreferences) void this.refreshHostPreferences(status.generation);
       devLog('service', status.stage, `generation=${status.generation}`);
       if (status.stage === 'READY' && this.pendingSnapshot) {
         const snapshot = this.pendingSnapshot;
@@ -292,6 +307,7 @@ export class DesktopHost {
       this.reconcilePets();
       return { ok: true };
     });
+    ipcMain.handle(DESKTOP_IPC.hostRequest, (event, ...args: unknown[]) => this.handleHostRequest(event, args));
     ipcMain.handle(DESKTOP_IPC.aiRequest, (event, ...args: unknown[]) => this.handleAiRequest(event, args));
     ipcMain.handle(DESKTOP_IPC.credentialSave, (event, ...args: unknown[]) => this.handleCredential(event, args, true));
     ipcMain.handle(DESKTOP_IPC.credentialRevoke, (event, ...args: unknown[]) => this.handleCredential(event, args, false));
@@ -377,6 +393,111 @@ export class DesktopHost {
   private recheckFeature(event: IpcMainInvokeEvent, stamp: FeatureStamp): boolean {
     const current = this.authorizedFeature(event);
     return current !== null && this.sameFeature(stamp, current);
+  }
+
+  private async refreshHostPreferences(generation: number): Promise<void> {
+    try {
+      const response = await this.service.requestHost({ kind: 'preferences' });
+      if (!this.stopping && this.status.stage === 'READY' && this.status.generation === generation
+        && response.kind === 'preferences' && response.result.ok) this.applyHostPreferences(response.result.preferences);
+    } catch { /* a later explicit settings read may retry */ }
+  }
+
+  private petSize(): { width: number; height: number } {
+    const scale = (this.hostPreferences?.values.scalePercent ?? 100) / 100;
+    return { width: Math.round(PET_SIZE.width * scale), height: Math.round(PET_SIZE.height * scale) };
+  }
+
+  private applyHostPreferences(preferences: HostPreferencesView): void {
+    const previous = this.hostPreferences;
+    if (previous && preferences.revision <= previous.revision) return;
+    this.hostPreferences = preferences;
+    if (!this.shortcuts) {
+      this.shortcuts = new HostShortcutController({
+        globalShortcut, loginApp: app, initialShortcutEnabled: preferences.values.hotkeysEnabled, shortcutPreferenceScope: 'PERSISTED',
+        actions: {
+          openControlCenter: () => this.openControlCenter(),
+          togglePetVisibility: () => this.togglePetVisibility(),
+          rescueInteraction: () => this.setInputMode('temporary-interactive'),
+        },
+      });
+      this.shortcuts.start();
+    } else if (previous?.values.hotkeysEnabled !== preferences.values.hotkeysEnabled) {
+      this.shortcuts.setHostShortcutEnabled(preferences.values.hotkeysEnabled);
+    }
+    if (previous?.values.scalePercent !== preferences.values.scalePercent) this.stopWalkMotion();
+    for (const record of this.windows.values()) {
+      if (!record.pet || !this.isCurrent(record)) continue;
+      if (previous?.values.scalePercent !== preferences.values.scalePercent) {
+        const bounds = record.window.getBounds();
+        const area = screen.getDisplayMatching(bounds).workArea;
+        record.window.setBounds(clampBounds({ ...bounds, ...this.petSize() }, area));
+      }
+      this.send(record, DESKTOP_IPC.hostRenderPreferences, { reducedMotion: preferences.values.reducedMotion });
+    }
+  }
+
+  private async handleHostRequest(event: IpcMainInvokeEvent, args: readonly unknown[]):
+    Promise<HostSettingsResult | HostPreferencesViewResult | BackupViewResult> {
+    const parsed = hostRendererRequestSchema.safeParse(args[0]);
+    if (args.length !== 1 || !parsed.success) throw new Error('INVALID_REQUEST');
+    const request = parsed.data;
+    const stamp = this.authorizedFeature(event, request.kind === 'backup' || request.kind === 'login');
+    if (!stamp) throw new Error('FORBIDDEN');
+    const unavailable = { ok: false, code: 'SERVICE_UNAVAILABLE' } as const;
+    const settingsUnavailable = { ...unavailable, settings: null };
+    if (request.kind === 'backup') return this.exportBackup(event, stamp);
+    if (request.kind === 'login') {
+      const before = this.shortcuts?.getHostSettings();
+      if (!before?.ok) return settingsUnavailable;
+      if (before.settings.loginStart.availability !== 'READY') return { ok: false, code: 'UNSUPPORTED', settings: before.settings };
+      const confirmed = await this.confirmNative(stamp, '登录时启动', request.enabled ? '允许 Pet Desktop 在登录 Windows 时启动？' : '关闭 Pet Desktop 的登录启动？', '确认');
+      return confirmed && this.recheckFeature(event, stamp) ? this.shortcuts?.setLoginStart(request.enabled) ?? settingsUnavailable : settingsUnavailable;
+    }
+    const previous = this.hostPreferences;
+    if (request.kind === 'shortcuts' && (process.platform !== 'win32' || !previous || !this.shortcuts)) {
+      return { ok: false, code: process.platform === 'win32' ? 'SERVICE_UNAVAILABLE' : 'UNSUPPORTED', settings: null };
+    }
+    if (request.kind === 'settings' && this.shortcuts) return this.shortcuts.getHostSettings();
+    const result = await this.service.requestHost(request.kind === 'shortcuts'
+      ? { ...request, expectedRevision: previous!.revision }
+      : request.kind === 'settings' ? { kind: 'preferences' } : request);
+    if (result.kind !== 'preferences') return unavailable;
+    const response = result.result;
+    if (response.ok && !this.stopping && this.status.stage === 'READY' && this.status.generation === stamp.serviceGeneration) {
+      this.applyHostPreferences(response.preferences);
+    }
+    if (!this.recheckFeature(event, stamp)) return unavailable;
+    if (request.kind === 'settings') return this.shortcuts?.getHostSettings() ?? settingsUnavailable;
+    if (request.kind === 'shortcuts') {
+      if (!response.ok) return settingsUnavailable;
+      if (previous?.values.hotkeysEnabled === request.enabled) return this.shortcuts?.setHostShortcutEnabled(request.enabled) ?? settingsUnavailable;
+      return this.shortcuts?.getHostSettings() ?? settingsUnavailable;
+    }
+    return response;
+  }
+
+  private async exportBackup(event: IpcMainInvokeEvent, stamp: FeatureStamp): Promise<BackupViewResult> {
+    if (this.nativePrompt || this.backupInProgress || this.voiceOwner || this.micLease) return { ok: false, code: 'BUSY' };
+    this.backupInProgress = true;
+    try {
+      this.nativePrompt = true;
+      let selected;
+      try {
+        const date = new Date().toISOString().slice(0, 10);
+        selected = await dialog.showSaveDialog(stamp.record.window, {
+          title: '导出 Pet Desktop 本地存档', defaultPath: `pet-desktop-${date}.sqlite3`,
+          filters: [{ name: 'SQLite 存档', extensions: ['sqlite3'] }],
+        });
+      } finally { this.nativePrompt = false; }
+      if (selected.canceled || !selected.filePath) return { ok: false, code: 'CANCELLED' };
+      if (!this.recheckFeature(event, stamp)) return { ok: false, code: 'SERVICE_UNAVAILABLE' };
+      const reply = await this.service.requestHost({ kind: 'backup', destination: selected.filePath });
+      if (!this.recheckFeature(event, stamp) || reply.kind !== 'backup') return { ok: false, code: 'SERVICE_UNAVAILABLE' };
+      return reply.result;
+    } catch {
+      return { ok: false, code: 'EXPORT_FAILED' };
+    } finally { this.backupInProgress = false; }
   }
 
   private async handleAiRequest(event: IpcMainInvokeEvent, args: readonly unknown[]): Promise<AiResult> {
@@ -950,6 +1071,9 @@ export class DesktopHost {
       record.documentReady = isTrustedDocument(record.binding, window.webContents.getURL());
       if (record.pet) record.pet.documentReady = true;
       this.send(record, DESKTOP_IPC.status, this.status);
+      if (record.pet && this.hostPreferences) {
+        this.send(record, DESKTOP_IPC.hostRenderPreferences, { reducedMotion: this.hostPreferences.values.reducedMotion });
+      }
       if (this.status.stage === 'READY' && this.snapshot) this.send(record, DESKTOP_IPC.snapshot, this.snapshot);
       if (record.pet) this.reconcilePets();
     });
@@ -1057,7 +1181,7 @@ export class DesktopHost {
     const display = screen.getAllDisplays().find((candidate) => candidate.id === anchor?.displayId)
       ?? screen.getPrimaryDisplay();
     const area = display.workArea;
-    const size = pet ? PET_SIZE : { width: 900, height: 680 };
+    const size = pet ? this.petSize() : { width: 900, height: 680 };
     const offset = pet ? 30 * this.windows.size : 0;
     const x = anchor ? area.x + anchor.offsetX : pet ? area.x + area.width - size.width - 24 - offset
       : area.x + Math.round((area.width - size.width) / 2);
@@ -1110,16 +1234,18 @@ export class DesktopHost {
     this.updateTray();
   }
 
+  private togglePetVisibility(): void {
+    this.manuallyHidden = !this.manuallyHidden;
+    this.reconcilePets();
+    this.updateTray();
+  }
+
   private updateTray(): void {
     if (!this.tray || this.tray.isDestroyed()) return;
     this.tray.setContextMenu(Menu.buildFromTemplate([
       { label: '打开控制中心', click: () => this.openControlCenter() },
       ...(this.stopping ? [{ label: '等待本地服务确认退出…', enabled: false }] : []),
-      { label: this.manuallyHidden ? '恢复桌面宠物' : '暂时隐藏桌面宠物', click: () => {
-        this.manuallyHidden = !this.manuallyHidden;
-        this.reconcilePets();
-        this.updateTray();
-      } },
+      { label: this.manuallyHidden ? '恢复桌面宠物' : '暂时隐藏桌面宠物', click: () => this.togglePetVisibility() },
       { label: '自动命中（实验）', type: 'radio', checked: this.inputMode === 'auto', click: () => this.setInputMode('auto') },
       { label: '整窗鼠标穿透', type: 'radio', checked: this.inputMode === 'through', click: () => this.setInputMode('through') },
       { label: '临时矩形交互（20秒）', type: 'radio', checked: this.inputMode === 'temporary-interactive', click: () => this.setInputMode('temporary-interactive') },
@@ -1139,6 +1265,7 @@ export class DesktopHost {
   async stop(): Promise<void> {
     if (this.stopping) return;
     this.stopping = true;
+    this.shortcuts?.close();
     this.workspaceHost?.close();
     this.invalidateFeatures();
     this.micConsent = undefined;

@@ -3,6 +3,8 @@ import { CONTRACT_SCHEMA_VERSION, idSchema, ipcRequestSchema, resultMatchesMetho
 import type { AppSnapshot, IpcErrorCode, IpcRequest, IpcResult } from '@pet-desktop/contracts';
 import { serviceInputSchema, serviceOutputSchema } from '../shared/protocol.js';
 import type { ServiceInput, ServiceStatus, SnapshotListener, StatusListener } from '../shared/protocol.js';
+import { hostAuthorityFailure } from '../shared/host-settings-ipc';
+import type { HostAuthorityRequest, HostAuthorityResult } from '../shared/host-settings-ipc';
 import { FeatureClient } from './feature-client';
 import type { AiRequest,AiResult,ChatIdentity } from '../shared/ai-ipc';
 import type { AiCancelReason,ChatStreamEvent } from '@pet-desktop/contracts/ai';
@@ -139,6 +141,11 @@ export class ServiceClient {
   requestWorkspace(request:WorkspaceAuthorityRequest):Promise<WorkspaceAuthorityResult>{
     const session=this.current;if(!session||session.phase!=='online'||this.stopping||!session.features)return Promise.resolve({ok:false,requestId:request.requestId,method:request.intent.method,error:{code:'SERVICE_UNAVAILABLE'}});
     return session.features.requestWorkspace(request);
+  }
+  requestHost(request: HostAuthorityRequest): Promise<HostAuthorityResult> {
+    const session = this.current;
+    if (!session || session.phase !== 'online' || this.stopping || !session.features) return Promise.resolve(hostAuthorityFailure(request));
+    return session.features.requestHost(request);
   }
   requestVoiceSettings(request:VoiceSettingsRequest):Promise<VoiceSettingsResult>{
     const session=this.current;if(!session||session.phase!=='online'||this.stopping||!session.features)return Promise.resolve({ok:false,kind:'error',code:'UNAVAILABLE',petId:request.petId});
@@ -277,7 +284,7 @@ export class ServiceClient {
       case 'snapshot':
         this.publishSnapshot(session, message.snapshot);
         break;
-      case 'ai-result':case 'voice-result':case 'chat-event':case 'credential-lookup':case 'workspace-authority-result':case 'voice-settings-result':
+      case 'ai-result':case 'voice-result':case 'chat-event':case 'credential-lookup':case 'workspace-authority-result':case 'voice-settings-result':case 'host-authority-result':
         if(session.phase==='online')session.features?.receive(message);
         break;
       case 'fatal':

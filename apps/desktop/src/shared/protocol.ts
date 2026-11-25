@@ -11,7 +11,11 @@ import type { VoiceChatIdentity, VoiceMicGrant, VoiceMouthNotification, VoiceOwn
 import type {VoiceSettingsRequest,VoiceSettingsResult} from './voice-settings-ipc';
 import type {WorkspaceIntent,WorkspaceResult} from './workspace-ipc';
 
+import type { BackupViewResult, HostPreferenceSave, HostPreferencesViewResult, HostRenderPreferences, HostSettingsResult } from './host-settings-ipc';
+
 export const DESKTOP_IPC = Object.freeze({
+  hostRequest: 'pet-desktop:host-settings:v1',
+  hostRenderPreferences: 'pet-desktop:host-render-preferences:v1',
   request: 'pet-desktop:request:v1',
   snapshot: 'pet-desktop:snapshot:v1',
   getStatus: 'pet-desktop:get-status:v1',
@@ -57,10 +61,17 @@ export interface PetDesktopBridge extends DesktopBridgeBase {
   readonly role: 'pet';
   setInteractive(interactive: boolean): Promise<HostActionResult>;
   reportVisualReady(report: PetVisualReady): Promise<HostActionResult>;
+  subscribeHostRenderPreferences(listener: (value: HostRenderPreferences) => void): () => void;
   subscribeVoiceMouth(listener:(event:VoiceMouthNotification)=>void):()=>void;
 }
 export interface ControlCenterBridge extends DesktopBridgeBase {
   readonly role: 'control-center';
+  getHostSettings(): Promise<HostSettingsResult>;
+  setHostShortcutEnabled(enabled: boolean): Promise<HostSettingsResult>;
+  setLoginStart(enabled: boolean): Promise<HostSettingsResult>;
+  getHostPreferences(): Promise<HostPreferencesViewResult>;
+  saveHostPreferences(edit: HostPreferenceSave): Promise<HostPreferencesViewResult>;
+  exportBackup(): Promise<BackupViewResult>;
   listGallery(query: GalleryQuery): Promise<GalleryIpcResult>;
   listCharacters(): Promise<CharactersIpcResult>;
   listInventory(legacyOffset?: number): Promise<InventoryIpcResult>;

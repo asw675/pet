@@ -11,13 +11,17 @@ import type { WorkspaceAuthorityRequest,WorkspaceAuthorityResult } from '../shar
 import { voiceSettingsRequestSchema,voiceSettingsResultMatchesRequest } from '../shared/voice-settings-ipc';
 import type { VoiceSettingsRequest,VoiceSettingsResult } from '../shared/voice-settings-ipc';
 
+import { hostAuthorityRequestSchema, hostAuthorityFailure } from '../shared/host-settings-ipc';
+import type { HostAuthorityRequest, HostAuthorityResult } from '../shared/host-settings-ipc';
+
 const sameChat=(a:ChatIdentity,b:ChatIdentity)=>a.petId===b.petId&&a.conversationId===b.conversationId&&a.requestId===b.requestId;
 const aiFailure=(request:AiRequest,code:'UNAVAILABLE'|'TIMEOUT'|'UNSUPPORTED'='UNAVAILABLE'):AiResult=>({requestId:request.requestId,method:request.intent.method,ok:false,
   error:{code,message:code==='TIMEOUT'?'AI 请求结果尚未确认，请刷新对话。':'AI 服务暂不可用。',retryable:code!=='UNSUPPORTED'}});
 const voiceFailure=(request:VoiceServiceRequest,code:'unavailable'|'timeout'='unavailable'):VoiceServiceResult=>({ok:false,kind:'error',code,...('job'in request?{job:request.job}:{})});
 const workspaceFailure=(request:WorkspaceAuthorityRequest):WorkspaceAuthorityResult=>({ok:false,requestId:request.requestId,method:request.intent.method,error:{code:'SERVICE_UNAVAILABLE'}});
 const voiceSettingsFailure=(request:VoiceSettingsRequest):VoiceSettingsResult=>({ok:false,kind:'error',code:'UNAVAILABLE',petId:request.petId});
-type Pending={kind:'ai',request:AiRequest,resolve:(result:AiResult)=>void,timer:ReturnType<typeof setTimeout>}
+type Pending = {kind:'host',request:HostAuthorityRequest,resolve:(result:HostAuthorityResult)=>void,timer:ReturnType<typeof setTimeout>}
+  | {kind:'ai',request:AiRequest,resolve:(result:AiResult)=>void,timer:ReturnType<typeof setTimeout>}
   |{kind:'voice',request:VoiceServiceRequest,resolve:(result:VoiceServiceResult)=>void,timer:ReturnType<typeof setTimeout>}
   |{kind:'workspace',request:WorkspaceAuthorityRequest,resolve:(result:WorkspaceAuthorityResult)=>void,timer:ReturnType<typeof setTimeout>}
   |{kind:'voice-settings',request:VoiceSettingsRequest,resolve:(result:VoiceSettingsResult)=>void,timer:ReturnType<typeof setTimeout>};
@@ -38,6 +42,19 @@ export class FeatureClient {
   private send(message:FeatureInput):boolean{
     if(this.closed)return false;
     try{this.options.post(featureInputSchema.parse(message));return true;}catch{this.options.fault();return false;}
+  }
+  requestHost(raw: HostAuthorityRequest): Promise<HostAuthorityResult> {
+    const request = hostAuthorityRequestSchema.parse(raw);
+    if (this.closed || this.pending.size >= 64 || this.used.size >= 30_000) return Promise.resolve(hostAuthorityFailure(request));
+    const requestId = `host-${randomUUID()}`;
+    this.used.add(requestId);
+    return new Promise(resolve => {
+      const timer = setTimeout(() => {
+        if (this.pending.delete(requestId)) resolve(hostAuthorityFailure(request));
+      }, request.kind === 'backup' ? 180_000 : this.options.aiTimeoutMs ?? 15_000);
+      this.pending.set(requestId, { kind: 'host', request, resolve, timer });
+      if (!this.send({ kind: 'host-authority-request', requestId, request })) this.close();
+    });
   }
   requestAi(raw:AiRequest):Promise<AiResult>{
     const request=aiRequestSchema.parse(raw);
@@ -109,6 +126,17 @@ export class FeatureClient {
     if(!parsed.success){this.options.fault();return;}
     const output=parsed.data;
     switch(output.kind){
+      case 'host-authority-result': {
+        const p = this.pending.get(output.requestId);
+        if (!p) return;
+        if (p.kind !== 'host' || output.result.kind !== (p.request.kind === 'backup' ? 'backup' : 'preferences')) {
+          this.options.fault(); return;
+        }
+        this.pending.delete(output.requestId);
+        clearTimeout(p.timer);
+        p.resolve(output.result);
+        break;
+      }
       case 'ai-result':{
         const result=output.result,p=this.pending.get(result.requestId);
         if(!p)return;
@@ -162,7 +190,7 @@ export class FeatureClient {
   }
   close():void{
     if(this.closed)return;this.closed=true;this.chats.clear();this.activeVoice=null;this.voiceReserved=false;this.credentialLookups.clear();
-    for(const p of this.pending.values()){clearTimeout(p.timer);if(p.kind==='ai')p.resolve(aiFailure(p.request));else if(p.kind==='voice')p.resolve(voiceFailure(p.request));else if(p.kind==='workspace')p.resolve(workspaceFailure(p.request));else p.resolve(voiceSettingsFailure(p.request));}
+    for(const p of this.pending.values()){clearTimeout(p.timer);if(p.kind==='host')p.resolve(hostAuthorityFailure(p.request));else if(p.kind==='ai')p.resolve(aiFailure(p.request));else if(p.kind==='voice')p.resolve(voiceFailure(p.request));else if(p.kind==='workspace')p.resolve(workspaceFailure(p.request));else p.resolve(voiceSettingsFailure(p.request));}
     this.pending.clear();
   }
 }

@@ -9,6 +9,7 @@ import type { TripDepartureLoadoutRecord } from './trip-departure-storage.js';
 import type { AiStateStorage } from './ai-state-storage.js';
 import type { WorkspaceStorage } from './workspace-storage.js';
 import type { VoiceProfileStorage } from './voice-profile-storage.js';
+import type { HostPreferenceStorage } from './host-preference-storage.js';
 export type { TripDepartureLoadoutRecord } from './trip-departure-storage.js';
 import type { RewardDraft, TripCheckpoint, TripFact, TripSnapshot } from '@pet-desktop/domain';
 
@@ -200,6 +201,7 @@ export interface AppTransaction {
   aiState(): AiStateStorage;
   workspaceState(): WorkspaceStorage;
   voiceProfiles(): VoiceProfileStorage;
+  hostPreferences(): HostPreferenceStorage;
   getPreferences(): PreferencesRecord | null;
   savePreferences(record: PreferencesRecord): void;
   listPets(): PetRecord[];
@@ -283,6 +285,20 @@ export interface SqliteConnection {
   exec(sql: string): void;
   prepare(sql: string): SqlStatement;
   close(): void;
+}
+
+/** Trusted filesystem boundary for an explicitly selected backup export.
+ * The stage is a unique app-owned temporary path on the destination volume;
+ * publication must be atomic and exclusive (never replace an existing file).
+ * Neither this port nor a destination path is exposed to renderer IPC. */
+export interface BackupExportStage {
+  readonly filename: string;
+  publishVerified(): void;
+  dispose(): void;
+}
+export interface BackupExportIo {
+  stage(destination: string): BackupExportStage;
+  openReadOnly(filename: string): SqliteConnection;
 }
 
 export interface AppRuntime {

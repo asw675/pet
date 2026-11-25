@@ -1,3 +1,6 @@
+import type { HostAuthorityRequest, HostAuthorityResult } from '../src/shared/host-settings-ipc';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import type { EventEmitter } from 'node:events';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AppSnapshot } from '@pet-desktop/contracts';
@@ -14,7 +17,7 @@ import type { VoiceSettingsRequest, VoiceSettingsResult } from '../src/shared/vo
 // handlers and lifecycle using exact webContents/frame object identities.
 const electronMock = vi.hoisted(() => ({ handlers: new Map<string, (...args: any[]) => any>(), windows: [] as any[],
   permission: undefined as ((...args: any[]) => void) | undefined, check: undefined as (() => boolean) | undefined,
-  device: undefined as (() => boolean) | undefined, prompt: vi.fn(), power: undefined as EventEmitter | undefined,
+  device: undefined as (() => boolean) | undefined, prompt: vi.fn(), savePrompt: vi.fn(), power: undefined as EventEmitter | undefined,
   screen: undefined as EventEmitter | undefined }));
 
 vi.mock('electron', async () => {
@@ -73,7 +76,7 @@ vi.mock('electron', async () => {
   electronMock.screen = Object.assign(new EventEmitter(), { getAllDisplays: () => [display], getPrimaryDisplay: () => display,
     getDisplayMatching: () => display, getCursorScreenPoint: () => ({ x: 0, y: 0 }) });
   class Tray extends EventEmitter { setToolTip() {} setContextMenu() {} isDestroyed() { return false; } destroy() {} }
-  return { app, BrowserWindow: Window, dialog: { showMessageBox: electronMock.prompt }, ipcMain: { handle: (channel: string, handler: any) => electronMock.handlers.set(channel, handler) },
+  return { app, BrowserWindow: Window, dialog: { showMessageBox: electronMock.prompt, showSaveDialog: electronMock.savePrompt }, ipcMain: { handle: (channel: string, handler: any) => electronMock.handlers.set(channel, handler) },
     Menu: { buildFromTemplate: () => ({}) }, nativeImage: { createFromBitmap: () => ({ setTemplateImage() {} }) }, powerMonitor: electronMock.power,
     safeStorage: {}, screen: electronMock.screen, session: { defaultSession: {
       setPermissionRequestHandler: (handler: any) => { electronMock.permission = handler; },
@@ -98,6 +101,11 @@ function fixture() {
   let statusListener: (status: ServiceStatus) => void = () => {};
   let snapshotListener: (value: AppSnapshot) => void = () => {};
   const service = {
+    requestHost: vi.fn(async (request: HostAuthorityRequest): Promise<HostAuthorityResult> => {
+      if (request.kind === 'backup') return { kind: 'backup', result: { ok: true, schemaVersion: 11 } };
+      return { kind: 'preferences', result: { ok: true, preferences: { revision: 0, updatedAt: null,
+        values: { hotkeysEnabled: true, scalePercent: 100, reducedMotion: false } } } };
+    }),
     getStatus: () => current, start: () => snapshotListener(snapshot()), stop: async () => {}, request: vi.fn(),
     subscribeStatus: (listener: typeof statusListener) => { statusListener = listener; return () => {}; },
     subscribeSnapshot: (listener: typeof snapshotListener) => { snapshotListener = listener; return () => {}; },
@@ -148,10 +156,23 @@ describe('actual Main feature IPC and lifecycle (mocked Electron)', () => {
   beforeEach(() => {
     vi.useFakeTimers({ toFake: ['setTimeout','clearTimeout','setInterval','clearInterval','performance'] });
     electronMock.handlers.clear(); electronMock.windows.length = 0; electronMock.power?.removeAllListeners(); electronMock.screen?.removeAllListeners();
+    electronMock.savePrompt.mockReset();
     electronMock.prompt.mockReset(); electronMock.prompt.mockResolvedValue({ response: 1 });
     f = fixture();
   });
   afterEach(async () => { await f?.host.stop(); vi.useRealTimers(); });
+
+  it('accepts backup only from the focused control center and sends only the native-selected path to the writer', async () => {
+    const destination = join(tmpdir(), 'synthetic-backup.sqlite3');
+    electronMock.savePrompt.mockResolvedValueOnce({ canceled: true }).mockResolvedValueOnce({ canceled: false, filePath: destination });
+    await expect(f.callFrom(f.pet, DESKTOP_IPC.hostRequest, { kind: 'backup' })).rejects.toThrow('FORBIDDEN');
+    await expect(f.call(DESKTOP_IPC.hostRequest, { kind: 'backup', destination })).rejects.toThrow('INVALID_REQUEST');
+    expect(electronMock.savePrompt).not.toHaveBeenCalled();
+    expect(await f.call(DESKTOP_IPC.hostRequest, { kind: 'backup' })).toEqual({ ok: false, code: 'CANCELLED' });
+    expect(f.service.requestHost).not.toHaveBeenCalled();
+    expect(await f.call(DESKTOP_IPC.hostRequest, { kind: 'backup' })).toEqual({ ok: true, schemaVersion: 11 });
+    expect(f.service.requestHost).toHaveBeenCalledExactlyOnceWith({ kind: 'backup', destination });
+  });
 
   it('accepts only the trusted control-center main frame and remaps the AI transport correlation ID', async () => {
     expect(await f.call(DESKTOP_IPC.aiRequest, aiRequest)).toEqual(aiSuccess(aiRequest));

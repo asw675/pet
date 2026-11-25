@@ -17,6 +17,7 @@ const pet = computed(() => store.snapshot?.pets.find((entry) => entry.petId === 
 const canAct = computed(() => store.ready && !store.busy && !store.loading && pet.value?.presence === 'HOME' && pet.value.visibility === 'VISIBLE');
 const petCanvas = ref<InstanceType<typeof PetCanvas> | null>(null);
 const quietMotion = computed(() => !store.ready || !store.snapshot || store.snapshot.pausedRender || store.snapshot.doNotDisturb || pet.value?.visibility !== 'VISIBLE');
+const reducedMotion = ref(false);
 const hostError = ref<string | null>(null);
 const openingCenter = ref(false);
 const canHit = computed(() => !quietMotion.value && pet.value?.presence === 'HOME' && pet.value.visibility === 'VISIBLE');
@@ -24,6 +25,7 @@ const canHit = computed(() => !quietMotion.value && pet.value?.presence === 'HOM
 // Visual-only audio-clock samples from the trusted host. The pet renderer
 // owns no microphone, playback source, raw audio or AI/provider requests.
 let mouth = petId ? new VoiceMouthProjection(petId) : null;
+let unsubscribeRenderPreferences: (() => void) | undefined;
 let unsubscribeMouth: (() => void) | undefined;
 let mouthTimer: number | undefined;
 
@@ -139,6 +141,7 @@ function leave(): void {
 watch(canHit, (enabled) => enabled ? hitTest() : leave(), { flush: 'sync' });
 
 onMounted(() => {
+  unsubscribeRenderPreferences = bridge?.subscribeHostRenderPreferences(value => { reducedMotion.value = value.reducedMotion; });
   unsubscribeMouth = bridge?.subscribeVoiceMouth(onVoiceMouth);
   document.addEventListener('visibilitychange', onVoiceVisibility);
   document.addEventListener('mousemove', onMouseMove);
@@ -150,6 +153,7 @@ onMounted(() => {
 });
 
 onBeforeUnmount(() => {
+  unsubscribeRenderPreferences?.();
   unsubscribeMouth?.(); unsubscribeMouth = undefined;
   clearVoiceMouth(); mouth?.dispose(); mouth = null;
   document.removeEventListener('visibilitychange', onVoiceVisibility);
@@ -199,7 +203,7 @@ function interact(interaction: Interaction): void {
         <button class="more" aria-label="打开控制中心" title="控制中心" :disabled="openingCenter" @click="openControlCenter">···</button>
       </div>
       <div class="portrait-surface">
-        <PetCanvas ref="petCanvas" :character-id="pet.characterId" :activity="pet.activity" :paused="quietMotion" :interactive="canAct && canHit" @touch="interact('PET')" @visual="visual = $event" />
+        <PetCanvas ref="petCanvas" :character-id="pet.characterId" :activity="pet.activity" :paused="quietMotion" :reduced-motion="reducedMotion" :interactive="canAct && canHit" @touch="interact('PET')" @visual="visual = $event" />
       </div>
       <div class="state" data-hit>
         <span class="dot" :class="{ muted: !store.ready }"></span>

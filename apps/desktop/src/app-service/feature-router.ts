@@ -2,6 +2,8 @@ import { randomUUID } from 'node:crypto';
 import type { ChatIdentity } from '../shared/ai-ipc';
 import type { AiCancelReason } from '@pet-desktop/contracts/ai';
 import { aiResultMatches, aiResultSchema, credentialLookupReplySchema, credentialLookupSchema } from '../shared/ai-ipc';
+import { hostAuthorityFailure } from '../shared/host-settings-ipc';
+import type { HostAuthorityRequest, HostAuthorityResult } from '../shared/host-settings-ipc';
 import type { FeatureInput, FeatureOutput } from '../shared/feature-protocol';
 import { featureInputSchema, featureOutputSchema } from '../shared/feature-protocol';
 import { voiceResultMatchesRequest, voiceServiceResultSchema } from '../shared/voice-ipc';
@@ -45,7 +47,7 @@ export interface UtilityFeatures {
 /** Same utility process as the SQLite writer. Async provider completions are
  * awaited outside transactions, then authority performs short CAS writes. */
 export function createUtilityFeatureRouter(options:{ai:Pick<AiControlService,'handleRequest'|'cancelInternal'|'close'>;
-  voice:Pick<VoiceService,'handle'|'dispose'>;voiceSettings:Pick<VoiceSettingsService,'handle'|'dispose'>;workspace:Pick<WorkspaceControl,'handleAuthority'>;broker:UtilityCredentialBroker;send:(value:FeatureOutput)=>void;fault:()=>void}):UtilityFeatures {
+  voice:Pick<VoiceService,'handle'|'dispose'>;voiceSettings:Pick<VoiceSettingsService,'handle'|'dispose'>;workspace:Pick<WorkspaceControl,'handleAuthority'>;host?: (request: HostAuthorityRequest) => HostAuthorityResult;broker:UtilityCredentialBroker;send:(value:FeatureOutput)=>void;fault:()=>void}):UtilityFeatures {
   let closed=false;
   const send=(message:FeatureOutput)=>{if(!closed)options.send(featureOutputSchema.parse(message));};
   return{
@@ -53,6 +55,10 @@ export function createUtilityFeatureRouter(options:{ai:Pick<AiControlService,'ha
       if(closed)return;
       const input=featureInputSchema.parse(raw);
       switch(input.kind){
+        case 'host-authority-request':
+          send({ kind: 'host-authority-result', requestId: input.requestId,
+            result: options.host?.(input.request) ?? hostAuthorityFailure(input.request) });
+          break;
         case 'credential-reply':options.broker.receive(input.reply);break;
         case 'internal-chat-cancel':{
           const {reason,...identity}=input.cancel;

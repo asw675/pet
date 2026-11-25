@@ -60,5 +60,6 @@
 | 007E-2/008C/009D | AI、语音、工作台同一写入者及闭合真实业务传输、原生发行门禁 | 296项专项、生产构建通过；真实 Windows 待验收 | [007e2-feature-transport](007e2-feature-transport.md) |
 | 007E-3/008D/009F | 聊天、记忆、语音口型及工作台实际页面 | 专项及生产构建通过，实机待验收 | [007e3-user-interfaces](007e3-user-interfaces.md) |
 | 007-Q | 固定 d20fc41 核心功能及代码规模核对 | 开发覆盖约82.7% | [007-progress-checkpoint](007-progress-checkpoint.md) |
+| 010A | SQLite v11、宿主显示偏好与手动备份 | SQLite 和宿主专项通过，Windows 真机待验收 | [010a-host-preferences-and-backup](010a-host-preferences-and-backup.md) |
 
 每份记录包含：日期、范围、设计依据、具体变更、测试命令与真实结果、已知限制、下一步。完整验收状态见 [POC 矩阵](../qa/poc-matrix.md)。

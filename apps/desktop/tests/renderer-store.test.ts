@@ -49,6 +49,12 @@ function testBridge() {
   const listTravelReports = vi.fn<ControlCenterBridge['listTravelReports']>();
   const listEvents = vi.fn<ControlCenterBridge['listEvents']>();
   const bridge: ControlCenterBridge = {
+    getHostSettings: vi.fn<ControlCenterBridge['getHostSettings']>(),
+    setHostShortcutEnabled: vi.fn<ControlCenterBridge['setHostShortcutEnabled']>(),
+    setLoginStart: vi.fn<ControlCenterBridge['setLoginStart']>(),
+    getHostPreferences: vi.fn<ControlCenterBridge['getHostPreferences']>(),
+    saveHostPreferences: vi.fn<ControlCenterBridge['saveHostPreferences']>(),
+    exportBackup: vi.fn<ControlCenterBridge['exportBackup']>(),
     role: 'control-center', getServiceStatus, getSnapshot, dispatch, listGallery, listCharacters, listInventory,
     listTravelCatalog, previewTravel, listTravelReports, listEvents,
     aiRequest:vi.fn<ControlCenterBridge['aiRequest']>(),subscribeChatEvents:()=>()=>undefined,

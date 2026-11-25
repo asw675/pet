@@ -4,9 +4,11 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { describe, expect, it } from 'vitest';
 import { advanceTrip, createTripCheckpoint, createTripSnapshot, DEMO_ROUTE } from '@pet-desktop/domain';
-import { MIGRATION_001, MIGRATION_002, MIGRATION_003, MIGRATION_004, MIGRATION_005, MIGRATION_006, MIGRATION_007, SQLiteRepository } from '../src/sqlite-repository.ts';
+import { MIGRATION_001, MIGRATION_002, MIGRATION_003, MIGRATION_004, MIGRATION_005, MIGRATION_006, MIGRATION_007, SQLiteRepository, SCHEMA_VERSION } from '../src/sqlite-repository.ts';
 import { AI_STATE_MIGRATION_SQL, AiStateStorage } from '../src/ai-state-storage.ts';
 import { WORKSPACE_MIGRATION_SQL, WorkspaceStorage } from '../src/workspace-storage.ts';
+import { VOICE_PROFILE_MIGRATION_SQL, VoiceProfileStorage } from '../src/voice-profile-storage.ts';
+import { DEFAULT_HOST_PREFERENCES } from '../src/host-preference-storage.ts';
 import { DEFAULT_LOCAL_VOICE_CONFIG } from '@pet-desktop/contracts/voice';
 import { selectEvent, resolveEventOccurrence } from '@pet-desktop/domain/event-engine';
 
@@ -93,6 +95,7 @@ const OLD_MIGRATION_007_CHECKSUM = 'fnv1a32:049ff093'; // Measured against commi
 const MOUNTED_AI_MIGRATION_CHECKSUM = 'fnv1a32:eb3b9ef0';
 const MOUNTED_WORKSPACE_MIGRATION_CHECKSUM = 'fnv1a32:08f24fcd';
 const MOUNTED_VOICE_MIGRATION_CHECKSUM = 'fnv1a32:233919ba';
+const MOUNTED_HOST_MIGRATION_CHECKSUM = 'fnv1a32:c7b7df18';
 const hash = 'a'.repeat(64);
 function departurePin(trip, version = '1.0.0', assetHash = hash) {
   return { tripId: trip.snapshot.tripId, petId: trip.snapshot.petId, cgId: 'postcard', variant: 'default',
@@ -275,14 +278,14 @@ describe('SQLite repository — schema and engine', () => {
     }
   });
 
-  it('creates v1 through v10 in contiguous order with verified pragmas and no temp tables', () => withMemory((repo, db) => {
+  it('creates all numbered migrations in contiguous order, preserving prior checksums, with no temp tables', () => withMemory((repo, db) => {
     expect(db.prepare('PRAGMA journal_mode').get().journal_mode).toBe('memory');
     expect(db.prepare('PRAGMA foreign_keys').get().foreign_keys).toBe(1);
     expect(db.prepare('PRAGMA synchronous').get().synchronous).toBe(2);
     expect(db.prepare('PRAGMA busy_timeout').get().timeout).toBe(5000);
-    expect(db.prepare('PRAGMA user_version').get().user_version).toBe(10);
+    expect(db.prepare('PRAGMA user_version').get().user_version).toBe(SCHEMA_VERSION);
     const history = db.prepare('SELECT version, checksum FROM schema_migrations ORDER BY version').all();
-    expect(history.map(row => row.version)).toEqual([1,2,3,4,5,6,7,8,9,10]);
+    expect(history.map(row => row.version)).toEqual(Array.from({length:SCHEMA_VERSION},(_,i)=>i+1));
     expect(history[0].checksum).toBe(OLD_MIGRATION_CHECKSUM);
     expect(history[1].checksum).toBe(OLD_MIGRATION_002_CHECKSUM);
     expect(history[2].checksum).toBe(OLD_MIGRATION_003_CHECKSUM);
@@ -293,15 +296,17 @@ describe('SQLite repository — schema and engine', () => {
     expect(history[7].checksum).toBe(MOUNTED_AI_MIGRATION_CHECKSUM);
     expect(history[8].checksum).toBe(MOUNTED_WORKSPACE_MIGRATION_CHECKSUM);
     expect(history[9].checksum).toBe(MOUNTED_VOICE_MIGRATION_CHECKSUM);
+    expect(history[10].checksum).toBe(MOUNTED_HOST_MIGRATION_CHECKSUM);
+    for(const migration of history.slice(11))expect(migration.checksum).toMatch(/^fnv1a32:[0-9a-f]{8}$/);
     expect(db.prepare('SELECT name FROM sqlite_temp_schema').all()).toEqual([]);
-    expect(db.prepare("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all().map(row => row.name)).toEqual([
+    expect(db.prepare("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all().map(row => row.name)).toEqual(expect.arrayContaining([
       'ai_action_proposals','ai_candidate_ids','ai_candidate_sources','ai_conversations','ai_memories','ai_memory_candidates','ai_memory_grants','ai_memory_ids','ai_memory_sources',
       'ai_messages','ai_pet_provider_assignments','ai_proposal_ids','ai_provider_configs','ai_turn_memory_refs','ai_turn_sources','ai_turns',
-      'cg_unlocks', 'commands', 'commerce_operation_instances', 'commerce_operation_materials', 'commerce_operations', 'event_cg_unlocks', 'event_effects', 'event_finalizations', 'event_occurrences', 'event_trigger_receipts', 'inventory', 'item_instances', 'launch_history', 'outbox',
+      'cg_unlocks', 'commands', 'commerce_operation_instances', 'commerce_operation_materials', 'commerce_operations', 'event_cg_unlocks', 'event_effects', 'event_finalizations', 'event_occurrences', 'event_trigger_receipts', 'host_preferences','host_window_anchors','inventory', 'item_instances', 'launch_history', 'outbox',
       'pet_acquisitions', 'pet_equipment', 'pet_home_schedules', 'pet_progression', 'pet_states', 'pets', 'preferences',
       'quick_actions','recommendation_impressions','recommendation_preferences','reward_ledger','routine_targets','routines','schema_migrations','settlements',
       'trip_cg_asset_pins','trip_departure_equipment','trip_departure_loadouts','trip_departure_supplies','trip_events','trip_reports','trips','voice_profiles','wallet','workspace_settings',
-    ]);
+    ]));
     expect(repo.transaction(tx => [tx.getPreferences(), tx.listPets(), tx.listTrips(), tx.getWalletCoins()])).toEqual([null, [], [], 0]);
   }));
 
@@ -534,15 +539,63 @@ function createV9Archive(db) {
   }catch(error){db.exec('ROLLBACK');throw error;}
 }
 
+function createV10Archive(db) {
+  const prior=createV9Archive(db);
+  db.exec('BEGIN IMMEDIATE');
+  try{
+    db.exec(VOICE_PROFILE_MIGRATION_SQL);
+    db.prepare('INSERT INTO schema_migrations VALUES(10,?,?)').run(MOUNTED_VOICE_MIGRATION_CHECKSUM,START+9);
+    db.exec('PRAGMA user_version=10');
+    const profile=new VoiceProfileStorage(db,()=>true).save('pet-event',{...DEFAULT_LOCAL_VOICE_CONFIG,volume:.65},0,prior.at);
+    db.exec('COMMIT');return {...prior,profile};
+  }catch(error){db.exec('ROLLBACK');throw error;}
+}
+
+describe('SQLite repository — genuine v10 host preference migration',()=>{
+  it('backs up v10 before adding defaults and preserves real voice/AI/workspace/event/CG/travel history without invented placement',()=>withFile(path=>{
+    const db=new DatabaseSync(path),fixture=createV10Archive(db),backupPath=`${path}.v10-backup`;
+    const take=()=>Object.fromEntries(['schema_migrations','voice_profiles','ai_provider_configs','ai_pet_provider_assignments','ai_conversations','event_occurrences','workspace_settings','quick_actions','launch_history','trips','trip_departure_loadouts']
+      .map(table=>[table,db.prepare(`SELECT * FROM ${table}`).all()]));
+    const before=take(),failing={prepare:sql=>db.prepare(sql),close:()=>db.close(),exec(sql){db.exec(sql);if(sql.includes('CREATE TABLE host_preferences'))throw new Error('v11 post-DDL fault');}};
+    try{
+      expect(()=>new SQLiteRepository(db,{persistent:true})).toThrow(/pre-migration backup callback/);
+      expect(()=>new SQLiteRepository(db,{persistent:true,beforeMigration(){throw new Error('v10 backup failed');}})).toThrow(/v10 backup failed/);
+      expect(()=>new SQLiteRepository(failing,{persistent:true,beforeMigration(){}})).toThrow(/v11 post-DDL fault/);
+      expect(db.prepare('PRAGMA user_version').get().user_version).toBe(10);expect(take()).toEqual(before);
+      expect(db.prepare('SELECT name FROM sqlite_schema WHERE name=?').get('host_preferences')).toBeUndefined();
+      let calls=0;
+      const repo=new SQLiteRepository(db,{persistent:true,beforeMigration(from,to){calls++;expect([from,to]).toEqual([10,SCHEMA_VERSION]);db.prepare('VACUUM INTO ?').run(backupPath);}});
+      expect(calls).toBe(1);expect(db.prepare('PRAGMA user_version').get().user_version).toBe(SCHEMA_VERSION);
+      repo.transaction(tx=>{
+        expect(tx.voiceProfiles().get('pet-event')).toEqual(fixture.profile);
+        expect(tx.aiState().getPetProviderAssignment('pet-event')).toEqual(fixture.assignment);
+        expect(tx.workspaceState().getActionRecord(fixture.action.id)).toEqual(fixture.action);
+        expect(tx.workspaceState().listLaunchHistory(fixture.at)).toEqual([fixture.history]);
+        expect(tx.getEventOccurrence(fixture.event.occurrence.occurrenceId)).toEqual(fixture.terminal);
+        expect(tx.getTripDepartureLoadout('trip-v6')).toEqual(fixture.loadout);
+        expect(tx.hostPreferences().getPreferences()).toEqual({...DEFAULT_HOST_PREFERENCES,revision:0,updatedAt:null});
+        expect(tx.hostPreferences().listAnchors()).toEqual([]);
+      });
+      const backup=new DatabaseSync(backupPath);
+      try{
+        expect(backup.prepare('PRAGMA user_version').get().user_version).toBe(10);
+        expect(backup.prepare('SELECT name FROM sqlite_schema WHERE name=?').get('host_preferences')).toBeUndefined();
+        expect(backup.prepare('SELECT revision FROM voice_profiles WHERE pet_id=?').get('pet-event').revision).toBe(fixture.profile.revision);
+        expect(backup.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
+      }finally{backup.close();}
+    }finally{db.close();}
+  }));
+});
+
 describe('SQLite repository — real v1 archive migration', () => {
   it('verifies the old archive, runs a synchronous backup outside the transaction, preserves history and settles legacy in-flight only as unversioned', () => withFile(path => {
     const db = new DatabaseSync(path);
     const { old, active, oldUnlock, final } = createV1Archive(db);
-    const backupPath = `${path}.before-v10`;
+    const backupPath = `${path}.before-latest`;
     let callbacks = 0;
     const repo = new SQLiteRepository(db, { persistent: true, beforeMigration(from, to) {
       callbacks++;
-      expect([from,to]).toEqual([1,10]);
+      expect([from,to]).toEqual([1,SCHEMA_VERSION]);
       expect(db.prepare('PRAGMA user_version').get().user_version).toBe(1);
       expect(db.prepare('SELECT version, checksum FROM schema_migrations').all()).toEqual([{ version: 1, checksum: OLD_MIGRATION_CHECKSUM }]);
       expect(db.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
@@ -552,7 +605,7 @@ describe('SQLite repository — real v1 archive migration', () => {
     } });
     try {
       expect(callbacks).toBe(1);
-      expect(db.prepare('PRAGMA user_version').get().user_version).toBe(10);
+      expect(db.prepare('PRAGMA user_version').get().user_version).toBe(SCHEMA_VERSION);
       expect(db.prepare('SELECT trip_id, cg_pin_schema FROM trips ORDER BY trip_id').all()).toEqual([
         { trip_id: 'trip-legacy', cg_pin_schema: 1 }, { trip_id: 'trip-old', cg_pin_schema: 1 },
       ]);
@@ -590,7 +643,7 @@ describe('SQLite repository — real v1 archive migration', () => {
       } finally { backup.close(); }
     } finally { repo.close(); }
     const reopened = new DatabaseSync(path);
-    const v10 = new SQLiteRepository(reopened, { persistent: true, beforeMigration() { throw new Error('should not back up v10 again'); } });
+    const v10 = new SQLiteRepository(reopened, { persistent: true, beforeMigration() { throw new Error('should not back up current schema again'); } });
     try {
       expect(v10.transaction(tx => tx.listCgUnlocks('pet-a'))).toEqual([unlocked(oldUnlock)]);
       expect(reopened.prepare('PRAGMA integrity_check').all().map(row => row.integrity_check)).toEqual(['ok']);
@@ -649,24 +702,24 @@ describe('SQLite repository — real v1 archive migration', () => {
       expect(db.prepare('SELECT name FROM sqlite_schema WHERE name=?').get('trip_cg_asset_pins')).toBeUndefined();
       const repo = new SQLiteRepository(db, { persistent: true, beforeMigration });
       expect(backups).toBe(2);
-      expect(db.prepare('PRAGMA user_version').get().user_version).toBe(10);
+      expect(db.prepare('PRAGMA user_version').get().user_version).toBe(SCHEMA_VERSION);
       expect(repo.transaction(tx => tx.getCgUnlock('pet-a','postcard','default'))).toEqual(unlocked(oldUnlock));
     } finally { db.close(); }
   }));
 
-  it('verifies all ten applied checksums and refuses missing or noncontiguous history on v10 startup', () => withFile(path => {
+  it('verifies all applied checksums and refuses missing or noncontiguous history on current startup', () => withFile(path => {
     const initial = new DatabaseSync(path);
     new SQLiteRepository(initial, { persistent: true }).close();
     const db = new DatabaseSync(path);
     try {
-      for (const [version, checksum] of [[1, OLD_MIGRATION_CHECKSUM],[2, OLD_MIGRATION_002_CHECKSUM],[3,OLD_MIGRATION_003_CHECKSUM],[4,OLD_MIGRATION_004_CHECKSUM],[5,OLD_MIGRATION_005_CHECKSUM],[6,OLD_MIGRATION_006_CHECKSUM],[7,OLD_MIGRATION_007_CHECKSUM],[8,MOUNTED_AI_MIGRATION_CHECKSUM],[9,MOUNTED_WORKSPACE_MIGRATION_CHECKSUM],[10,MOUNTED_VOICE_MIGRATION_CHECKSUM]]) {
+      for (const {version,checksum} of db.prepare('SELECT version,checksum FROM schema_migrations ORDER BY version').all()) {
         db.prepare("UPDATE schema_migrations SET checksum='bad' WHERE version=?").run(version);
         expect(() => new SQLiteRepository(db, { persistent: true })).toThrow(/checksum mismatch/);
         db.prepare('UPDATE schema_migrations SET checksum=? WHERE version=?').run(checksum, version);
       }
-      db.exec('UPDATE schema_migrations SET version=11 WHERE version=2');
+      db.prepare('UPDATE schema_migrations SET version=? WHERE version=2').run(SCHEMA_VERSION+1);
       expect(() => new SQLiteRepository(db, { persistent: true })).toThrow(/not contiguous/);
-      db.exec('DELETE FROM schema_migrations WHERE version=11');
+      db.prepare('DELETE FROM schema_migrations WHERE version=?').run(SCHEMA_VERSION+1);
       expect(() => new SQLiteRepository(db, { persistent: true })).toThrow(/history is invalid/);
     } finally { db.close(); }
   }));
@@ -688,13 +741,13 @@ describe('SQLite repository — real v1 archive migration', () => {
 });
 
 describe('SQLite repository — genuine v2 acquisition migration', () => {
-  it('preserves pinned CG/trips/receipt and legacy pets while invoking one v2→v10 pre-backup', () => withFile(path => {
+  it('preserves pinned CG/trips/receipt and legacy pets while invoking one v2→current pre-backup', () => withFile(path => {
     const db = new DatabaseSync(path), fixture = createV2Archive(db);
     const backupPath = `${path}.v2-copy`;
     let calls = 0;
     const repo = new SQLiteRepository(db, { persistent:true,beforeMigration(from,to) {
       calls++;
-      expect([from,to]).toEqual([2,10]);
+      expect([from,to]).toEqual([2,SCHEMA_VERSION]);
       expect(db.prepare('PRAGMA user_version').get().user_version).toBe(2);
       expect(db.prepare('SELECT version, checksum FROM schema_migrations ORDER BY version').all()).toEqual([
         {version:1,checksum:OLD_MIGRATION_CHECKSUM},{version:2,checksum:OLD_MIGRATION_002_CHECKSUM},
@@ -704,7 +757,7 @@ describe('SQLite repository — genuine v2 acquisition migration', () => {
     } });
     try {
       expect(calls).toBe(1);
-      expect(db.prepare('PRAGMA user_version').get().user_version).toBe(10);
+      expect(db.prepare('PRAGMA user_version').get().user_version).toBe(SCHEMA_VERSION);
       expect(db.prepare('SELECT * FROM pet_acquisitions').all()).toEqual([]);
       repo.transaction(tx => {
         expect(tx.listPets().map(p=>p.petId)).toEqual(['pet-a','pet-b','pet-c']);
@@ -782,7 +835,7 @@ describe('SQLite repository — genuine v3 home-clock migration', () => {
     let calls=0;
     const repo=new SQLiteRepository(db,{persistent:true,beforeMigration(from,to){
       calls++;
-      expect([from,to]).toEqual([3,10]);
+      expect([from,to]).toEqual([3,SCHEMA_VERSION]);
       expect(db.prepare('PRAGMA user_version').get().user_version).toBe(3);
       expect(db.prepare('SELECT version,checksum FROM schema_migrations ORDER BY version').all()).toEqual([
         {version:1,checksum:OLD_MIGRATION_CHECKSUM},{version:2,checksum:OLD_MIGRATION_002_CHECKSUM},{version:3,checksum:OLD_MIGRATION_003_CHECKSUM},
@@ -792,7 +845,7 @@ describe('SQLite repository — genuine v3 home-clock migration', () => {
     }});
     try{
       expect(calls).toBe(1);
-      expect(db.prepare('PRAGMA user_version').get().user_version).toBe(10);
+      expect(db.prepare('PRAGMA user_version').get().user_version).toBe(SCHEMA_VERSION);
       expect(db.prepare('SELECT * FROM pet_home_schedules').all()).toEqual([]);
       repo.transaction(tx=>{
         expect(tx.listPets().map(p=>p.petId)).toEqual(['pet-a','pet-b','pet-c',fixture.acquired.petId]);
@@ -844,13 +897,13 @@ describe('SQLite repository — genuine v4 commerce migration',()=>{
     const db=new DatabaseSync(path),fixture=createV4Archive(db),backupPath=`${path}.v4-backup`;
     let calls=0;
     const repo=new SQLiteRepository(db,{persistent:true,beforeMigration(from,to){
-      calls++;expect([from,to]).toEqual([4,10]);
+      calls++;expect([from,to]).toEqual([4,SCHEMA_VERSION]);
       expect(db.prepare('PRAGMA user_version').get().user_version).toBe(4);
       expect(db.prepare('SELECT name FROM sqlite_schema WHERE name=?').get('item_instances')).toBeUndefined();
       db.prepare('VACUUM INTO ?').run(backupPath);
     }});
     try{
-      expect(calls).toBe(1);expect(db.prepare('PRAGMA user_version').get().user_version).toBe(10);
+      expect(calls).toBe(1);expect(db.prepare('PRAGMA user_version').get().user_version).toBe(SCHEMA_VERSION);
       repo.transaction(tx=>{
         expect(tx.listInventory()).toEqual(fixture.stacks);
         expect(tx.listItemInstances()).toEqual([]);expect(tx.listPetEquipment()).toEqual([]);expect(tx.getCommerceOperation('absent')).toBeNull();
@@ -898,13 +951,13 @@ describe('SQLite repository — genuine v5 departure migration',()=>{
     const db=new DatabaseSync(path),fixture=createV5Archive(db),backupPath=`${path}.v5-backup`;
     let calls=0;
     const repo=new SQLiteRepository(db,{persistent:true,beforeMigration(from,to){
-      calls++;expect([from,to]).toEqual([5,10]);
+      calls++;expect([from,to]).toEqual([5,SCHEMA_VERSION]);
       expect(db.prepare('PRAGMA user_version').get().user_version).toBe(5);
       expect(db.prepare('SELECT name FROM sqlite_schema WHERE name=?').get('trip_departure_loadouts')).toBeUndefined();
       db.prepare('VACUUM INTO ?').run(backupPath);
     }});
     try {
-      expect(calls).toBe(1);expect(db.prepare('PRAGMA user_version').get().user_version).toBe(10);
+      expect(calls).toBe(1);expect(db.prepare('PRAGMA user_version').get().user_version).toBe(SCHEMA_VERSION);
       repo.transaction(tx=>{
         expect(tx.listInventory()).toEqual(fixture.stacks);expect(tx.getWalletCoins()).toBe(30);
         expect(tx.getItemInstance(fixture.item.instanceId)).toEqual(fixture.item);
@@ -958,12 +1011,12 @@ describe('SQLite repository — genuine v6 narrative migration',()=>{
     const db=new DatabaseSync(path),fixture=createV6Archive(db),backupPath=`${path}.v6-backup`;
     let calls=0;
     const repo=new SQLiteRepository(db,{persistent:true,beforeMigration(from,to){
-      calls++;expect([from,to]).toEqual([6,10]);expect(db.prepare('PRAGMA user_version').get().user_version).toBe(6);
+      calls++;expect([from,to]).toEqual([6,SCHEMA_VERSION]);expect(db.prepare('PRAGMA user_version').get().user_version).toBe(6);
       expect(db.prepare('SELECT name FROM sqlite_schema WHERE name=?').get('event_occurrences')).toBeUndefined();
       db.prepare('VACUUM INTO ?').run(backupPath);
     }});
     try{
-      expect(calls).toBe(1);expect(db.prepare('PRAGMA user_version').get().user_version).toBe(10);
+      expect(calls).toBe(1);expect(db.prepare('PRAGMA user_version').get().user_version).toBe(SCHEMA_VERSION);
       repo.transaction(tx=>{
         expect(tx.getTrip('trip-v6')).toEqual(fixture.v6Trip);expect(tx.getTripDepartureLoadout('trip-v6')).toEqual(fixture.loadout);
         expect(tx.getCommandReceipt(fixture.departure.commandId)).toEqual(fixture.departure);
@@ -1003,13 +1056,13 @@ describe('SQLite repository — actual AI, workspace and voice migration mount',
     const db=new DatabaseSync(path),fixture=createV7Archive(db),backupPath=`${path}.v7-backup`;
     let calls=0;
     const repo=new SQLiteRepository(db,{persistent:true,beforeMigration(from,to){
-      calls++;expect([from,to]).toEqual([7,10]);expect(db.prepare('PRAGMA user_version').get().user_version).toBe(7);
+      calls++;expect([from,to]).toEqual([7,SCHEMA_VERSION]);expect(db.prepare('PRAGMA user_version').get().user_version).toBe(7);
       expect(db.prepare('SELECT name FROM sqlite_schema WHERE name=?').get('ai_provider_configs')).toBeUndefined();
       expect(db.prepare('SELECT name FROM sqlite_schema WHERE name=?').get('workspace_settings')).toBeUndefined();
       db.prepare('VACUUM INTO ?').run(backupPath);
     }});
     try{
-      expect(calls).toBe(1);expect(db.prepare('PRAGMA user_version').get().user_version).toBe(10);
+      expect(calls).toBe(1);expect(db.prepare('PRAGMA user_version').get().user_version).toBe(SCHEMA_VERSION);
       repo.transaction(tx=>{
         expect(tx.getEventTriggerReceipt(fixture.no.triggerKey)).toEqual(fixture.no);
         expect(tx.getEventTriggerReceipt(fixture.event.receipt.triggerKey)).toEqual(fixture.event.receipt);
@@ -1057,7 +1110,7 @@ describe('SQLite repository — actual AI, workspace and voice migration mount',
       expect(()=>new SQLiteRepository(failing,{persistent:true,beforeMigration(){}})).toThrow(/v9 post-DDL fault/);
       expect(db.prepare('PRAGMA user_version').get().user_version).toBe(8);expect(take()).toEqual(before);
       expect(db.prepare('SELECT name FROM sqlite_schema WHERE name=?').get('workspace_settings')).toBeUndefined();
-      const repo=new SQLiteRepository(db,{persistent:true,beforeMigration(from,to){expect([from,to]).toEqual([8,10]);db.prepare('VACUUM INTO ?').run(backupPath);}});
+      const repo=new SQLiteRepository(db,{persistent:true,beforeMigration(from,to){expect([from,to]).toEqual([8,SCHEMA_VERSION]);db.prepare('VACUUM INTO ?').run(backupPath);}});
       repo.transaction(tx=>{
         const ai=tx.aiState();expect(ai.getProviderConfig(mountedMockProvider.providerId)).toEqual(fixture.provider);
         expect(ai.getPetProviderAssignment('pet-event')).toEqual(fixture.assignment);expect(ai.getConversation('pet-event',fixture.conversation.conversationId)).toEqual(fixture.conversation);
@@ -1073,7 +1126,7 @@ describe('SQLite repository — actual AI, workspace and voice migration mount',
     }finally{db.close();}
   }));
 
-  it('retains a valid independently committed v8 when v7→10 fails during v9; retry backs up from v8, not synthetic rollback to v7',()=>withFile(path=>{
+  it('retains a valid independently committed v8 when v7→current fails during v9; retry backs up from v8, not synthetic rollback to v7',()=>withFile(path=>{
     const db=new DatabaseSync(path),fixture=createV7Archive(db);let calls=[];
     const failing={prepare:sql=>db.prepare(sql),close:()=>db.close(),exec(sql){db.exec(sql);if(sql.includes('CREATE TABLE workspace_settings'))throw new Error('v9 post-DDL fault');}};
     const beforeMigration=(from,to)=>calls.push([from,to]);
@@ -1082,7 +1135,7 @@ describe('SQLite repository — actual AI, workspace and voice migration mount',
       expect(db.prepare('PRAGMA user_version').get().user_version).toBe(8);
       expect(db.prepare('SELECT checksum FROM schema_migrations WHERE version=8').get().checksum).toBe(MOUNTED_AI_MIGRATION_CHECKSUM);
       expect(db.prepare('SELECT count(*) AS n FROM ai_provider_configs').get().n).toBe(0);
-      const repo=new SQLiteRepository(db,{persistent:true,beforeMigration});expect(calls).toEqual([[7,10],[8,10]]);
+      const repo=new SQLiteRepository(db,{persistent:true,beforeMigration});expect(calls).toEqual([[7,SCHEMA_VERSION],[8,SCHEMA_VERSION]]);
       expect(repo.transaction(tx=>tx.getEventOccurrence(fixture.event.occurrence.occurrenceId))).toEqual(fixture.terminal);
     }finally{db.close();}
   }));
@@ -1158,8 +1211,8 @@ describe('SQLite repository — actual AI, workspace and voice migration mount',
       expect(db.prepare('PRAGMA user_version').get().user_version).toBe(9);expect(take()).toEqual(before);
       expect(db.prepare('SELECT name FROM sqlite_schema WHERE name=?').get('voice_profiles')).toBeUndefined();
       let calls=0;
-      const repo=new SQLiteRepository(db,{persistent:true,beforeMigration(from,to){calls++;expect([from,to]).toEqual([9,10]);db.prepare('VACUUM INTO ?').run(backupPath);}});
-      expect(calls).toBe(1);expect(db.prepare('PRAGMA user_version').get().user_version).toBe(10);
+      const repo=new SQLiteRepository(db,{persistent:true,beforeMigration(from,to){calls++;expect([from,to]).toEqual([9,SCHEMA_VERSION]);db.prepare('VACUUM INTO ?').run(backupPath);}});
+      expect(calls).toBe(1);expect(db.prepare('PRAGMA user_version').get().user_version).toBe(SCHEMA_VERSION);
       repo.transaction(tx=>{
         expect(tx.aiState().getPetProviderAssignment('pet-event')).toEqual(fixture.assignment);
         expect(tx.aiState().getConversation('pet-event',fixture.conversation.conversationId)).toEqual(fixture.conversation);

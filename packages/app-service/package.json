@@ -9,7 +9,8 @@
     "./ai-state-storage": "./src/ai-state-storage.ts",
     "./ai-authority-service": "./src/ai-authority-service.ts",
     "./workspace-storage": "./src/workspace-storage.ts",
-    "./voice-profile-storage": "./src/voice-profile-storage.ts"
+    "./voice-profile-storage": "./src/voice-profile-storage.ts",
+    "./host-preference-storage": "./src/host-preference-storage.ts"
   },
   "imports": {
     "#gallery-service": "./src/gallery-service.ts",
@@ -22,6 +23,7 @@
     "#workspace-storage": "./src/workspace-storage.ts",
     "#ai-authority-service": "./src/ai-authority-service.ts",
     "#voice-profile-storage": "./src/voice-profile-storage.ts",
+    "#host-preference-storage": "./src/host-preference-storage.ts",
     "#trip-departure-storage": "./src/trip-departure-storage.ts",
     "#ports": "./src/ports.ts",
     "#app-service": "./src/app-service.ts",

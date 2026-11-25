@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { AppService } from '../src/app-service.ts';
 import { verifyMigrationBackup } from '../src/migration-backup.ts';
-import { MIGRATION_001, MIGRATION_002, MIGRATION_003, MIGRATION_004, SQLiteRepository } from '../src/sqlite-repository.ts';
+import { MIGRATION_001, MIGRATION_002, MIGRATION_003, MIGRATION_004, SQLiteRepository, SCHEMA_VERSION } from '../src/sqlite-repository.ts';
 import { advanceTrip, createTripCheckpoint, createTripSnapshot, DEMO_ROUTE } from '@pet-desktop/domain';
 import { findBuiltinCg } from '@pet-desktop/domain/cg-catalog';
 import { CHARACTER_CATALOG_VERSION } from '@pet-desktop/domain/character-catalog';
@@ -983,7 +983,7 @@ describe.skipIf(!supported)('persisted HOME recovery and bounded interactions', 
     instance.close();
     const upgraded = new DatabaseSync(f.dbPath, { readOnly: true });
     try {
-      expect(upgraded.prepare('PRAGMA user_version').get().user_version).toBe(10);
+      expect(upgraded.prepare('PRAGMA user_version').get().user_version).toBe(SCHEMA_VERSION);
       expect(upgraded.prepare('SELECT fingerprint,outcome_json,created_at FROM commands WHERE command_id=?').get(oldCommand.commandId))
         .toEqual({ fingerprint, outcome_json: outcome, created_at: initialTime });
       expect(upgraded.prepare('SELECT acquired_at FROM pet_acquisitions WHERE pet_id=?').get(petId).acquired_at)

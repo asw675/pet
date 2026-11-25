@@ -8,7 +8,10 @@ import { voiceSettingsRequestSchema,voiceSettingsResultSchema } from './voice-se
 
 /** Main↔utility only. No renderer may invoke credential replies or internal
  * cancellation directly; these never cross a renderer bridge. */
+import { hostAuthorityRequestSchema, hostAuthorityResultSchema } from './host-settings-ipc';
+
 export const featureInputSchema = z.discriminatedUnion('kind', [
+  z.strictObject({ kind: z.literal('host-authority-request'), requestId: idSchema, request: hostAuthorityRequestSchema }),
   z.strictObject({ kind:z.literal('ai-request'), request:aiRequestSchema }),
   z.strictObject({ kind:z.literal('voice-request'), requestId:idSchema, request:voiceServiceRequestSchema }),
   z.strictObject({ kind:z.literal('credential-reply'), reply:credentialLookupReplySchema }),
@@ -18,6 +21,7 @@ export const featureInputSchema = z.discriminatedUnion('kind', [
 ]);
 export type FeatureInput=z.infer<typeof featureInputSchema>;
 export const featureOutputSchema=z.discriminatedUnion('kind',[
+  z.strictObject({ kind: z.literal('host-authority-result'), requestId: idSchema, result: hostAuthorityResultSchema }),
   z.strictObject({kind:z.literal('ai-result'),result:aiResultSchema}),
   z.strictObject({kind:z.literal('voice-result'),requestId:idSchema,result:voiceServiceResultSchema}),
   z.strictObject({kind:z.literal('chat-event'),event:chatStreamEventSchema}),

@@ -4,6 +4,7 @@ import type {
   ActionRequest, ActionResult, HitRegion, MouthSample, PetRenderer, RenderPose, RenderProfile,
 } from './contract';
 import { backingStoreSize, calculateModelGeometry, hitTestModel, type Size } from './geometry';
+import { authoredMouthPatch, type AuthoredMouthPatch } from './authored-mouth';
 
 export type BitmapDecoder = (bytes: Uint8Array<ArrayBuffer>, signal: AbortSignal) => Promise<ImageBitmap>;
 export interface CanvasRendererOptions {
@@ -23,6 +24,7 @@ interface LoadedVariant {
 interface Frame {
   readonly key: string;
   readonly rect: readonly [number, number, number, number];
+  readonly mouth?: AuthoredMouthPatch;
 }
 
 const DEFAULT_POSE: RenderPose = { x: 0, y: 0, scale: 1, facing: 1 };
@@ -115,6 +117,8 @@ export class CanvasRenderer implements PetRenderer {
   private destroyed = false;
   private lastDrawn: string | null = null;
   private elapsedDrawMs = 0;
+  private mouth: MouthSample | null = null;
+  private mouthGeneration = -1;
 
   constructor(options: CanvasRendererOptions = {}) {
     this.decode = options.decode ?? browserDecode;
@@ -146,6 +150,9 @@ export class CanvasRenderer implements PetRenderer {
   async loadPack(pack: ResolvedPack, signal: AbortSignal): Promise<void> {
     if (!this.canvas || !this.ctx || this.destroyed) throw new Error('Canvas renderer not initialized');
     signal.throwIfAborted();
+    // A character resource replacement is a visual identity boundary. Never
+    // paint a new avatar using the previous avatar's speech projection.
+    this.clearMouth();
     this.pending?.abort(new DOMException('Superseded character load', 'AbortError'));
     const pending = new AbortController();
     this.pending = pending;
@@ -242,11 +249,27 @@ export class CanvasRenderer implements PetRenderer {
     return result;
   }
 
-  // 004A fixtures contain no independently composable expression or mouth
-  // layers. Deliberately unsupported: do not fake speech/expressions or map
-  // sample timestamps onto a renderer clock without a real audio controller.
+  // Expressions remain unsupported. The exact pinned engineering atlases
+  // have authored mouth pixels in their TALK/IDLE clips. An actual-audio
+  // scalar may select those pixels; never invent a generic mouth on unknown
+  // art or advance a talk frame solely from rendering elapsed time.
   setExpression(_id: string, _weight: number): void {}
-  setMouth(_sample: MouthSample): void {}
+  setMouth(sample: MouthSample): void {
+    if (this.destroyed || this.paused || this.profile.reducedMotion || !this.active || !Number.isSafeInteger(sample.generation) || sample.generation < 0
+      || !Number.isFinite(sample.open) || sample.open < 0 || sample.open > 1 || !Number.isFinite(sample.atMs) || sample.atMs < 0
+      || sample.generation < this.mouthGeneration || (sample.generation === this.mouthGeneration && (!this.mouth || sample.atMs <= this.mouth.atMs))) return;
+    this.mouthGeneration = sample.generation;
+    this.mouth = { ...sample };
+    this.refresh(false);
+  }
+
+  /** Idempotent cancellation barrier. The retired generation cannot reopen
+   * the mouth even if a sample was already in the renderer's event queue. */
+  clearMouth(): void {
+    if (!this.mouth) return;
+    this.mouth = null;
+    this.refresh(false);
+  }
 
   tick(dtSeconds: number): void {
     if (this.destroyed || this.paused || !Number.isFinite(dtSeconds) || dtSeconds <= 0 || !this.active) return;
@@ -267,6 +290,7 @@ export class CanvasRenderer implements PetRenderer {
   setQuality(profile: RenderProfile): void {
     if (this.destroyed) return;
     assertProfile(profile);
+    if (profile.reducedMotion) this.clearMouth();
     this.profile = { ...profile };
     this.updateBackingStore();
     this.refresh(true);
@@ -276,11 +300,13 @@ export class CanvasRenderer implements PetRenderer {
     if (this.destroyed) return;
     this.paused = paused;
     this.active?.actions.setPaused(paused);
+    if (paused) this.clearMouth();
   }
 
   destroy(): void {
     if (this.destroyed) return;
     this.destroyed = true;
+    this.mouth = null;
     this.pending?.abort(new DOMException('Canvas renderer destroyed', 'AbortError'));
     this.pending = undefined;
     const active = this.active;
@@ -338,7 +364,12 @@ export class CanvasRenderer implements PetRenderer {
     const index = this.profile.reducedMotion ? 0 : playing.frameIndex;
     const selected = active.variant.atlas.clips[playing.clipId]?.frames[index];
     if (!selected) return null;
-    return { key: `${playing.clipId}:${index}`, rect: selected.rect };
+    const scalar = this.mouth && !this.paused && !this.profile.reducedMotion ? this.mouth.open : null;
+    // A semantic CHAT/TALK motion without audible samples remains an
+    // expressive pose with closed mouth, not fabricated speech animation.
+    const mouth = scalar !== null || playing.semanticId === 'talk'
+      ? authoredMouthPatch(active.pack, active.variant, playing.clipId, index, scalar ?? 0) : null;
+    return { key: `${playing.clipId}:${index}${mouth ? `:mouth-${mouth.level}` : ''}`, rect: selected.rect, ...(mouth ? { mouth } : {}) };
   }
 
   private paint(active: LoadedVariant): string | null {
@@ -362,6 +393,7 @@ export class CanvasRenderer implements PetRenderer {
     if (transform.some((value) => !Number.isFinite(value))) return null;
     ctx.setTransform(...transform);
     ctx.drawImage(active.bitmap, ...frame.rect, 0, 0, geometry.logicalSize.w, geometry.logicalSize.h);
+    if (frame.mouth) ctx.drawImage(active.bitmap, ...frame.mouth.source, ...frame.mouth.destination);
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     return frame.key;
   }

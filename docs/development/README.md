@@ -56,5 +56,7 @@
 | 009A-1 | 快捷工作台宿主一次性批准/文件身份复核 | 122项专项，平台适配待完成 | [009a1-quick-launch-policy](009a1-quick-launch-policy.md) |
 | 009A-2/B-2 | 真实独立工作台/场景/隐私统计 SQLite 存储与契约 | 53合同+17真实SQLite通过，待主迁移挂载 | [009a2-workspace-storage](009a2-workspace-storage.md) |
 | 009B-1 | 本地频次/时段/共现推荐纯策略 | 9项专项，历史与界面待接入 | [009b1-recommendation-rules](009b1-recommendation-rules.md) |
+| 007E-2/008C/009D | AI、语音、工作台同一写入者及闭合真实业务传输、原生发行门禁 | 296项专项、生产构建通过；真实 Windows 待验收 | [007e2-feature-transport](007e2-feature-transport.md) |
+| 007E-3/008D/009F | 聊天、记忆、语音口型及工作台实际页面 | 专项及生产构建通过，实机待验收 | [007e3-user-interfaces](007e3-user-interfaces.md) |
 
 每份记录包含：日期、范围、设计依据、具体变更、测试命令与真实结果、已知限制、下一步。完整验收状态见 [POC 矩阵](../qa/poc-matrix.md)。

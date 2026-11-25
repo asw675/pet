@@ -6,6 +6,9 @@ import { petStatus, serviceStatusLabel } from '../shared/presentation';
 import PetCanvas from './PetCanvas.vue';
 import { createInteractionLease } from '../shared/interaction-lease';
 import type { PetVisualReady } from '../../shared/protocol';
+import type { VoiceMouthNotification } from '../../shared/voice-ipc';
+import { MOUTH_STALE_MS, VoiceMouthProjection } from '../rendering/voice-mouth-projection';
+import type { MouthProjectionResult } from '../rendering/voice-mouth-projection';
 
 const store = useAppStore();
 const bridge = window.petDesktop?.role === 'pet' ? window.petDesktop : undefined;
@@ -17,6 +20,43 @@ const quietMotion = computed(() => !store.ready || !store.snapshot || store.snap
 const hostError = ref<string | null>(null);
 const openingCenter = ref(false);
 const canHit = computed(() => !quietMotion.value && pet.value?.presence === 'HOME' && pet.value.visibility === 'VISIBLE');
+
+// Visual-only audio-clock samples from the trusted host. The pet renderer
+// owns no microphone, playback source, raw audio or AI/provider requests.
+let mouth = petId ? new VoiceMouthProjection(petId) : null;
+let unsubscribeMouth: (() => void) | undefined;
+let mouthTimer: number | undefined;
+
+function stopMouthWatchdog(): void {
+  if (mouthTimer !== undefined) window.clearTimeout(mouthTimer);
+  mouthTimer = undefined;
+}
+function applyMouth(result: MouthProjectionResult): void {
+  if (result.changed) petCanvas.value?.setVoiceMouth(result.sample);
+}
+function clearVoiceMouth(): void {
+  stopMouthWatchdog(); mouth?.retire(); petCanvas.value?.setVoiceMouth(null);
+}
+function scheduleMouthWatchdog(): void {
+  stopMouthWatchdog();
+  if (!mouth?.active) return;
+  mouthTimer = window.setTimeout(() => {
+    mouthTimer = undefined;
+    if (!mouth) return;
+    applyMouth(mouth.expire(performance.now()));
+    if (mouth.active) scheduleMouthWatchdog();
+  }, MOUTH_STALE_MS + 4);
+}
+function onVoiceMouth(event: VoiceMouthNotification): void {
+  if (!mouth) return;
+  const result = mouth.accept(event, performance.now(), canHit.value && document.visibilityState === 'visible');
+  if (!result.changed) return;
+  applyMouth(result); scheduleMouthWatchdog();
+}
+function onVoiceVisibility(): void { if (document.visibilityState !== 'visible') clearVoiceMouth(); }
+watch(canHit, enabled => { if (!enabled) clearVoiceMouth(); }, { flush: 'sync' });
+watch(() => pet.value?.characterId, () => clearVoiceMouth(), { flush: 'sync' });
+watch(() => store.serviceStatus?.generation, () => clearVoiceMouth(), { flush: 'sync' });
 
 // A staging window can report only that its own verified visual/fallback has
 // been prepared. The host, not this renderer, decides which pet window appears.
@@ -99,6 +139,8 @@ function leave(): void {
 watch(canHit, (enabled) => enabled ? hitTest() : leave(), { flush: 'sync' });
 
 onMounted(() => {
+  unsubscribeMouth = bridge?.subscribeVoiceMouth(onVoiceMouth);
+  document.addEventListener('visibilitychange', onVoiceVisibility);
   document.addEventListener('mousemove', onMouseMove);
   document.documentElement.addEventListener('mouseleave', leave);
   document.addEventListener('visibilitychange', leave);
@@ -108,6 +150,9 @@ onMounted(() => {
 });
 
 onBeforeUnmount(() => {
+  unsubscribeMouth?.(); unsubscribeMouth = undefined;
+  clearVoiceMouth(); mouth?.dispose(); mouth = null;
+  document.removeEventListener('visibilitychange', onVoiceVisibility);
   visualReportEpoch += 1;
   clearVisualReportTimer();
   if (leaseTimer !== undefined) window.clearInterval(leaseTimer);

@@ -65,6 +65,45 @@ function deferred<T>() {
 }
 
 describe('Canvas2D verified sprite fallback adapter', () => {
+  it('draws actual verified mouth patches from the audio sample levels, preserving body frame and clearing old generations immediately', async () => {
+    const { decode, images } = decoder();
+    const { renderer, context } = await setup(decode);
+    await renderer.loadPack(star, signal());
+    renderer.setMouth({ generation: 2, atMs: 34, open: .9 });
+    expect(context.drawImage.mock.calls.at(-2)).toEqual([images[0]!.value, 0, 0, 128, 128, 0, 0, 128, 128]);
+    // Talk frame 2 is the highest authored ellipse, at cell (0,384), dy=-3.
+    expect(context.drawImage).toHaveBeenLastCalledWith(images[0]!.value, 59, 447, 10, 11, 59, 66, 10, 11);
+    renderer.setMouth({ generation: 2, atMs: 68, open: 0 });
+    expect(context.drawImage).toHaveBeenLastCalledWith(images[0]!.value, 59, 66, 10, 11, 59, 66, 10, 11);
+    const draws = context.drawImage.mock.calls.length;
+    renderer.setMouth({ generation: 2, atMs: 34, open: .9 });
+    renderer.setMouth({ generation: 1, atMs: 100, open: .9 });
+    expect(context.drawImage).toHaveBeenCalledTimes(draws);
+    renderer.clearMouth();
+    expect(context.drawImage).toHaveBeenLastCalledWith(images[0]!.value, 0, 0, 128, 128, 0, 0, 128, 128);
+    renderer.setMouth({ generation: 2, atMs: 102, open: .9 });
+    expect(context.drawImage.mock.lastCall?.[3]).toBe(128);
+    renderer.setMouth({ generation: 3, atMs: 10, open: .65 });
+    expect(context.drawImage.mock.lastCall?.[3]).toBe(10);
+    renderer.setPaused(true); expect(context.drawImage.mock.lastCall?.[3]).toBe(128);
+    renderer.setPaused(false); renderer.setMouth({ generation: 3, atMs: 40, open: .9 });
+    expect(context.drawImage.mock.lastCall?.[3]).toBe(128);
+    renderer.setBaseAction('talk'); // Text-only semantically talking, no fake audio-driven mouth.
+    expect(context.drawImage).toHaveBeenLastCalledWith(images[0]!.value, 59, 66, 10, 11, 59, 66, 10, 11);
+    renderer.destroy();
+  });
+
+  it('reduced motion and pack replacement cannot leave an open speech patch on a new character', async () => {
+    const { decode, images } = decoder();
+    const { renderer, context } = await setup(decode);
+    await renderer.loadPack(star, signal()); renderer.setMouth({ generation: 2, atMs: 30, open: .9 });
+    renderer.setQuality({ ...profile, reducedMotion: true }); expect(context.drawImage.mock.lastCall?.[3]).toBe(128);
+    renderer.setQuality(profile); renderer.setMouth({ generation: 2, atMs: 60, open: .9 }); expect(context.drawImage.mock.lastCall?.[3]).toBe(128);
+    renderer.setMouth({ generation: 3, atMs: 30, open: .9 }); await renderer.loadPack(ranger, signal());
+    expect(context.drawImage).toHaveBeenLastCalledWith(images[1]!.value, 0, 0, 128, 128, 0, 0, 128, 128);
+    renderer.setMouth({ generation: 3, atMs: 60, open: .9 }); expect(context.drawImage.mock.lastCall?.[3]).toBe(128);
+    renderer.destroy();
+  });
   it('decodes the built-in atlas and actually draws changing source rects with frame durations', async () => {
     const { decode, images } = decoder();
     const { renderer, context } = await setup(decode);

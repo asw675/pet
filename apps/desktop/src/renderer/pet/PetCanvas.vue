@@ -4,7 +4,7 @@ import type { Activity } from '@pet-desktop/contracts';
 import { loadBuiltinPack } from '../asset-packs/builtin-registry';
 import { CanvasRenderer } from '../rendering/canvas-renderer';
 import { semanticIdForActivity } from '../rendering/action-controller';
-import type { HitRegion, RenderProfile } from '../rendering/contract';
+import type { HitRegion, MouthSample, RenderProfile } from '../rendering/contract';
 import PetPortrait from '../shared/PetPortrait.vue';
 
 const props = defineProps<{
@@ -133,7 +133,15 @@ function playSemantic(semanticId: string): void {
   void renderer.play({ requestId: crypto.randomUUID(), semanticId, loop: false, priority: 10, blendMs: 0 });
 }
 
-defineExpose({ hitTestClient, playSemantic });
+function setVoiceMouth(sample: MouthSample | null): void {
+  if (!renderer) return;
+  if (!sample || !active() || renderer.activeCharacterId !== props.characterId || loadState.value !== 'ready') {
+    renderer.clearMouth(); return;
+  }
+  renderer.setMouth(sample);
+}
+
+defineExpose({ hitTestClient, playSemantic, setVoiceMouth });
 
 watch(() => props.characterId, () => { void replacePack(); });
 watch(() => props.activity, (activity) => renderer?.setBaseAction(semanticIdForActivity(activity)));

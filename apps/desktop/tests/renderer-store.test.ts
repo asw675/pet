@@ -51,6 +51,12 @@ function testBridge() {
   const bridge: ControlCenterBridge = {
     role: 'control-center', getServiceStatus, getSnapshot, dispatch, listGallery, listCharacters, listInventory,
     listTravelCatalog, previewTravel, listTravelReports, listEvents,
+    aiRequest:vi.fn<ControlCenterBridge['aiRequest']>(),subscribeChatEvents:()=>()=>undefined,
+    saveProviderCredential:vi.fn<ControlCenterBridge['saveProviderCredential']>(),revokeProviderCredential:vi.fn<ControlCenterBridge['revokeProviderCredential']>(),
+    voiceRequest:vi.fn<ControlCenterBridge['voiceRequest']>(),authorizeMicrophone:vi.fn<ControlCenterBridge['authorizeMicrophone']>(),
+    voiceSettingsRequest:vi.fn<ControlCenterBridge['voiceSettingsRequest']>(),workspaceRequest:vi.fn<ControlCenterBridge['workspaceRequest']>(),
+    requestMic:vi.fn<ControlCenterBridge['requestMic']>(),revokeMic:vi.fn<ControlCenterBridge['revokeMic']>(),cancelVoiceChat:vi.fn<ControlCenterBridge['cancelVoiceChat']>(),
+    publishMouth:vi.fn<ControlCenterBridge['publishMouth']>(),subscribeSuspend:()=>()=>undefined,
     openControlCenter: () => Promise.resolve({ ok: true }),
     subscribeSnapshot: (listener) => {
       snapshots.add(listener);

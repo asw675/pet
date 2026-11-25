@@ -9,7 +9,13 @@
     "./character-catalog": "./src/character-catalog.ts",
     "./home-simulation": "./src/home-simulation.ts",
     "./progression": "./src/progression.ts",
-    "./equipment-rules": "./src/equipment-rules.ts"
+    "./equipment-rules": "./src/equipment-rules.ts",
+    "./item-catalog": "./src/item-catalog.ts",
+    "./commerce-rules": "./src/commerce-rules.ts"
+  },
+  "imports": {
+    "#item-catalog": "./src/item-catalog.ts",
+    "#equipment-rules": "./src/equipment-rules.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",

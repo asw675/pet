@@ -77,7 +77,7 @@ export const CHARACTER_CATALOG: readonly CharacterDefinition[] = Object.freeze([
     species: '魔族',
     profession: 'MAGE',
     professionLabel: '星辉魔法师',
-    background: '拥有绯粉长发和异色双瞳的魔族少女，收集星光与旅途中的古老魔法知识。',
+    background: '收集星光与旅途中的古老魔法知识，喜欢把途中遇见的故事记成一页页笔记。',
     personality: {
       summary: '好奇而细腻，喜欢认真观察新事物，也愿意分享发现。',
       traits: ['好奇', '温柔', '善于推理'],

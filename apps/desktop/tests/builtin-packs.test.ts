@@ -4,11 +4,12 @@ import { join, relative, sep } from 'node:path';
 import { createHash } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import { characterPackManifestSchema } from '@pet-desktop/contracts';
+import { CHARACTER_CATALOG } from '@pet-desktop/domain/character-catalog';
 import { builtinPackIds, loadBuiltinPack } from '../src/renderer/asset-packs/builtin-registry';
 import { resolvePack } from '../src/renderer/asset-packs/resolve-pack';
 
 const root = fileURLToPath(new URL('../src/renderer/asset-packs/builtin/', import.meta.url));
-const packIds = ['star-singer', 'fluffy-ranger'];
+const packIds = ['star-singer', 'fluffy-ranger', 'nova'];
 
 function collectFiles(directory: string, packRoot: string): string[] {
   return readdirSync(directory).flatMap((name) => {
@@ -35,7 +36,7 @@ describe('versioned built-in character fixtures', () => {
     const resolved = await resolvePack(manifest, {
       paths: () => expected.filter((path) => path !== 'manifest.json'),
       read: async (path) => new Uint8Array(readFileSync(join(directory, path))),
-    }, { characterId, packVersion: '1.0.1', appVersion: '0.0.0' });
+    }, { characterId, packVersion: characterId === 'nova' ? '1.0.0' : '1.0.1', appVersion: '0.0.0' });
     expect(resolved.manifest.characterId).toBe(characterId);
     expect(resolved.variants.some((variant) => variant.renderer === 'sprite')).toBe(true);
     expect(resolved.variants.some((variant) => variant.renderer === 'static')).toBe(true);
@@ -43,6 +44,7 @@ describe('versioned built-in character fixtures', () => {
 
   it('exposes only the known versioned built-ins', async () => {
     expect([...builtinPackIds()].sort()).toEqual([...packIds].sort());
+    expect([...builtinPackIds()].sort()).toEqual(CHARACTER_CATALOG.map(character => character.characterId).sort());
     await expect(loadBuiltinPack('https://example.invalid/pack')).rejects.toThrow();
     await expect(loadBuiltinPack('../../outside')).rejects.toThrow();
   });

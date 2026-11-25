@@ -3,11 +3,11 @@
  * or uses an image library. The installed application consumes only the PNGs
  * and validated JSON, never this generator.
  *
- * node scripts/generate-demo-packs.mjs          regenerate owned fixtures
- * node scripts/generate-demo-packs.mjs --check  verify byte-for-byte output
+ * mise exec node@26.12.1 -- node scripts/generate-demo-packs.mjs
+ * mise exec node@26.12.1 -- node scripts/generate-demo-packs.mjs --check
  */
 import { createHash } from 'node:crypto';
-import { readFileSync, mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { deflateSync } from 'node:zlib';
@@ -292,6 +292,96 @@ function drawRanger(draw, clip, i) {
   face(draw, ink, color.jade, color.mint, clip, i);
 }
 
+function drawNova(draw, clip, i) {
+  // Nova is an original humanoid mechanical assistant heroine. The cool
+  // silver-blue silhouette, optical monocle and white/graphite tech blazer
+  // distinguish her from the other two fantasy heroines. Keep this palette
+  // local: older character versions must remain byte-for-byte identical.
+  const ink = rgba('334f69');
+  const shadowHair = rgba('819dbb');
+  const silver = rgba('dce9f8');
+  const whiteHair = rgba('eef5ff');
+  const highlight = rgba('f8fcff');
+  const ice = rgba('a2c9e3');
+  const dark = rgba('394c64');
+  const graphite = rgba('526982');
+  const suit = rgba('ecf3f9');
+  const trim = rgba('65bdd9');
+  const cyan = rgba('70e5ef');
+  const cyanLight = rgba('d1fcff');
+  const iris = rgba('4ea8c8');
+  const stride = clip === 'walk' ? [3, -2, -3, 2][i] : 0;
+  const lift = clip === 'happy' ? 9 : clip === 'walk' ? stride : 0;
+
+  // Shoulder-length angular hair behind the body, with a longer side lock.
+  draw.polygon([[29, 43], [36, 27], [51, 19], [73, 18], [88, 25], [98, 42],
+    [97, 69], [105, 89], [102, 105], [93, 109], [84, 99], [76, 104],
+    [52, 102], [42, 94], [33, 103], [20, 107], [24, 89], [29, 69]], shadowHair, ink);
+  draw.polygon([[29, 69], [38, 73], [38, 91], [29, 102], [24, 103], [27, 86]], silver);
+  draw.polygon([[92, 66], [98, 73], [102, 91], [98, 103], [93, 104], [87, 88]], silver);
+  draw.line(29, 80, 27, 97, 1.5, highlight);
+  draw.line(95, 79, 98, 96, 1.6, highlight);
+
+  // Human legs in articulated graphite boots; teal seam and pale toe plate.
+  draw.line(49 - stride, 105, 49 - stride, 116 + Math.max(0, -stride), 9, dark);
+  draw.line(79 + stride, 105, 79 + stride, 116 + Math.max(0, stride), 9, dark);
+  draw.line(48 - stride, 108, 48 - stride, 115 + Math.max(0, -stride), 2, trim);
+  draw.line(78 + stride, 108, 78 + stride, 115 + Math.max(0, stride), 2, trim);
+  draw.ellipse(48 - stride, 117 + Math.max(0, -stride), 10, 4.5, dark, ink);
+  draw.ellipse(80 + stride, 117 + Math.max(0, stride), 10, 4.5, dark, ink);
+  draw.line(43 - stride, 117 + Math.max(0, -stride), 52 - stride, 117 + Math.max(0, -stride), 2.0, suit);
+  draw.line(75 + stride, 117 + Math.max(0, stride), 84 + stride, 117 + Math.max(0, stride), 2.0, suit);
+
+  // Tailored sci-fi skirt suit, layered panels, bright cyan piping and core.
+  draw.polygon([[47, 96], [81, 96], [90, 111], [38, 111]], graphite, ink);
+  draw.polygon([[46, 99], [57, 100], [53, 110], [39, 110]], suit, ink, 1);
+  draw.polygon([[82, 99], [71, 100], [75, 110], [89, 110]], suit, ink, 1);
+  draw.line(58, 103, 56, 110, 1.5, trim);
+  draw.line(70, 103, 72, 110, 1.5, trim);
+  draw.polygon([[48, 79], [80, 79], [88, 89], [81, 93], [84, 99], [44, 99],
+    [47, 93], [40, 89]], suit, ink);
+  draw.polygon([[53, 81], [64, 86], [75, 81], [77, 98], [51, 98]], dark, ink, 1);
+  draw.polygon([[60, 83], [64, 88], [68, 83], [70, 93], [64, 98], [58, 93]], trim, ink, 0.9);
+  draw.polygon([[64, 87], [68, 90], [64, 94], [60, 90]], cyanLight, cyan, 1);
+  draw.line(46, 98, 82, 98, 2, trim);
+  draw.polygon([[40, 88], [47, 89], [42, 101], [34, 99], [35, 92]], suit, ink, 1.2);
+  draw.polygon([[88, 88 - lift], [82, 89 - lift], [85, 101 - lift], [93, 99 - lift],
+    [94, 92 - lift]], suit, ink, 1.2);
+  draw.ellipse(36, 101 + stride, 5.6, 4.8, color.skin, ink, 1);
+  draw.ellipse(92, 101 - lift, 5.6, 4.8, color.skin, ink, 1);
+  draw.line(34, 97 + stride, 41, 96 + stride, 2.1, trim);
+  draw.line(89, 96 - lift, 95, 97 - lift, 2.1, trim);
+
+  // Human anime face and asymmetrically layered white/silver fringe.
+  draw.ellipse(64, 57, 36, 34, shadowHair, ink);
+  draw.ellipse(64, 63, 28, 25, color.skin, ink);
+  draw.polygon([[34, 57], [37, 40], [45, 31], [57, 26], [73, 26], [87, 33],
+    [94, 47], [91, 57], [82, 50], [76, 40], [70, 48], [61, 52], [55, 44],
+    [47, 55], [41, 58]], whiteHair, ink, 0.9);
+  draw.polygon([[36, 50], [43, 56], [42, 68], [48, 80], [43, 96], [36, 91], [31, 71]],
+    silver, ink, 0.9);
+  draw.polygon([[89, 50], [95, 53], [96, 71], [90, 87], [84, 83], [88, 70]],
+    silver, ink, 0.9);
+  draw.line(42, 41, 55, 32, 2.4, highlight);
+  draw.line(55, 32, 68, 33, 2.1, highlight);
+  draw.line(78, 37, 86, 43, 1.7, ice);
+  draw.line(35, 62, 37, 81, 1.8, highlight);
+  draw.line(93, 62, 92, 77, 1.6, highlight);
+  // Deliberately mechanical temple attachment and glowing optical monocle,
+  // rather than animal ears or a generic futuristic accessory.
+  face(draw, ink, iris, cyanLight, clip, i);
+  draw.polygon([[90, 49], [100, 54], [102, 66], [94, 72], [88, 67], [89, 55]], dark, ink, 1.2);
+  draw.polygon([[96, 55], [100, 59], [99, 65], [94, 67], [91, 62], [92, 57]], trim, ink, 0.7);
+  draw.line(96, 58, 95, 64, 1.8, cyanLight);
+  draw.line(90, 61, 86, 61, 2.3, dark);
+  const optical = [[69, 53], [81, 53], [86, 57], [86, 65], [81, 69], [69, 69], [66, 65], [66, 57]];
+  draw.polygon(optical, rgba('89dcf8', 50), iris, 1.35);
+  draw.line(70, 53, 78, 53, 1.2, cyanLight);
+  draw.line(81, 66, 84, 63, 1.1, cyanLight);
+  draw.polygon([[47, 39], [53, 35], [56, 38], [50, 43]], dark, ink, 0.8);
+  draw.line(49, 40, 54, 37, 1.2, cyan);
+}
+
 function renderFrame(characterId, clip, i) {
   const pixels = new Raster(SIZE, SIZE);
   const dx = clip === 'walk' ? [-2, 1, 2, -1][i] : 0;
@@ -301,7 +391,9 @@ function renderFrame(characterId, clip, i) {
   pixels.ellipse(64, 124, clip === 'happy' ? 30 : 37, 2.8, color.shadow);
   const draw = shapeAt(pixels, dx, dy);
   if (characterId === 'star-singer') drawStarSinger(draw, clip, i);
-  else drawRanger(draw, clip, i);
+  else if (characterId === 'fluffy-ranger') drawRanger(draw, clip, i);
+  else if (characterId === 'nova') drawNova(draw, clip, i);
+  else throw new Error(`Unknown character fixture: ${characterId}`);
   // Clearly visible action-specific accents; no text or external font asset.
   if (clip === 'happy') {
     star(pixels, 15, 24 - i * 2, 4 + i, color.sparkle);
@@ -369,7 +461,7 @@ function encodePng(image) {
 }
 
 const json = (value) => Buffer.from(`${JSON.stringify(value, null, 2)}\n`, 'utf8');
-function generatePack(characterId, name) {
+function generatePack(characterId, name, packVersion) {
   const clips = {};
   const actions = {};
   const atlas = new Raster(COLS * SIZE, Math.ceil(ACTIONS.length * 4 / COLS) * SIZE);
@@ -404,7 +496,7 @@ function generatePack(characterId, name) {
   const manifest = {
     schemaVersion: 1,
     characterId,
-    packVersion: '1.0.1',
+    packVersion,
     minAppVersion: '0.0.0',
     displayName: { 'zh-CN': name },
     thumbnail: 'assets/thumbnail.png',
@@ -435,11 +527,17 @@ const mode = process.argv.slice(2);
 if (mode.length > 1 || (mode.length === 1 && mode[0] !== '--check')) {
   throw new Error('Usage: node scripts/generate-demo-packs.mjs [--check]');
 }
-for (const [characterId, name] of [['star-singer', '星咏'], ['fluffy-ranger', '绒绒']]) {
-  const pack = generatePack(characterId, name);
+for (const [characterId, name, packVersion] of [
+  ['star-singer', '星咏', '1.0.1'],
+  ['fluffy-ranger', '绒绒', '1.0.1'],
+  ['nova', '诺瓦', '1.0.0'],
+]) {
+  const pack = generatePack(characterId, name, packVersion);
   for (const [relative, bytes] of pack) {
     const path = join(ROOT, characterId, relative);
-    if (mode[0] === '--check') {
+    if (mode[0] === '--check' || existsSync(path)) {
+      // Published-by-version fixtures are immutable. Never overwrite changed
+      // content under an existing ID/version during a new character addition.
       if (!readFileSync(path).equals(bytes)) throw new Error(`Fixture drift: ${characterId}/${relative}`);
     } else {
       mkdirSync(dirname(path), { recursive: true });

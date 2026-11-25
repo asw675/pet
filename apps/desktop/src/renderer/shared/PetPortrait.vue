@@ -77,6 +77,49 @@ withDefaults(defineProps<{
       <path d="M54 132c-11-2-15 7-14 14l10 3 7-7" fill="#ffe5cf" stroke="#614334" stroke-width="2.5" />
       <path d="M125 131c9-4 15 3 15 12l-9 6-8-7" fill="#ffe5cf" stroke="#614334" stroke-width="2.5" />
     </g>
+    <g v-else-if="characterId === 'nova'" class="breathe" stroke-linecap="round" stroke-linejoin="round">
+      <!-- Original humanoid mechanical assistant: silver-blue hair, cyan optics,
+           white tech blazer over graphite skirt and articulated boots. -->
+      <path d="M41 79C34 41 58 26 87 26s54 16 55 52l-1 26 8 29-5 22-13 7-12-14-9 5H69l-10-6-11 12-19-6 7-31 5-43Z" fill="#819dbb" stroke="#334f69" stroke-width="3" />
+      <path d="M41 103l14 6-1 22-13 18-8 4 4-24Zm98-1-12 7 1 24 11 18 7-3-3-20Z" fill="#dce9f8" />
+      <path d="M41 118l-5 26m103-26 5 26" stroke="#f8fcff" stroke-width="2.5" />
+      <path d="M68 151v15l-9 5h24l3-20m9 0 2 20h24l-9-5v-15" fill="#394c64" stroke="#334f69" stroke-width="3" />
+      <path d="M72 154v10m35-10v10" stroke="#65bdd9" stroke-width="2.5" />
+      <path d="M64 167h12m28 0h12" stroke="#ecf3f9" stroke-width="3" />
+      <path d="M65 135h50l13 25H52l13-25Z" fill="#526982" stroke="#334f69" stroke-width="3" />
+      <path d="M63 140l17 3-6 16H53Zm54 0-17 3 6 16h21Z" fill="#ecf3f9" stroke="#334f69" stroke-width="1.7" />
+      <path d="M82 145l-3 11m19-11 3 11" stroke="#65bdd9" stroke-width="2" />
+      <path d="M68 116h44l12 13-11 5 5 9H62l5-9-11-5Z" fill="#ecf3f9" stroke="#334f69" stroke-width="3" />
+      <path d="M75 119l15 10 15-10 3 23H72Z" fill="#394c64" stroke="#334f69" stroke-width="2" />
+      <path d="m84 122 6 8 6-8 3 14-9 6-9-6Z" fill="#65bdd9" stroke="#334f69" stroke-width="1.5" />
+      <path d="m90 128 6 5-6 6-6-6Z" fill="#d1fcff" stroke="#70e5ef" stroke-width="1.5" />
+      <path d="M64 141h52" stroke="#65bdd9" stroke-width="3" />
+      <path d="M57 128l10 2-6 17-11-3 1-11Zm66 0-10 2 6 17 11-3-1-11Z" fill="#ecf3f9" stroke="#334f69" stroke-width="2" />
+      <ellipse cx="51" cy="147" rx="8" ry="6" fill="#ffe5cf" stroke="#334f69" stroke-width="1.8" /><ellipse cx="129" cy="147" rx="8" ry="6" fill="#ffe5cf" stroke="#334f69" stroke-width="1.8" />
+      <path d="M48 141l9-2m75 2-9-2" stroke="#65bdd9" stroke-width="2.6" />
+      <ellipse cx="90" cy="95" rx="39" ry="34" fill="#ffe5cf" stroke="#334f69" stroke-width="2.5" />
+      <path d="M48 82c0-33 18-49 42-49 24 0 43 18 43 48l-13-9-13-19-9 12-12 10-8-13-8 15-12 7Z" fill="#eef5ff" stroke="#334f69" stroke-width="2.5" />
+      <path d="M49 77l11 10-2 18 8 17-7 15-10-7-5-25Zm81 0 10 6 1 20-9 24-11-6 8-17Z" fill="#dce9f8" stroke="#334f69" stroke-width="2.1" />
+      <path d="M58 58l15-11 18 2m18 6 12 11M50 92l3 24m83-24-3 21" stroke="#f8fcff" stroke-width="3" />
+      <path d="m68 57 8-6 5 4-8 6Z" fill="#394c64" stroke="#334f69" stroke-width="1.4" />
+      <path d="m70 57 8-5" stroke="#70e5ef" stroke-width="1.5" />
+      <g v-if="sleeping" stroke="#334f69" stroke-width="3"><path d="M67 95q6 7 12 0m22 0q6 7 12 0" /></g>
+      <g v-else class="eyes" stroke="#334f69" stroke-width="1.5">
+        <ellipse cx="74" cy="96" rx="9" ry="10.4" fill="#fff9ee" /><ellipse cx="107" cy="96" rx="9" ry="10.4" fill="#fff9ee" />
+        <ellipse cx="74" cy="96" rx="6.4" ry="9.1" fill="#4ea8c8" /><ellipse cx="107" cy="96" rx="6.4" ry="9.1" fill="#4ea8c8" />
+        <ellipse cx="74.5" cy="100.5" rx="4.7" ry="3.2" fill="#d1fcff" stroke="none" /><ellipse cx="107.5" cy="100.5" rx="4.7" ry="3.2" fill="#d1fcff" stroke="none" />
+        <ellipse cx="74" cy="95" rx="3.5" ry="5.3" fill="#334f69" /><ellipse cx="107" cy="95" rx="3.5" ry="5.3" fill="#334f69" />
+        <path d="M65 91l-3-3m53 3 3-3M67 87q7-4 14 0m19 0q7-4 14 0" fill="none" stroke-width="2.5" />
+        <circle cx="71.5" cy="92" r="2.5" fill="#fff9ee" stroke="none" /><circle cx="104.5" cy="92" r="2.5" fill="#fff9ee" stroke="none" />
+      </g>
+      <ellipse cx="63" cy="106" rx="6" ry="3" fill="#f3a8ad" opacity=".7" /><ellipse cx="118" cy="106" rx="6" ry="3" fill="#f3a8ad" opacity=".7" />
+      <path d="M86 106q4.5 4 9 0" stroke="#8f5260" stroke-width="2" />
+      <path d="m127 79 14 7 2 16-11 10-9-6 1-17Z" fill="#394c64" stroke="#334f69" stroke-width="2" />
+      <path d="m134 88 5 5-2 9-7 3-3-7 3-8Z" fill="#65bdd9" stroke="#334f69" stroke-width="1.5" />
+      <path d="m134 92-2 9m-7-7h-6" stroke="#d1fcff" stroke-width="2.3" />
+      <path d="M97 84h16l7 6v11l-7 6H97l-5-6V90Z" fill="#89dcf8" fill-opacity=".2" stroke="#4ea8c8" stroke-width="2.2" />
+      <path d="M98 84h10m6 18 4-5" stroke="#d1fcff" stroke-width="2" />
+    </g>
     <g v-else class="breathe" stroke="#51435a" stroke-width="3" stroke-linecap="round">
       <!-- Neutral human heroine silhouette for a missing character pack. -->
       <path d="M46 85c0-32 18-52 44-52s44 20 44 52c0 29 8 44 9 73l-20 5-13-15H70l-13 15-20-5c1-29 9-44 9-73Z" fill="#a497b8" />

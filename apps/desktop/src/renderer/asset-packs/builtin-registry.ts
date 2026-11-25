@@ -14,6 +14,7 @@ const imageFiles = import.meta.glob<string>('./builtin/*/assets/**/*.png', { que
 const BUILTIN_VERSIONS = new Map([
   ['star-singer', '1.0.1'],
   ['fluffy-ranger', '1.0.1'],
+  ['nova', '1.0.0'],
 ]);
 
 function decodePngDataUrl(url: string): Uint8Array<ArrayBuffer> {

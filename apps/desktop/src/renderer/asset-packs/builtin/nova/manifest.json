@@ -1,0 +1,98 @@
+{
+  "schemaVersion": 1,
+  "characterId": "nova",
+  "packVersion": "1.0.0",
+  "minAppVersion": "0.0.0",
+  "displayName": {
+    "zh-CN": "诺瓦"
+  },
+  "thumbnail": "assets/thumbnail.png",
+  "variants": [
+    {
+      "id": "sprite",
+      "renderer": "sprite",
+      "entry": "assets/atlas.json"
+    },
+    {
+      "id": "still",
+      "renderer": "static",
+      "entry": "assets/idle.png"
+    }
+  ],
+  "anchor": {
+    "x": 0.5,
+    "y": 1
+  },
+  "logicalSize": {
+    "w": 128,
+    "h": 128
+  },
+  "hitRegions": [
+    {
+      "id": "head",
+      "rect": [
+        0.3,
+        0.35,
+        0.4,
+        0.24
+      ]
+    },
+    {
+      "id": "body",
+      "rect": [
+        0.35,
+        0.67,
+        0.3,
+        0.2
+      ]
+    }
+  ],
+  "actions": {
+    "idle": {
+      "sprite": "idle",
+      "still": "idle"
+    },
+    "sleep": {
+      "sprite": "sleep"
+    },
+    "happy": {
+      "sprite": "happy"
+    },
+    "tap.head": {
+      "sprite": "tap.head"
+    },
+    "talk": {
+      "sprite": "talk"
+    },
+    "walk": {
+      "sprite": "walk"
+    }
+  },
+  "cgIds": [],
+  "license": {
+    "owner": "Pet Desktop",
+    "reference": "original-poc-fixture"
+  },
+  "files": [
+    {
+      "path": "assets/atlas.png",
+      "bytes": 33971,
+      "sha256": "b8ccfd4e59b575ed483b87708ac3c4b431f90dfc143ea1f4a3bbfcb0815d0c6c"
+    },
+    {
+      "path": "assets/atlas.json",
+      "bytes": 3955,
+      "sha256": "701f66b111a4d07dd616e86121bec5631176027e1d3e66f70c9717940ffdbc56"
+    },
+    {
+      "path": "assets/idle.png",
+      "bytes": 4843,
+      "sha256": "84829c5d5a34a41dc1a6186559368bc1a9a1d2d9bc97f1b27f7d8b2f9b25a324"
+    },
+    {
+      "path": "assets/thumbnail.png",
+      "bytes": 4843,
+      "sha256": "84829c5d5a34a41dc1a6186559368bc1a9a1d2d9bc97f1b27f7d8b2f9b25a324"
+    }
+  ]
+}

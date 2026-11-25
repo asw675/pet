@@ -38,6 +38,7 @@
 | 006-Q | 中间代码与功能核对（固定5b6f4dc） | 开发覆盖41.3% | [006-progress-checkpoint](006-progress-checkpoint.md) |
 | 006C-2/D-2/E-2/F | 成长投影、装备经济、旅行、随机事件 | 分模块开发中 | — |
 | 007A-1 | AI 人格/Provider/逐宠会话及记忆契约 | 专项136项通过 | [007a1-ai-contract](007a1-ai-contract.md) |
+| 007A-2 | OpenAI-compatible Provider、受限流、人格 prompt | Fake fetch 61项通过，真实服务待配置 | [007a2-provider-adapter](007a2-provider-adapter.md) |
 | 007B-1 | 逐宠记忆候选、同源约束、敏感筛查及授权检索 | 专项93项通过 | [007b1-memory-policy](007b1-memory-policy.md) |
 | 008A-1 | 语音契约、单会话取消及实际音频 RMS 口型算法 | 50项专项通过，实际设备/供应商待接入 | [008a1-voice-contract](008a1-voice-contract.md) |
 

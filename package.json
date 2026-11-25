@@ -11,6 +11,7 @@
     "dev": "pnpm --filter @pet-desktop/desktop dev",
     "build": "pnpm --filter @pet-desktop/desktop build",
     "test": "pnpm -r --if-present test",
+    "test:smoke": "pnpm --filter @pet-desktop/domain test:smoke",
     "typecheck": "pnpm -r --if-present typecheck"
   }
 }

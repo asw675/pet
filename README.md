@@ -23,6 +23,8 @@ pnpm typecheck
 pnpm test
 ```
 
+纯旅行领域的依赖无关 smoke 已可运行：在项目根目录执行 `pnpm test:smoke`。
+
 当前只有公共契约和纯领域开发阶段，不存在可直接运行的 Electron 应用；`pnpm dev` 将在宿主与双 renderer 原型完成后启用。首次依赖安装成功后应提交真实生成的 `pnpm-lock.yaml`。
 
 ## 目标环境

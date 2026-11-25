@@ -45,5 +45,7 @@
 | 008A-1 | 语音契约、单会话取消及实际音频 RMS 口型算法 | 50项专项通过，实际设备/供应商待接入 | [008a1-voice-contract](008a1-voice-contract.md) |
 | 008B-1 | AudioWorklet 真实录放音 API 与有界清理 | 28项专项、Vite构建通过；设备/权限待联通 | [008b1-webaudio-adapter](008b1-webaudio-adapter.md) |
 | 008B-3A | 主进程麦克风一次性授权与监督策略 | 5项专项，默认拒绝，实际接入待完成 | [008b3-microphone-lease](008b3-microphone-lease.md) |
+| 009A-1 | 快捷工作台宿主一次性批准/文件身份复核 | 122项专项，平台适配待完成 | [009a1-quick-launch-policy](009a1-quick-launch-policy.md) |
+| 009B-1 | 本地频次/时段/共现推荐纯策略 | 9项专项，历史与界面待接入 | [009b1-recommendation-rules](009b1-recommendation-rules.md) |
 
 每份记录包含：日期、范围、设计依据、具体变更、测试命令与真实结果、已知限制、下一步。完整验收状态见 [POC 矩阵](../qa/poc-matrix.md)。

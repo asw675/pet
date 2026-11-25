@@ -1,0 +1,2 @@
+# Atlas JSON is loaded as bytes and checked against the manifest SHA-256.
+/apps/desktop/src/renderer/asset-packs/builtin/**/assets/*.json text eol=lf

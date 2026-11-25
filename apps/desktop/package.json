@@ -8,7 +8,7 @@
     "dev": "electron-vite dev",
     "build": "electron-vite build && node scripts/verify-build.mjs",
     "preview": "electron-vite preview",
-    "typecheck": "tsc -p tsconfig.node.json --noEmit && vue-tsc -p tsconfig.renderer.json --noEmit",
+    "typecheck": "tsc -p tsconfig.node.json --noEmit && vue-tsc -p tsconfig.renderer.json --noEmit && tsc -p tsconfig.test.json --noEmit",
     "test": "vitest run",
     "rebuild:native": "electron-builder install-app-deps",
     "package:win": "pnpm run build && electron-builder --win --x64"

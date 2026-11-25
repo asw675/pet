@@ -8,7 +8,7 @@
 | P0-02 | 独立服务、双 renderer、受限 IPC、安装包 | 进行中 | 公共契约125/125、Node 子进程、Electron utilityProcess 协议模拟、宿主边界、preload、Pinia 和六入口构建通过；真实 Electron 运行与 Windows 安装包仍待验证 |
 | P0-03 | SQLite、WAL、FTS5、迁移与故障恢复 | 进行中 | Node26 内置 SQLite 3.54.0 真实文件及仓储测试通过；已实现 utilityProcess 唯一持久连接与实际引擎版本检查，better-sqlite3/Electron ABI、Windows 与备份恢复待验证 |
 | P0-04 | 模拟确定性、离线结算、奖励幂等 | 开发机验证通过 | 领域 15/15、7/7 smoke；应用服务与真实 SQLite 7/7 集成、20次重启、离线结算、故障回滚和损坏检测通过；Windows 打包端需回归 |
-| P0-05 | 角色数据包、局部命中、序列帧、降级、CG 版本 | 进行中 | 004A 严格 manifest、atlas、内置素材/hash/预算、resolver 与真实文件测试通过；实际渲染、换宠、缓存 pin、CG 版本和 Windows 性能待开发/验收 |
+| P0-05 | 角色数据包、局部命中、序列帧、降级、CG 版本 | 进行中 | 004A manifest、atlas、内置素材/hash/预算、resolver 与真实文件测试通过；004B 动作时钟、DPI 独立几何和口型时间轴 38 项专项通过；实际渲染、换宠、缓存 pin、CG 版本和 Windows 性能待开发/验收 |
 | P1-01 | AI 与逐宠记忆 | 待开发 | 后续阶段 |
 | P1-02 | 语音管线 | 待开发 | 后续阶段 |
 | P1-03 | 桌面工具与推荐 | 待开发 | 后续阶段 |

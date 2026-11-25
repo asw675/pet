@@ -90,6 +90,75 @@ function fixture() {
   };
 }
 
+const modelPath = 'assets/live2d/test.model3.json';
+const mocPath = 'assets/live2d/test.moc3';
+const modelTexture = 'assets/live2d/textures/base.png';
+const modelFile = (extra: Record<string, unknown> = {}) => ({
+  Version: 3, FileReferences: { Moc: 'test.moc3', Textures: ['textures/base.png'], ...extra },
+  Groups: [{ Target: 'Parameter', Name: 'EyeBlink', Ids: ['ParamEyeLOpen', 'ParamEyeROpen'] }],
+});
+const encode = (data: unknown) => new TextEncoder().encode(JSON.stringify(data));
+
+function cubismFixture(model: ReturnType<typeof modelFile> = modelFile()) {
+  const f = fixture();
+  const moc = new Uint8Array(64); // Only the outer signature is validated without licensed Core.
+  moc.set(new Uint8Array([0x4d, 0x4f, 0x43, 0x33]));
+  f.setFile(modelPath, encode(model));
+  f.setFile(mocPath, moc);
+  f.setFile(modelTexture, png());
+  f.manifest.variants.unshift({ renderer: 'cubism', id: 'live2d', entry: modelPath });
+  Object.assign(f.manifest.actions.idle, { live2d: 'idle' });
+  return f;
+}
+
+describe('Cubism pack data', () => {
+  it('projects verified model references and keeps an independent static fallback', async () => {
+    const f = cubismFixture(modelFile({ Motions: { idle: [{ File: 'idle.motion3.json' }] } }));
+    f.setFile('assets/live2d/idle.motion3.json', encode({
+      Version: 3, Meta: { Duration: 1, Fps: 30, CurveCount: 1, TotalSegmentCount: 1, TotalPointCount: 2 },
+      Curves: [{ Target: 'Parameter', Id: 'ParamEyeLOpen', Segments: [0, 1, 0, 1, 0] }],
+    }));
+    const result = await resolvePack(f.manifest, f.source, options);
+    expect(result.variants[0]).toMatchObject({ renderer: 'cubism', entry: modelPath,
+      textures: [{ path: modelTexture, size: { w: 4, h: 4 } }], model: {
+        moc: mocPath, eyeBlink: ['ParamEyeLOpen', 'ParamEyeROpen'],
+        motions: { idle: [{ path: 'assets/live2d/idle.motion3.json' }] },
+      } });
+    expect(result.variants.some(item => item.renderer === 'static')).toBe(true);
+  });
+
+  it.each([
+    { Moc: '../test.moc3' }, { Moc: 'https://other.test/model.moc3' },
+    { Textures: ['textures/base.png', 'textures/base.png'] }, { Script: 'start.js' },
+    { Physics: 'missing.physics3.json' }, { Motions: { idle: [{ File: 'idle.motion3.json', Sound: 'audio.ogg' }] } },
+  ])('rejects unauthorized or unresolved model references %o', async extra => {
+    const f = cubismFixture(modelFile(extra));
+    await expect(resolvePack(f.manifest, f.source, options)).rejects.toMatchObject({ code: 'INVALID_CUBISM' });
+  });
+
+  it('rejects a forged MOC3 signature and giant physics allocation counters', async () => {
+    const invalidMoc = cubismFixture();
+    invalidMoc.setFile(mocPath, new Uint8Array(64));
+    await expect(resolvePack(invalidMoc.manifest, invalidMoc.source, options)).rejects.toMatchObject({ code: 'INVALID_CUBISM' });
+
+    const invalidPhysics = cubismFixture(modelFile({ Physics: 'bad.physics3.json' }));
+    invalidPhysics.setFile('assets/live2d/bad.physics3.json', encode({
+      Version: 3, Meta: { PhysicsSettingCount: 1, TotalInputCount: 8_000_000, TotalOutputCount: 0, VertexCount: 0 },
+      PhysicsSettings: [{ Input: [], Output: [], Vertices: [] }],
+    }));
+    await expect(resolvePack(invalidPhysics.manifest, invalidPhysics.source, options)).rejects.toMatchObject({ code: 'INVALID_CUBISM' });
+  });
+
+  it('requires a verified fallback and refuses auxiliary files absent from the model', async () => {
+    const f = cubismFixture();
+    f.setFile('assets/live2d/extra.exp3.json', encode({ Parameters: [] }));
+    await expect(resolvePack(f.manifest, f.source, options)).rejects.toMatchObject({ code: 'SOURCE_MISMATCH' });
+    f.manifest.variants = f.manifest.variants.filter(v => v.renderer !== 'static');
+    Reflect.deleteProperty(f.manifest.actions.idle, 'still');
+    await expect(resolvePack(f.manifest, f.source, options)).rejects.toMatchObject({ code: 'NO_STATIC_FALLBACK' });
+  });
+});
+
 describe('local pack preparation', () => {
   it('validates bytes, exact source paths, atlas references and static fallback; returns detached verified copies', async () => {
     const f = fixture();

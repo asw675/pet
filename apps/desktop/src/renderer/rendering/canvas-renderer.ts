@@ -16,7 +16,7 @@ export interface CanvasRendererOptions {
 
 interface LoadedVariant {
   readonly pack: ResolvedPack;
-  readonly variant: ResolvedPackVariant;
+  readonly variant: Exclude<ResolvedPackVariant, { renderer: 'cubism' }>;
   readonly bitmap: ImageBitmap;
   readonly actions: ActionController;
 }

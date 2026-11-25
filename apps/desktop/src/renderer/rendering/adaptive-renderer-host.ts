@@ -2,12 +2,13 @@ import type { ResolvedPack, ResolvedPackVariant } from '../../shared/resolve-cha
 import type { PetRenderer, RenderProfile, HitRegion, MouthSample, ActionRequest, ActionResult, RenderPose } from './contract';
 import type { PixiHealth } from './pixi-renderer';
 
-export type RenderBackend = 'pixi-webgl' | 'canvas2d';
+export type RenderBackend = 'cubism-webgl' | 'pixi-webgl' | 'canvas2d';
 export interface VisualRenderer extends PetRenderer {
   readonly activeCharacterId: string | null;
   readonly activeVariant: ResolvedPackVariant | null;
   readonly hasDrawnFrame?: boolean;
   setBaseAction(semanticId: string): void;
+  setLook?(x: number, y: number): void;
   clearMouth(): void;
 }
 export interface VisualSurface {
@@ -77,6 +78,7 @@ export class AdaptiveRendererHost {
   private pose: RenderPose = { x: 0, y: 0, scale: 1, facing: 1 };
   private paused = false;
   private baseAction = 'idle';
+  private look = { x: 0, y: 0 };
   private readonly recoveryWindowMs: number;
 
   constructor(private readonly options: AdaptiveRendererOptions) {
@@ -102,7 +104,9 @@ export class AdaptiveRendererHost {
     signal.addEventListener('abort', relay, { once: true });
     this.pending = job; this.loading = true; this.emit('loading');
     try {
-      await this.tryBackends(job, ['pixi-webgl', 'canvas2d']);
+      const backends: readonly RenderBackend[] = pack.variants.some(variant => variant.renderer === 'cubism')
+        ? ['cubism-webgl', 'pixi-webgl', 'canvas2d'] : ['pixi-webgl', 'canvas2d'];
+      await this.tryBackends(job, backends);
     } finally {
       signal.removeEventListener('abort', relay);
       this.finishJob(job);
@@ -138,6 +142,10 @@ export class AdaptiveRendererHost {
   }
   setBaseAction(semanticId: string): void {
     this.baseAction = semanticId; for (const slot of [this.current, this.staged]) slot?.renderer?.setBaseAction(semanticId);
+  }
+  setLook(x: number, y: number): void {
+    this.look = { x, y };
+    for (const slot of [this.current, this.staged]) slot?.renderer?.setLook?.(x, y);
   }
   setPaused(paused: boolean): void {
     if (this.disposed) return;
@@ -176,6 +184,7 @@ export class AdaptiveRendererHost {
   private configure(slot: Slot): void {
     const renderer = slot.renderer!;
     renderer.setQuality(this.profile); renderer.setPose(this.pose); renderer.setBaseAction(this.baseAction);
+    renderer.setLook?.(this.look.x, this.look.y);
     renderer.setPaused(this.paused); renderer.resize(this.viewport.w, this.viewport.h, this.viewport.dpr);
   }
   private async build(job: Job, backend: RenderBackend, recovered?: Slot): Promise<Slot> {
@@ -219,7 +228,7 @@ export class AdaptiveRendererHost {
       try { this.promote(job, await this.build(job, backend)); return; }
       catch (error) { if (!this.live(job)) throw job.controller.signal.reason ?? error; }
     }
-    // Neither actual render adapter succeeded. Do not masquerade a different
+    // No actual render adapter succeeded. Do not masquerade a different
     // character as this one. The caller may show a non-interactive portrait.
     if (this.live(job)) {
       retire(this.current); this.current = undefined; this.loading = false; this.emit('fallback');
@@ -270,7 +279,7 @@ export class AdaptiveRendererHost {
     // Existing verified Canvas2D remains interactive while recovery is staged
     // (same character). No visual identity change or new message authority.
     this.loading = !this.current;
-    void this.build(job, 'pixi-webgl', slot).then(candidate => this.promote(job, candidate), () => {
+    void this.build(job, slot.backend, slot).then(candidate => this.promote(job, candidate), () => {
       if (this.live(job) && !this.current) { this.loading = false; this.emit('fallback'); }
     }).catch(() => {}).finally(() => this.finishJob(job));
   }

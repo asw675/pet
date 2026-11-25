@@ -4,6 +4,7 @@ import {
   validateSpriteAtlas,
 } from '@pet-desktop/contracts';
 import type { CharacterPackManifest, SpriteAtlas } from '@pet-desktop/contracts';
+import { parseCubismModelSettings, type CubismModelSettings, validateCubismMetadata } from './cubism-model-settings';
 
 /** A capability for one already selected local pack. */
 export interface PackSource {
@@ -36,6 +37,7 @@ export type PackResolveErrorCode =
   | 'INVALID_PNG'
   | 'TEXTURE_BUDGET_EXCEEDED'
   | 'INVALID_ATLAS'
+  | 'INVALID_CUBISM'
   | 'ABORTED'
   | 'TIMEOUT';
 
@@ -58,7 +60,9 @@ interface ResolvedVariantBase {
 
 export type ResolvedPackVariant =
   | (ResolvedVariantBase & { readonly renderer: 'sprite'; readonly atlas: SpriteAtlas })
-  | (ResolvedVariantBase & { readonly renderer: 'static' });
+  | (ResolvedVariantBase & { readonly renderer: 'static' })
+  | { readonly renderer: 'cubism'; readonly id: string; readonly entry: string; readonly model: CubismModelSettings;
+    readonly textures: readonly { readonly path: string; readonly size: PackImageSize }[] };
 
 export interface ResolvedPack {
   /** Parsed and frozen copies, independent of source objects. */
@@ -73,6 +77,8 @@ const MAX_TEXTURE_BYTES = 64 * 1024 * 1024;
 const MAX_PNG_CHUNKS = 1024;
 const DEFAULT_TIMEOUT_MS = 30_000;
 const PNG_SIGNATURE = [137, 80, 78, 71, 13, 10, 26, 10] as const;
+const PNG_COLOR_CHUNK_SIZES = new Map([[0x73524742, 1], [0x67414d41, 4], [0x6348524d, 32],
+  [0x70485973, 9], [0x73424954, 4]]);
 
 function fail(code: PackResolveErrorCode): never {
   throw new PackResolveError(code);
@@ -130,7 +136,7 @@ function crc32(bytes: Uint8Array, from: number, until: number): number {
   return (crc ^ 0xffffffff) >>> 0;
 }
 
-/** Non-interlaced, 8bpc RGBA PNG. Only bounded, non-rendered provenance
+/** Non-interlaced, 8bpc RGBA PNG. Bounded provenance or fixed-size color
  * metadata may precede the pixel data.
  * Checks container/CRC/dimensions before any image decoder can allocate pixels.
  * IDAT decompression/pixel decoding is deliberately delegated to the renderer adapter.
@@ -142,6 +148,7 @@ function inspectPng(bytes: Uint8Array): PackImageSize {
   let chunks = 0;
   let compressedBytes = 0;
   let provenance = false;
+  const colorChunks = new Set<number>();
   let size: PackImageSize | undefined;
   while (offset <= bytes.length - 12 && ++chunks <= MAX_PNG_CHUNKS) {
     const length = view.getUint32(offset);
@@ -162,6 +169,9 @@ function inspectPng(bytes: Uint8Array): PackImageSize {
     } else if (type === 0x63614258) { // caBX Content Credentials metadata
       if (provenance || compressedBytes !== 0 || length === 0 || length > 256 * 1024) fail('INVALID_PNG');
       provenance = true;
+    } else if (PNG_COLOR_CHUNK_SIZES.has(type)) {
+      if (compressedBytes !== 0 || colorChunks.has(type) || length !== PNG_COLOR_CHUNK_SIZES.get(type)) fail('INVALID_PNG');
+      colorChunks.add(type);
     } else if (type === 0x49444154) { // IDAT; zero-size adjacent chunks are legal.
       compressedBytes += length;
     } else if (type === 0x49454e44) { // IEND
@@ -208,8 +218,8 @@ export async function resolvePack(
     const manifest = parsed.data;
     if (manifest.characterId !== options.characterId || manifest.packVersion !== options.packVersion) fail('IDENTITY_MISMATCH');
     if (!versionAtLeast(options.appVersion, manifest.minAppVersion)) fail('INCOMPATIBLE_APP');
-    if (manifest.variants.some(variant => variant.renderer !== 'sprite' && variant.renderer !== 'static')
-      || manifest.files.some(file => !file.path.endsWith('.png') && !file.path.endsWith('.json'))
+    if (manifest.variants.some(variant => !['sprite', 'static', 'cubism'].includes(variant.renderer))
+      || manifest.files.some(file => !file.path.endsWith('.png') && !file.path.endsWith('.json') && !file.path.endsWith('.moc3'))
       || !manifest.thumbnail.endsWith('.png')) fail('UNSUPPORTED_FORMAT');
     if (!manifest.variants.some(variant => variant.renderer === 'static')) fail('NO_STATIC_FALLBACK');
 
@@ -266,11 +276,40 @@ export async function resolvePack(
         const imageSize = images.get(atlas.image);
         if (!imageSize || imageSize.w !== atlas.size.w || imageSize.h !== atlas.size.h) fail('INVALID_ATLAS');
         variants.push({ renderer: 'sprite', id: variant.id, entry: variant.entry, atlas, imagePath: atlas.image, imageSize });
+      } else if (variant.renderer === 'cubism') {
+        const jsonBytes = verified.get(variant.entry);
+        if (!jsonBytes) fail('INVALID_CUBISM');
+        let model: CubismModelSettings;
+        try { model = parseCubismModelSettings(variant.entry, jsonBytes); }
+        catch { fail('INVALID_CUBISM'); }
+        for (const [semantic, actions] of Object.entries(manifest.actions)) {
+          const group = actions[variant.id];
+          if (group && !(semantic === 'idle' && group === 'idle') && !Object.hasOwn(model.motions, group)) fail('INVALID_CUBISM');
+        }
+        for (const path of model.dependencies) {
+          const dependency = verified.get(path);
+          if (!dependency) fail('INVALID_CUBISM');
+          if (path.endsWith('.json')) {
+            try { validateCubismMetadata(path, dependency); } catch { fail('INVALID_CUBISM'); }
+          }
+          requiredPaths.add(path);
+        }
+        const mocBytes = verified.get(model.moc);
+        // Container signature only. The official runtime must still check MOC
+        // consistency before any model object is allocated.
+        if (!mocBytes || mocBytes.byteLength < 64 || mocBytes[0] !== 0x4d || mocBytes[1] !== 0x4f
+          || mocBytes[2] !== 0x43 || mocBytes[3] !== 0x33) fail('INVALID_CUBISM');
+        const textures = model.textures.map(path => {
+          const size = images.get(path);
+          if (!size) fail('INVALID_CUBISM');
+          return { path, size };
+        });
+        variants.push({ renderer: 'cubism', id: variant.id, entry: variant.entry, model, textures });
       } else { fail('UNSUPPORTED_FORMAT'); }
     }
 
-    // This built-in pack subset contains only dependencies we resolve; external
-    // assets such as CG, audio and future SDK files need an explicit catalog/adapter.
+    // Only validated dependencies belong to this pack. The SDK and its
+    // shaders are never loaded from user asset files.
     if (requiredPaths.size !== verified.size || [...verified.keys()].some(path => !requiredPaths.has(path))) fail('SOURCE_MISMATCH');
     checkAborted(controller.signal);
     return Object.freeze({

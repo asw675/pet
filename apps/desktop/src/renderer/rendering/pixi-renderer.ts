@@ -18,7 +18,7 @@ export interface PixiRendererOptions {
 }
 interface Active {
   pack: ResolvedPack;
-  variant: ResolvedPackVariant;
+  variant: Exclude<ResolvedPackVariant, { renderer: 'cubism' }>;
   bitmap: ImageBitmap;
   resource: PixiAtlasResource;
   actions: ActionController;

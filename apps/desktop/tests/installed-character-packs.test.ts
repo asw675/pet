@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import { cp, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -143,6 +144,33 @@ test('loads the new Star Singer portrait including its original provenance chunk
   expect(prepared.variants[0]).toMatchObject({ renderer: 'static', imageSize: { w: 1024, h: 1536 } });
   await store.install(prepared);
   expect((await store.readActive('star-singer'))?.assets[0]?.data.byteLength).toBe(prepared.manifest.files[0]?.bytes);
+});
+
+test('installs a normalized Cubism Editor export and sends verified model data to the sandbox', async () => {
+  const exportDir = join(scratch, 'Editor Export');
+  const textures = join(exportDir, 'Star.2048');
+  const modelPath = join(exportDir, 'Star.model3.json');
+  const output = join(scratch, 'star-singer-1.2.0');
+  await mkdir(textures, { recursive: true });
+  const moc = Buffer.alloc(64); // This is a pack-transfer fixture, not an SDK-loadable model.
+  moc.write('MOC3');
+  await Promise.all([
+    writeFile(join(exportDir, 'Star.moc3'), moc),
+    cp(join(source, 'assets', 'thumbnail.png'), join(textures, 'Texture.00.png')),
+    writeFile(modelPath, JSON.stringify({ Version: 3, FileReferences: { Moc: 'Star.moc3', Textures: ['Star.2048/Texture.00.png'] } })),
+  ]);
+  const helper = fileURLToPath(new URL('../scripts/prepare-cubism-pack.mjs', import.meta.url));
+  execFileSync(process.execPath, [helper, modelPath, output, '1.2.0']);
+  await store.install(await store.prepare(output));
+  const pet = createPetBridge({
+    async invoke() { return { ok: true, kind: 'read', pack: await store.readActive('star-singer') }; },
+    on() {}, removeListener() {},
+  });
+  const model = await loadInstalledPack(pet, 'star-singer', new AbortController().signal);
+  expect(model?.manifest.packVersion).toBe('1.2.0');
+  expect(model?.variants.map(item => item.renderer)).toEqual(['cubism', 'static']);
+  expect(model?.variants[0]).toMatchObject({ model: { textures: ['assets/live2d/textures/texture-1.png'] } });
+  expect(model?.readAsset('assets/live2d/star-singer.moc3')).toEqual(new Uint8Array(moc));
 });
 
 test('offers the bundled preview without switching the saved appearance or requiring an import', async () => {

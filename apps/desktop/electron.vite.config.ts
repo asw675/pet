@@ -2,6 +2,7 @@ import { resolve } from 'node:path';
 import { defineConfig } from 'electron-vite';
 import vue from '@vitejs/plugin-vue';
 import { computeNativeArtifactPins } from './scripts/native-artifact-pins.mjs';
+import { cubismPreviewPlugin } from './cubism-preview-plugin';
 
 // Each preload is a standalone CJS bundle. The runtime native addon remains
 // external and is loaded only from the separate utility-process entry.
@@ -35,7 +36,7 @@ export default defineConfig({
   },
   renderer: {
     root: resolve('src/renderer'),
-    plugins: [vue()],
+    plugins: [vue(), cubismPreviewPlugin()],
     build: { rollupOptions: { input: {
       pet: resolve('src/renderer/pet/index.html'),
       'control-center': resolve('src/renderer/control-center/index.html'),

@@ -134,6 +134,17 @@ function onClick(event: MouseEvent): void {
   if (region) emit('touch', region.id);
 }
 
+function onLook(event: PointerEvent): void {
+  if (!event.isTrusted || !props.interactive || !surface.value) return;
+  const bounds = surface.value.getBoundingClientRect();
+  if (bounds.width > 0 && bounds.height > 0) {
+    renderer?.setLook(2 * (event.clientX - bounds.left) / bounds.width - 1,
+      1 - 2 * (event.clientY - bounds.top) / bounds.height);
+  }
+}
+
+function clearLook(): void { renderer?.setLook(0, 0); }
+
 function playSemantic(semanticId: string): void {
   if (!renderer || props.paused || renderer.activeCharacterId !== props.characterId || loadState.value !== 'ready') return;
   // Visual requests never act as domain command receipts or gate gameplay.
@@ -170,6 +181,12 @@ onMounted(() => {
     },
     createRenderer: async (backend, onHealth) => {
       if (backend === 'canvas2d') return new CanvasRenderer();
+      if (backend === 'cubism-webgl') {
+        const [{ CubismRenderer }, { loadLocalCubismPreview }] = await Promise.all([
+          import('../rendering/cubism-renderer'), import('../rendering/cubism-preview-runtime'),
+        ]);
+        return new CubismRenderer(await loadLocalCubismPreview(), onHealth);
+      }
       const [{ PixiRenderer }, { createPixiV8Runtime }] = await Promise.all([
         import('../rendering/pixi-renderer'),
         import('../rendering/pixi-v8-runtime'),
@@ -211,7 +228,8 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="pet-visual" :data-load-state="loadState">
-    <div ref="surface" class="pet-stage" aria-label="角色动画" @click="onClick"></div>
+    <div ref="surface" class="pet-stage" aria-label="角色动画" @click="onClick"
+      @pointermove="onLook" @pointerleave="clearLook"></div>
     <div v-if="!hasFrame" class="initial-fallback" aria-hidden="true">
       <PetPortrait :character-id="characterId" :sleeping="activity === 'REST' || activity === 'SLEEP'" :paused="paused" />
     </div>

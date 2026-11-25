@@ -81,7 +81,7 @@ onBeforeUnmount(() => { revision++; });
 <template>
   <section class="panel side-panel">
     <h2>角色资源包</h2>
-    <p class="muted">支持导入角色的序列帧或静态 PNG 资源包。可随时切回内置或已安装版本。</p>
+    <p class="muted">支持导入 Live2D、序列帧或静态 PNG 资源包。Live2D 在启用本机 Cubism SDK 预览时播放，其他情况显示后备画面。</p>
     <div v-for="item in rows" :key="item.characterId" class="pack-row">
       <label :for="'pack-' + item.characterId">{{ name[item.characterId] }}</label>
       <select :id="'pack-' + item.characterId" :value="item.activeVersion"

@@ -7,7 +7,7 @@ import type { TrustedMemoryConfirmation } from '@pet-desktop/app-service/memory-
 import { aiRequestSchema, aiResultMatches, aiResultSchema, chatIdentitySchema } from '../../shared/ai-ipc';
 import type { AiIntent, AiRequest, AiResult, ProviderAssignmentView } from '../../shared/ai-ipc';
 import { ChatCoordinator } from './chat-coordinator';
-import type { ChatCredentialBroker } from './chat-coordinator';
+import type { ChatCredentialBroker,ChatStartResult,ProactiveChatTurnIntent } from './chat-coordinator';
 import { MockModelProvider, publicAiError } from './model-provider';
 import type { TurnIdentity } from './model-provider';
 import { OpenAiCompatibleProvider } from './openai-compatible-provider';
@@ -28,6 +28,9 @@ export interface AiControlServiceOptions {
   now?: () => number;
   createId?: (kind:'proposal'|'memory-candidate') => string;
   maxActiveJobs?: number;
+  /** Internal durable proactive scheduler authorization. Missing means deny;
+   * a renderer cannot manufacture a locally opted-in pending notice. */
+  authorizeProactive?: (identity:TurnIdentity) => boolean;
   /** Transport injection for isolated provider tests; not a renderer setting. */
   openAiOptions?: Omit<OpenAiCompatibleProviderOptions,'now'>;
 }
@@ -92,6 +95,7 @@ export class AiControlService {
   private readonly coordinator:ChatCoordinator;
   private readonly options:AiControlServiceOptions;
   private readonly now:()=>number;
+  private readonly proactiveRequests=new Map<string,string>(); // one tracked identity per owned pet
   private closed=false;
   constructor(options:AiControlServiceOptions) {
     this.options=options;this.authority=options.authority;this.now=options.now??Date.now;
@@ -102,6 +106,7 @@ export class AiControlService {
       ...(options.createId===undefined?{}:{createId:options.createId}),
       ...(options.maxActiveJobs===undefined?{}:{maxActiveJobs:options.maxActiveJobs}),
       registry:{resolve:(providerId,providerRevision,identity,at)=>{
+        if(this.proactiveRequests.get(identity.petId)===identity.requestId&&!this.authorizedProactive(identity))return undefined;
         const record=this.authority.resolveTurnProvider(identity,providerId,providerRevision,at);
         if(!record||record.revision!==providerRevision||record.config.providerId!==providerId||!supportedProvider(record.config))return undefined;
         const provider=record.config.endpointKind==='MOCK'?mock:record.config.endpointKind==='OPENAI_COMPATIBLE'?openAi:null;
@@ -119,6 +124,25 @@ export class AiControlService {
     const parsed=chatStreamEventSchema.safeParse(event);
     if(parsed.success)this.options.sendEvent(parsed.data);
   }
+  private authorizedProactive(identity:TurnIdentity):boolean{
+    try{return this.options.authorizeProactive?.(cloneIdentity(identity))===true;}catch{return false;}
+  }
+  /** Trusted scheduler only. No public method or renderer event path for
+   * PROACTIVE, and a chat-cloud assignment never authorizes this request. */
+  startProactive(intent:ProactiveChatTurnIntent,onEvent:(event:ChatStreamEvent)=>void):ChatStartResult{
+    const rejected:ChatStartResult={accepted:false,reason:'AUTHORITY_REJECTED',error:publicAiError('UNAVAILABLE')};
+    if(this.closed||!this.authorizedProactive(intent)||typeof onEvent!=='function')return rejected;
+    try{
+      const config=this.authority.getProviderAssignment(intent.petId)?.provider.config;
+      if(!config||config.privacyBoundary==='CLOUD'||!supportedProvider(config))return rejected;
+      const result=this.coordinator.startProactive(intent,event=>{
+        if(event.kind!=='textDelta'&&this.proactiveRequests.get(event.petId)===event.requestId)this.proactiveRequests.delete(event.petId);
+        onEvent(event);
+      });
+      if(result.accepted)this.proactiveRequests.set(result.petId,result.requestId);
+      return result;
+    }catch{return rejected;}
+  }
   /** Trusted internal owner only (disconnect, pet switch, credential revoke).
    * Public renderer cancellation below accepts USER only. */
   cancelInternal(identity:TurnIdentity,reason:AiCancelReason):boolean{
@@ -128,7 +152,7 @@ export class AiControlService {
   }
   close():void {
     if(this.closed)return;
-    this.closed=true;this.coordinator.close();
+    this.closed=true;this.coordinator.close();this.proactiveRequests.clear();
   }
   handleRequest(raw:unknown):AiResult{
     const parsed=aiRequestSchema.safeParse(raw);
@@ -193,6 +217,7 @@ export class AiControlService {
           return success(request,{changed});
         }
         case 'chat/start':{
+          this.coordinator.cancelProactiveForPet(intent.payload.petId);
           const started=this.coordinator.start(intent.payload,event=>this.event(event));
           return started.accepted?success(request,cloneIdentity(started)):failure(request,started.error.code);
         }

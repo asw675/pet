@@ -475,6 +475,11 @@ export class AiStateStorage {
       motionIntent:value.motion_intent,usage:value.usage_json===null?null:parseJson(value.usage_json)});
   }
   getTurn(requestId:string):AiTurnRecord|null { const value=this.get('SELECT * FROM ai_turns WHERE request_id=?',idSchema.parse(requestId));return value?this.turnFromRow(value):null; }
+  /** Actual last user input, not a proactive reply or guessed system idle.
+   * Redacting content does not invent a different interaction timestamp. */
+  latestUserInteraction(petId:string):number|null {
+    return nullableInt(this.get("SELECT MAX(started_at) AS last_at FROM ai_turns WHERE pet_id=? AND trigger='USER'",idSchema.parse(petId))?.last_at);
+  }
   hasPendingTurn(petId:string):boolean { return this.get("SELECT 1 FROM ai_turns WHERE pet_id=? AND status='PENDING'",idSchema.parse(petId))!==null; }
   countPendingTurns():number { return int(this.get("SELECT COUNT(*) AS count FROM ai_turns WHERE status='PENDING'")?.count); }
 

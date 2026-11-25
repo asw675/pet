@@ -121,8 +121,8 @@ function gameContext(pet: PetSnapshot, view: AiAuthorityGameView, at: number): A
 function proactiveAllowed(snapshot: AppSnapshot, pet: PetSnapshot, config: ProviderConfig): boolean {
   // A chat-cloud assignment never implies unsolicited cloud transmission.
   // A dedicated opt-in policy would be needed for automatic remote context.
-  return config.privacyBoundary !== 'CLOUD' && !snapshot.doNotDisturb && pet.visibility === 'VISIBLE'
-    && pet.presence === 'HOME' && pet.activity !== 'CHAT' && pet.activity !== 'DRAG';
+  return config.privacyBoundary !== 'CLOUD' && !snapshot.doNotDisturb && snapshot.primaryPetId === pet.petId
+    && pet.visibility === 'VISIBLE' && pet.presence === 'HOME' && pet.activity === 'IDLE';
 }
 function currentPetForTurn(snapshot: AppSnapshot, turn: AiTurnRecord): PetSnapshot | null {
   const pet = findPet(snapshot,turn.petId), persona = pet ? personaFor(pet.characterId) : null;

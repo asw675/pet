@@ -10,7 +10,8 @@
     "./voice": "./src/voice.ts",
     "./travel": "./src/travel.ts",
     "./workspace": "./src/workspace.ts",
-    "./events": "./src/events.ts"
+    "./events": "./src/events.ts",
+    "./proactive": "./src/proactive.ts"
   },
   "imports": {
     "#character-pack": "./src/character-pack.ts",

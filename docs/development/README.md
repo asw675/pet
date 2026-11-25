@@ -61,6 +61,7 @@
 | 009B-1 | 本地频次/时段/共现推荐纯策略 | 9项专项，历史与界面待接入 | [009b1-recommendation-rules](009b1-recommendation-rules.md) |
 | 007E-2/008C/009D | AI、语音、工作台同一写入者及闭合真实业务传输、原生发行门禁 | 296项专项、生产构建通过；真实 Windows 待验收 | [007e2-feature-transport](007e2-feature-transport.md) |
 | 007E-3/008D/009F | 聊天、记忆、语音口型及工作台实际页面 | 专项及生产构建通过，实机待验收 | [007e3-user-interfaces](007e3-user-interfaces.md) |
+| 007F-1 | 主动陪伴存储与内部本地会话权限 | SQLite、契约和控制服务专项通过，调度与界面待接入 | [007f1-proactive-foundation](007f1-proactive-foundation.md) |
 | 007-Q | 固定 d20fc41 核心功能及代码规模核对 | 开发覆盖约82.7% | [007-progress-checkpoint](007-progress-checkpoint.md) |
 | 010A | SQLite v11、宿主显示偏好与手动备份 | SQLite 和宿主专项通过，Windows 真机待验收 | [010a-host-preferences-and-backup](010a-host-preferences-and-backup.md) |
 | 010B | Windows x64 原生构建及 NSIS 安装包工作流 | 配置与生产构建通过，Windows 打包待 CI | [010b-windows-package](010b-windows-package.md) |

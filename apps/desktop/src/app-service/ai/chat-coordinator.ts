@@ -452,6 +452,13 @@ export class ChatCoordinator {
     return this.finish(job, { ...job.identity, completedAt: this.completedAt(job), kind: 'CANCELLED', reason: validReason.data });
   }
 
+  /** A user explicitly initiating chat always takes priority over an
+   * unsolicited local companion turn on that same pet. */
+  cancelProactiveForPet(petId: string): boolean {
+    const job=this.jobs.get(petId);
+    return job?.intent.trigger==='PROACTIVE' ? this.cancel(job.identity,'SUPERSEDED') : false;
+  }
+
   /** Call only after a trusted settings/source/memory mutation commits.
    * Revocation invalidates outstanding jobs promptly, including streams
    * already opened; late completions and credential lookups become inert. */

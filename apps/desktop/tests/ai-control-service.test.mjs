@@ -22,7 +22,7 @@ function jsonReply(reply){return new Response(JSON.stringify({choices:[{index:0,
   {status:200,headers:{'content-type':'application/json'}});}
 const currentSource=init=>JSON.parse(JSON.parse(init.body).messages[1].content).currentUserMessage.messageId;
 
-async function fixture(run,{fetch:fetcher,broker,authorityOverride}={}){
+async function fixture(run,{fetch:fetcher,broker,authorityOverride,authorizeProactive}={}){
   const db=new DatabaseSync(':memory:');
   let service;
   try{
@@ -38,7 +38,7 @@ async function fixture(run,{fetch:fetcher,broker,authorityOverride}={}){
     const credentials={resolveCredential:vi.fn(broker??(async()=>SECRET))};
     service=new AiControlService({authority:authorityOverride?.(authority)??authority,readGameSnapshot:snapshot,
       credentialBroker:credentials,sendEvent:event=>{expect(chatStreamEventSchema.safeParse(event).success).toBe(true);events.push(event);},
-      now:()=>clock,createId:kind=>`${kind}-${++serial}`,openAiOptions:{fetch}});
+      authorizeProactive,now:()=>clock,createId:kind=>`${kind}-${++serial}`,openAiOptions:{fetch}});
     function call(method,payload){
       const request=aiRequestSchema.parse({requestId:`invoke-${++invoke}`,intent:{method,payload}}),result=service.handleRequest(request);
       expect(aiResultSchema.safeParse(result).success).toBe(true);expect(aiResultMatches(request,result)).toBe(true);
@@ -73,6 +73,23 @@ describe('AI utility closed IPC routing and actual provider selection',()=>{
     expect(f.service.handleRequest({requestId:'bad-call-2',intent:{method:'chat/start',payload:{...identity(f.conv1),trigger:'PROACTIVE',userText:null}}})).toMatchObject({ok:false});
     expect(f.service.handleRequest({requestId:'bad-call-3',intent:{method:'messages/list',payload:{...identity(f.conv1),...page}}}).ok).toBe(false);
   }));
+  it('denies an internal proactive turn without explicit trusted authorization',()=>fixture(f=>{
+    configure(f);
+    const onEvent=vi.fn();
+    expect(f.service.startProactive({...identity(f.conv1),trigger:'PROACTIVE',userText:null},onEvent))
+      .toMatchObject({accepted:false,reason:'AUTHORITY_REJECTED'});
+    expect(onEvent).not.toHaveBeenCalled();
+  }));
+  it('lets explicit user chat preempt its pet’s authorized proactive job',()=>fixture(async f=>{
+    configure(f);
+    const onEvent=vi.fn();
+    const proactive={...identity(f.conv1,'proactive-fixture'),trigger:'PROACTIVE',userText:null};
+    expect(f.service.startProactive(proactive,onEvent)).toMatchObject({accepted:true});
+    expect(start(f)).toMatchObject({ok:true});
+    expect(onEvent).toHaveBeenCalledWith(expect.objectContaining({kind:'cancelled',requestId:'proactive-fixture',reason:'SUPERSEDED'}));
+    expect(await waitTerminal(f)).toMatchObject({kind:'final'});
+    expect(f.fetch).not.toHaveBeenCalled();
+  },{authorizeProactive:identity=>identity.petId==='pet-1'&&identity.requestId==='proactive-fixture'}));
   it('default unassigned, only supported provider configs are stored; no silent mock or remote fallback',()=>fixture(async f=>{
     expect(start(f)).toMatchObject({ok:false,error:{code:'AUTH_REQUIRED'}});
     const unsupported={...cloud,endpointKind:'OPENAI_RESPONSES'};

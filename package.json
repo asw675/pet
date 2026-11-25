@@ -1,0 +1,16 @@
+{
+  "name": "pet-desktop",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.30.3",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "scripts": {
+    "dev": "pnpm --filter @pet-desktop/desktop dev",
+    "build": "pnpm --filter @pet-desktop/desktop build",
+    "test": "pnpm -r --if-present test",
+    "typecheck": "pnpm -r --if-present typecheck"
+  }
+}

@@ -68,5 +68,6 @@
 | 010C | Windows 构建检查诊断与 Pixi CSP 兼容接线 | 开发机专项和生产构建通过，Windows CI 待复跑 | [010c-package-qualification](010c-package-qualification.md) |
 | 010D | Mac 生产运行及 Windows 迁移测试夹具 | Mac 实际运行通过，Windows 待 CI 复测 | [010d-runtime-and-windows-ci](010d-runtime-and-windows-ci.md) |
 | 010E | 固定 Windows 检出的角色图集校验字节 | 模拟自动换行检出通过，Windows CI 待复测 | [010e-character-pack-line-endings](010e-character-pack-line-endings.md) |
+| 010F | Windows 验证日志及用户备份文件忽略 | 本地忽略规则验证通过 | [010f-windows-verification-log](010f-windows-verification-log.md) |
 
 每份记录包含：日期、范围、设计依据、具体变更、测试命令与真实结果、已知限制、下一步。完整验收状态见 [POC 矩阵](../qa/poc-matrix.md)。

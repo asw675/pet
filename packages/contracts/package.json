@@ -7,12 +7,14 @@
     ".": "./src/index.ts",
     "./inventory": "./src/inventory.ts",
     "./ai": "./src/ai.ts",
-    "./voice": "./src/voice.ts"
+    "./voice": "./src/voice.ts",
+    "./travel": "./src/travel.ts"
   },
   "imports": {
     "#character-pack": "./src/character-pack.ts",
     "#gallery": "./src/gallery.ts",
-    "#characters": "./src/characters.ts"
+    "#characters": "./src/characters.ts",
+    "#inventory": "./src/inventory.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",

@@ -2,6 +2,8 @@
 import { nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import type { Activity } from '@pet-desktop/contracts';
 import { loadBuiltinPack } from '../asset-packs/builtin-registry';
+import { AdaptiveRendererHost } from '../rendering/adaptive-renderer-host';
+import type { AdaptiveRenderState } from '../rendering/adaptive-renderer-host';
 import { CanvasRenderer } from '../rendering/canvas-renderer';
 import { semanticIdForActivity } from '../rendering/action-controller';
 import type { HitRegion, MouthSample, RenderProfile } from '../rendering/contract';
@@ -17,12 +19,12 @@ const emit = defineEmits<{
   touch: [region: string];
   visual: [report: { characterId: string; result: 'READY' | 'FALLBACK' }];
 }>();
-const surface = ref<HTMLCanvasElement | null>(null);
+const surface = ref<HTMLDivElement | null>(null);
 const hasFrame = ref(false);
 const loadState = ref<'loading' | 'ready' | 'failed'>('loading');
 
 // GPU/Canvas objects and clocks remain outside reactive state and Pinia.
-let renderer: CanvasRenderer | null = null;
+let renderer: AdaptiveRendererHost | null = null;
 let mounted = false;
 let loadAbort: AbortController | null = null;
 let resizeObserver: ResizeObserver | null = null;
@@ -79,6 +81,12 @@ function syncQuality(): void {
   resize();
 }
 
+function acceptRenderState(state: AdaptiveRenderState): void {
+  if (!mounted || state.characterId !== props.characterId) return;
+  hasFrame.value = state.hasFrame;
+  loadState.value = state.stage === 'fallback' ? 'failed' : state.stage;
+}
+
 async function replacePack(): Promise<void> {
   const instance = renderer;
   if (!instance || !mounted) return;
@@ -86,31 +94,18 @@ async function replacePack(): Promise<void> {
   const request = new AbortController();
   loadAbort = request;
   const characterId = props.characterId;
-  loadState.value = 'loading';
+  const isCurrent = () => mounted && loadAbort === request && !request.signal.aborted;
+  instance.invalidate(characterId);
   try {
     const pack = await loadBuiltinPack(characterId, request.signal);
+    if (!isCurrent()) return;
     await instance.loadPack(pack, request.signal);
-    if (!mounted || loadAbort !== request || request.signal.aborted) return;
-    // A successful preparation/bitmap decode is the only point at which the
-    // visual becomes current. A previous character is never a hit target for
-    // the new character's authoritative UI.
-    hasFrame.value = true;
-    loadState.value = 'ready';
-    instance.setBaseAction(semanticIdForActivity(props.activity));
-    resize();
-    syncAnimation();
-    await nextTick();
-    if (mounted && loadAbort === request && !request.signal.aborted) emit('visual', { characterId, result: 'READY' });
   } catch {
-    if (!mounted || loadAbort !== request || request.signal.aborted) return;
-    // The adapter retains the previous prepared resource on failure. On an
-    // initial failure or identity change, show the requested character's
-    // non-interactive SVG fallback, never an old character under a new name.
-    if (instance.activeCharacterId !== characterId) hasFrame.value = false;
-    loadState.value = 'failed';
-    await nextTick();
-    if (mounted && loadAbort === request && !request.signal.aborted) emit('visual', { characterId, result: 'FALLBACK' });
+    if (!isCurrent()) return;
+    instance.showPortrait(characterId);
   }
+  await nextTick();
+  if (isCurrent()) emit('visual', { characterId, result: instance.hasFrame ? 'READY' : 'FALLBACK' });
 }
 
 function hitTestClient(x: number, y: number): HitRegion | null {
@@ -147,34 +142,39 @@ watch(() => props.characterId, () => { void replacePack(); });
 watch(() => props.activity, (activity) => renderer?.setBaseAction(semanticIdForActivity(activity)));
 watch(() => props.paused, syncAnimation);
 
-onMounted(async () => {
+onMounted(() => {
+  const stage = surface.value;
+  if (!stage) return;
   mounted = true;
-  if (!surface.value) return;
+  renderer = new AdaptiveRendererHost({
+    createSurface: (backend) => {
+      const canvas = document.createElement('canvas');
+      canvas.dataset.backend = backend;
+      canvas.hidden = true;
+      canvas.setAttribute('aria-hidden', 'true');
+      stage.append(canvas);
+      return { canvas, show: visible => { canvas.hidden = !visible; }, destroy: () => canvas.remove() };
+    },
+    createRenderer: async (backend, onHealth) => {
+      if (backend === 'canvas2d') return new CanvasRenderer();
+      const [{ PixiRenderer }, { createPixiV8Runtime }] = await Promise.all([
+        import('../rendering/pixi-renderer'),
+        import('../rendering/pixi-v8-runtime'),
+      ]);
+      return new PixiRenderer({ runtime: createPixiV8Runtime(), onHealth });
+    },
+    onState: acceptRenderState,
+  });
   motionPreference = window.matchMedia('(prefers-reduced-motion: reduce)');
+  renderer.setBaseAction(semanticIdForActivity(props.activity));
   syncQuality();
-  const instance = new CanvasRenderer();
-  try {
-    await instance.init(surface.value, profile);
-    if (!mounted) { instance.destroy(); return; }
-    renderer = instance;
-    instance.setBaseAction(semanticIdForActivity(props.activity));
-    resizeObserver = new ResizeObserver(resize);
-    resizeObserver.observe(surface.value);
-    resize();
-    document.addEventListener('visibilitychange', syncAnimation);
-    window.addEventListener('resize', resize);
-    motionPreference.addEventListener('change', syncQuality);
-    syncAnimation();
-    await replacePack();
-  } catch {
-    instance.destroy();
-    if (renderer === instance) renderer = null;
-    if (mounted) {
-      loadState.value = 'failed';
-      await nextTick();
-      if (mounted) emit('visual', { characterId: props.characterId, result: 'FALLBACK' });
-    }
-  }
+  resizeObserver = new ResizeObserver(resize);
+  resizeObserver.observe(stage);
+  document.addEventListener('visibilitychange', syncAnimation);
+  window.addEventListener('resize', resize);
+  motionPreference.addEventListener('change', syncQuality);
+  syncAnimation();
+  void replacePack();
 });
 
 onBeforeUnmount(() => {
@@ -192,7 +192,7 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="pet-visual" :data-load-state="loadState">
-    <canvas ref="surface" class="pet-canvas" :class="{ 'frame-visible': hasFrame }" aria-label="角色动画" @click="onClick" />
+    <div ref="surface" class="pet-stage" aria-label="角色动画" @click="onClick"></div>
     <div v-if="!hasFrame" class="initial-fallback" aria-hidden="true">
       <PetPortrait :character-id="characterId" :sleeping="activity === 'REST' || activity === 'SLEEP'" :paused="paused" />
     </div>
@@ -202,8 +202,8 @@ onBeforeUnmount(() => {
 
 <style scoped>
 .pet-visual { position: relative; width: 100%; height: 100%; min-height: 100px; overflow: hidden; }
-.pet-canvas { display: block; width: 100%; height: 100%; opacity: 0; pointer-events: none; }
-.pet-canvas.frame-visible { opacity: 1; pointer-events: auto; }
+.pet-stage { position: absolute; inset: 0; }
+.pet-stage :deep(canvas) { position: absolute; width: 100%; height: 100%; }
 .initial-fallback { position: absolute; inset: 0; pointer-events: none; }
 .resource-notice { position: absolute; bottom: 1px; left: 50%; transform: translateX(-50%); white-space: nowrap; border-radius: 6px; padding: 2px 5px; background: #352b43dd; font-size: 10px; pointer-events: none; }
 </style>

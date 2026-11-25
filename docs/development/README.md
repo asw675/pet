@@ -23,6 +23,7 @@
 | 004E-1 | 图鉴契约、真实内置 CG 场景及历史目录 | 代码与专项测试通过 | [004e1-cg-catalog](004e1-cg-catalog.md) |
 | 004E-2 | SQLite v2 历史迁移、冻结 CG、权威图鉴及 IPC | 代码和数据库/传输测试通过 | [004e2-cg-authority](004e2-cg-authority.md) |
 | 004E-3 | 实际 CG 图鉴界面及精确资源回看 | 代码、专项测试与构建通过 | [004e3-gallery-ui](004e3-gallery-ui.md) |
+| 004F | Pixi WebGL 与 Canvas2D 降级接入桌宠窗口 | 专项测试与生产构建通过，Windows GPU 待验收 | [004f-pixi-desktop](004f-pixi-desktop.md) |
 | 004-Q | V1.1 功能及代码规模复核 | 产品覆盖约34.0% | [004-progress-audit](004-progress-audit.md) |
 | 005 | Windows 安装包与真机 P0 验收 | 按用户要求推迟至约90%开发覆盖 | — |
 | 006A-1 | 角色模板与获得规则、诺瓦内置资源 | 代码与专项测试通过 | [006a1-character-catalog](006a1-character-catalog.md) |

@@ -8,7 +8,6 @@ export interface AuthoredMouthPatch { readonly source: Rect; readonly destinatio
 // offsets. Never infer landmarks/crop a mouth from other character packs.
 const ATLAS_DESCRIPTOR_HASH = '701f66b111a4d07dd616e86121bec5631176027e1d3e66f70c9717940ffdbc56';
 const authored: Readonly<Record<string, string>> = {
-  'star-singer:1.0.1': '332e062fa42e201514790222245b6bfac67659a467ec37b330c6187ecf113a3e',
   'fluffy-ranger:1.0.1': 'e0355da39251e955a9588bbe20b2c0c477b2a8dd615e34012f3407d0f598ff7e',
   'nova:1.0.0': 'b8ccfd4e59b575ed483b87708ac3c4b431f90dfc143ea1f4a3bbfcb0815d0c6c',
 };

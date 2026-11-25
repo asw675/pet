@@ -117,12 +117,8 @@ class Raster {
 }
 
 const color = {
-  ink: rgba('433451'), rangerInk: rgba('64483c'), white: rgba('fff9ee'), gold: rgba('ffe29a'),
+  rangerInk: rgba('64483c'), white: rgba('fff9ee'), gold: rgba('ffe29a'),
   skin: rgba('ffe5cf'), blush: rgba('ed8ba1', 180),
-  demonHair: rgba('e17a98'), demonHairShade: rgba('a94d78'), demonHairShine: rgba('ffaac1'),
-  horn: rgba('3d304d'), hornShine: rgba('80668b'), demonCloth: rgba('473752'), demonBlack: rgba('30263f'),
-  demonAccent: rgba('a46ba1'), demonSkirt: rgba('726082'), azure: rgba('638ec8'), ice: rgba('b4ddf7'),
-  rose: rgba('d779a7'), roseLight: rgba('ffc3dc'),
   copper: rgba('ac604e'), copperDark: rgba('844537'), copperShine: rgba('df956e'), cream: rgba('ffecc7'),
   pink: rgba('f6b5a4'), green: rgba('71977b'), vest: rgba('8eb08d'), brown: rgba('76523e'),
   leaf: rgba('76b383'), jade: rgba('588e78'), mint: rgba('aed9a7'), mouth: rgba('9c5d65'), shadow: rgba('2b203c', 48),
@@ -152,7 +148,7 @@ function shapeAt(frame, dx, dy) {
   };
 }
 
-function face(draw, ink, iris, irisLight, clip, i, rightIris = iris, rightIrisLight = irisLight) {
+function face(draw, ink, iris, irisLight, clip, i) {
   const eyesClosed = clip === 'sleep' || (clip === 'idle' && i === 3) ||
     (clip === 'happy' && i >= 1 && i <= 2) || (clip === 'tap.head' && i === 2);
   for (const x of [52, 76]) {
@@ -166,8 +162,8 @@ function face(draw, ink, iris, irisLight, clip, i, rightIris = iris, rightIrisLi
     } else {
       // Oversized almond-like eyes, layered irises and bright anime catchlights.
       draw.ellipse(x, 61, 6.6, 7.0, color.white, ink, 0.9);
-      draw.ellipse(x + 0.25, 61, 4.7, 6.5, outer < 0 ? iris : rightIris, ink, 0.6);
-      draw.ellipse(x + 0.4, 64.1, 3.6, 2.8, outer < 0 ? irisLight : rightIrisLight);
+      draw.ellipse(x + 0.25, 61, 4.7, 6.5, iris, ink, 0.6);
+      draw.ellipse(x + 0.4, 64.1, 3.6, 2.8, irisLight);
       draw.ellipse(x + 0.1, 60.0, 2.6, 3.8, ink);
       draw.line(x - 5.3, 55.2, x + 4.8, 55.2, 1.9, ink);
       draw.line(x + outer * 5, 55.5, x + outer * 7.0, 53.7, 1.6, ink);
@@ -187,60 +183,6 @@ function face(draw, ink, iris, irisLight, clip, i, rightIris = iris, rightIrisLi
     draw.line(61, 70, 64, 72, 1.7, color.mouth);
     draw.line(64, 72, 67, 70, 1.7, color.mouth);
   }
-}
-
-function drawStarSinger(draw, clip, i) {
-  const ink = color.ink;
-  const stride = clip === 'walk' ? [3, -2, -3, 2][i] : 0;
-  // Original fantasy demon heroine: very long rose-pink hair, a dark
-  // tailored jacket and skirt, stockings / boots and human hands.
-  draw.polygon([[30, 43], [39, 25], [53, 18], [75, 17], [91, 27], [99, 44], [97, 69], [105, 91],
-    [111, 111], [103, 119], [94, 113], [91, 117], [86, 98], [75, 108], [50, 106], [42, 97],
-    [36, 118], [29, 113], [20, 119], [16, 112], [23, 90], [31, 69]], color.demonHairShade, ink);
-  draw.polygon([[29, 60], [37, 64], [38, 81], [31, 111], [24, 116], [21, 111], [26, 92]], color.demonHair);
-  draw.polygon([[91, 64], [98, 61], [102, 88], [107, 111], [102, 116], [95, 111], [90, 82]], color.demonHair);
-  draw.line(29, 77, 24, 108, 2, color.demonHairShine);
-  draw.line(98, 76, 104, 108, 2, color.demonHairShine);
-
-  draw.line(51 - stride, 105, 51 - stride, 118 + Math.max(0, -stride), 9, color.demonBlack);
-  draw.line(77 + stride, 105, 77 + stride, 118 + Math.max(0, stride), 9, color.demonBlack);
-  draw.line(49 - stride, 108, 49 - stride, 115 + Math.max(0, -stride), 2, color.hornShine);
-  draw.line(75 + stride, 108, 75 + stride, 115 + Math.max(0, stride), 2, color.hornShine);
-  draw.ellipse(50 - stride, 118 + Math.max(0, -stride), 10, 4.5, color.demonBlack, ink);
-  draw.ellipse(78 + stride, 118 + Math.max(0, stride), 10, 4.5, color.demonBlack, ink);
-  draw.polygon([[46, 96], [82, 96], [90, 112], [38, 112]], color.demonSkirt, ink);
-  draw.line(47, 108, 81, 108, 1.1, color.demonAccent);
-  draw.line(51, 102, 48, 110, 1.2, color.demonBlack);
-  draw.line(77, 102, 80, 110, 1.2, color.demonBlack);
-  draw.polygon([[47, 81], [58, 79], [70, 79], [81, 81], [84, 98], [44, 98]], color.demonBlack, ink);
-  draw.polygon([[53, 81], [64, 87], [75, 81], [69, 96], [59, 96]], color.demonCloth, color.demonAccent, 1.2);
-  draw.line(46, 98, 82, 98, 2.3, color.demonAccent);
-  star(draw, 64, 92, 4.1, color.gold, color.demonBlack);
-  draw.ellipse(38, 96, 6.5, 6.8, color.skin, ink);
-  const lift = clip === 'happy' ? 9 : clip === 'walk' ? stride : 0;
-  draw.ellipse(89, 95 - lift, 6.5, 6.8, color.skin, ink);
-
-  // The horns are curved above the scalp, distinct from animal ears.
-  const leftHorn = [[42, 40], [33, 37], [25, 29], [22, 20], [24, 13], [31, 8], [29, 17], [33, 24], [42, 28], [48, 33]];
-  const rightHorn = leftHorn.map(([x, y]) => [128 - x, y]);
-  draw.polygon(leftHorn, color.horn, ink);
-  draw.polygon(rightHorn, color.horn, ink);
-  draw.line(27, 19, 28, 25, 2, color.hornShine);
-  draw.line(28, 25, 35, 32, 2, color.hornShine);
-  draw.line(101, 19, 100, 25, 2, color.hornShine);
-  draw.line(100, 25, 93, 32, 2, color.hornShine);
-
-  draw.ellipse(64, 59, 36, 32, color.demonHairShade, ink);
-  draw.ellipse(64, 63, 28, 25, color.skin, ink);
-  draw.polygon([[35, 56], [37, 42], [49, 34], [64, 33], [80, 39], [93, 52], [88, 57],
-    [76, 51], [69, 43], [63, 53], [57, 47], [47, 56]], color.demonHair);
-  draw.polygon([[36, 52], [43, 54], [42, 69], [46, 84], [39, 94], [32, 74]], color.demonHair, ink, 0.9);
-  draw.polygon([[88, 52], [92, 54], [94, 72], [91, 94], [82, 86], [87, 70]], color.demonHair, ink, 0.9);
-  draw.line(39, 43, 50, 37, 2.0, color.demonHairShine);
-  draw.line(50, 37, 61, 37.8, 2.0, color.demonHairShine);
-  draw.line(36, 58, 37.8, 74, 1.8, color.demonHairShine);
-  draw.line(89.5, 58, 90.5, 74, 1.8, color.demonHairShine);
-  face(draw, ink, color.azure, color.ice, clip, i, color.rose, color.roseLight);
 }
 
 function drawRanger(draw, clip, i) {
@@ -390,8 +332,7 @@ function renderFrame(characterId, clip, i) {
       clip === 'tap.head' ? [0, 2, 3, 0][i] : [0, -1, -3, -1][i];
   pixels.ellipse(64, 124, clip === 'happy' ? 30 : 37, 2.8, color.shadow);
   const draw = shapeAt(pixels, dx, dy);
-  if (characterId === 'star-singer') drawStarSinger(draw, clip, i);
-  else if (characterId === 'fluffy-ranger') drawRanger(draw, clip, i);
+  if (characterId === 'fluffy-ranger') drawRanger(draw, clip, i);
   else if (characterId === 'nova') drawNova(draw, clip, i);
   else throw new Error(`Unknown character fixture: ${characterId}`);
   // Clearly visible action-specific accents; no text or external font asset.
@@ -528,7 +469,6 @@ if (mode.length > 1 || (mode.length === 1 && mode[0] !== '--check')) {
   throw new Error('Usage: node scripts/generate-demo-packs.mjs [--check]');
 }
 for (const [characterId, name, packVersion] of [
-  ['star-singer', '星咏', '1.0.1'],
   ['fluffy-ranger', '绒绒', '1.0.1'],
   ['nova', '诺瓦', '1.0.0'],
 ]) {
@@ -538,7 +478,10 @@ for (const [characterId, name, packVersion] of [
     if (mode[0] === '--check' || existsSync(path)) {
       // Published-by-version fixtures are immutable. Never overwrite changed
       // content under an existing ID/version during a new character addition.
-      if (!readFileSync(path).equals(bytes)) throw new Error(`Fixture drift: ${characterId}/${relative}`);
+      const existing = readFileSync(path);
+      // The manifest is parsed as JSON. Git may check it out with CRLF on Windows.
+      const same = relative === 'manifest.json' ? existing.toString('utf8').replace(/\r\n/gu, '\n') === bytes.toString('utf8') : existing.equals(bytes);
+      if (!same) throw new Error(`Fixture drift: ${characterId}/${relative}`);
     } else {
       mkdirSync(dirname(path), { recursive: true });
       writeFileSync(path, bytes);

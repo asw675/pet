@@ -1,6 +1,7 @@
 /**
  * Original, SD/anime-heroine engineering CG compositions. The only input art
- * is this repository's own versioned character atlas (1.0.1). The backdrops
+ * is this repository's own versioned character atlas (1.0.1). The retired
+ * Star Singer atlas is read from its original Git commit. The backdrops
  * are procedural; no network, user reference image, third-party illustration,
  * external font, native image library, or executable runtime content.
  *
@@ -9,6 +10,7 @@
  * Existing catalog metadata pins both PNGs. Regeneration will not change
  * those pins or silently publish different bytes under an existing version.
  */
+import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -22,6 +24,7 @@ const CG_ROOT = join(SCRIPT, '../src/renderer/cg-assets/builtin');
 const W = 768;
 const H = 432;
 const SPRITE_VERSION = '1.0.1';
+const ORIGINAL_STAR_SINGER = '8e8125969c125991c619c94bc948389910b659cb:apps/desktop/src/renderer/asset-packs/builtin/star-singer';
 const sha = (bytes) => createHash('sha256').update(bytes).digest('hex');
 const clamp = (x, lo, hi) => Math.max(lo, Math.min(hi, x));
 const mix = (a, b, t) => a + (b - a) * t;
@@ -433,17 +436,19 @@ function decodePinnedPng(png) {
 }
 
 /**
- * Read only the two built-in, exact-version, hash-checked atlas files. New
- * sprite versions are not silently used to regenerate existing CG versions.
+ * Read the exact-version, hash-checked input for each published scene.
  */
 function readHeroine(characterId) {
   const root = join(ART_ROOT, characterId);
-  const manifest = JSON.parse(readFileSync(join(root, 'manifest.json'), 'utf8'));
+  const readOriginal = characterId === 'star-singer'
+    ? (relative) => execFileSync('git', ['show', `${ORIGINAL_STAR_SINGER}/${relative}`], { cwd: SCRIPT, maxBuffer: 512 * 1024, windowsHide: true })
+    : (relative) => readFileSync(join(root, relative));
+  const manifest = JSON.parse(readOriginal('manifest.json').toString('utf8'));
   if (manifest.characterId !== characterId || manifest.packVersion !== SPRITE_VERSION
     || manifest.license.reference !== 'original-poc-fixture') throw new Error('Original 1.0.1 sprite pack required');
   const verified = (relative) => {
     const spec = manifest.files.find((file) => file.path === relative);
-    const bytes = readFileSync(join(root, relative));
+    const bytes = readOriginal(relative);
     if (!spec || spec.bytes !== bytes.length || spec.sha256 !== sha(bytes)) throw new Error('Original asset hash mismatch');
     return bytes;
   };

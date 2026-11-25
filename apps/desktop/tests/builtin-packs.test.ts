@@ -9,7 +9,12 @@ import { builtinPackIds, loadBuiltinPack } from '../src/renderer/asset-packs/bui
 import { resolvePack } from '../src/shared/resolve-character-pack';
 
 const root = fileURLToPath(new URL('../src/renderer/asset-packs/builtin/', import.meta.url));
-const packIds = ['star-singer', 'fluffy-ranger', 'nova'];
+const builtins = [
+  { characterId: 'star-singer', packVersion: '1.1.0', variants: ['static'], logicalSize: { w: 1024, h: 1536 } },
+  { characterId: 'fluffy-ranger', packVersion: '1.0.1', variants: ['sprite', 'static'], logicalSize: { w: 128, h: 128 } },
+  { characterId: 'nova', packVersion: '1.0.0', variants: ['sprite', 'static'], logicalSize: { w: 128, h: 128 } },
+];
+const packIds = builtins.map(({ characterId }) => characterId);
 
 function collectFiles(directory: string, packRoot: string): string[] {
   return readdirSync(directory).flatMap((name) => {
@@ -23,7 +28,7 @@ function collectFiles(directory: string, packRoot: string): string[] {
 }
 
 describe('versioned built-in character fixtures', () => {
-  it.each(packIds)('validates actual on-disk bytes and the entire %s directory', async (characterId) => {
+  it.each(builtins)('validates actual on-disk bytes and the entire $characterId directory', async ({ characterId, packVersion, variants, logicalSize }) => {
     const directory = join(root, characterId);
     const manifest = characterPackManifestSchema.parse(JSON.parse(readFileSync(join(directory, 'manifest.json'), 'utf8')));
     const expected = ['manifest.json', ...manifest.files.map((file) => file.path)].sort();
@@ -36,10 +41,10 @@ describe('versioned built-in character fixtures', () => {
     const resolved = await resolvePack(manifest, {
       paths: () => expected.filter((path) => path !== 'manifest.json'),
       read: async (path) => new Uint8Array(readFileSync(join(directory, path))),
-    }, { characterId, packVersion: characterId === 'nova' ? '1.0.0' : '1.0.1', appVersion: '0.0.0' });
+    }, { characterId, packVersion, appVersion: '0.0.0' });
     expect(resolved.manifest.characterId).toBe(characterId);
-    expect(resolved.variants.some((variant) => variant.renderer === 'sprite')).toBe(true);
-    expect(resolved.variants.some((variant) => variant.renderer === 'static')).toBe(true);
+    expect(resolved.manifest.logicalSize).toEqual(logicalSize);
+    expect(resolved.variants.map((variant) => variant.renderer)).toEqual(variants);
   });
 
   it('exposes only the known versioned built-ins', async () => {

@@ -9,8 +9,8 @@ import type { ActionRequest, RenderProfile } from '../src/renderer/rendering/con
 import type { ModelGeometry, Size } from '../src/renderer/rendering/geometry';
 import { modelToCss, calculateModelGeometry } from '../src/renderer/rendering/geometry';
 
-let star: ResolvedPack, ranger: ResolvedPack, nova: ResolvedPack;
-beforeAll(async () => { [star,ranger,nova] = await Promise.all([loadBuiltinPack('star-singer'),loadBuiltinPack('fluffy-ranger'),loadBuiltinPack('nova')]); });
+let starSinger: ResolvedPack, fluffy: ResolvedPack, nova: ResolvedPack;
+beforeAll(async () => { [starSinger, fluffy, nova] = await Promise.all([loadBuiltinPack('star-singer'), loadBuiltinPack('fluffy-ranger'), loadBuiltinPack('nova')]); });
 afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 const profile:RenderProfile={maxFps:30,resolutionScale:1,reducedMotion:false};
 const signal=()=>new AbortController().signal;
@@ -45,8 +45,8 @@ async function micro(){await Promise.resolve();await Promise.resolve();await Pro
 describe('Pixi adapter over verified atlas and injected runtime',()=>{
   it('plays actual sprite frame rect/duration, pure semantic actions and latest base loop',async()=>{
     const d=decoder(),h=await setup(d.decode);
-    await h.renderer.loadPack(star,signal());
-    expect(h.renderer.activeCharacterId).toBe('star-singer');expect(h.renderer.activeVariant?.renderer).toBe('sprite');
+    await h.renderer.loadPack(fluffy,signal());
+    expect(h.renderer.activeCharacterId).toBe('fluffy-ranger');expect(h.renderer.activeVariant?.renderer).toBe('sprite');
     expect(h.surface.draw.mock.lastCall?.[1].rect).toEqual([0,0,128,128]);
     const draws=h.surface.draw.mock.calls.length;
     h.renderer.tick(.40);expect(h.surface.draw).toHaveBeenCalledTimes(draws);
@@ -63,27 +63,27 @@ describe('Pixi adapter over verified atlas and injected runtime',()=>{
     const actual=bitmap(768,512);const create=vi.fn(async (_blob:Blob,_options:ImageBitmapOptions)=>actual.value);
     vi.stubGlobal('createImageBitmap',create);
     const h=port(), renderer=new PixiRenderer({runtime:h.runtime});
-    await renderer.init(h.canvas,profile);renderer.resize(128,128,1);await renderer.loadPack(star,signal());
+    await renderer.init(h.canvas,profile);renderer.resize(128,128,1);await renderer.loadPack(fluffy,signal());
     expect(create.mock.lastCall?.[0].type).toBe('image/png');
     expect(create.mock.lastCall?.[1]).toEqual({premultiplyAlpha:'premultiply'});
-    expect(new Uint8Array(await create.mock.lastCall![0].arrayBuffer())).toEqual(star.readAsset('assets/atlas.png'));
+    expect(new Uint8Array(await create.mock.lastCall![0].arrayBuffer())).toEqual(fluffy.readAsset('assets/atlas.png'));
     renderer.destroy();expect(actual.close).toHaveBeenCalledTimes(1);
   });
   it('falls back to actual verified static variant when animated decode fails or dimensions differ',async()=>{
     const wrong=bitmap(127,128),d=decoder();let count=0;
     const h=await setup(async (bytes,signal)=>++count===1?wrong.value:d.decode(bytes,signal));
-    await h.renderer.loadPack(star,signal());
+    await h.renderer.loadPack(fluffy,signal());
     expect(wrong.close).toHaveBeenCalledTimes(1);expect(h.renderer.activeVariant?.renderer).toBe('static');
     expect(h.surface.draw.mock.lastCall?.[1].rect).toEqual([0,0,128,128]);
     const unsupported=h.renderer.play(action('walk'));h.renderer.tick(1.1);
     await expect(unsupported).resolves.toEqual({requestId:'walk',status:'unsupported'});h.renderer.destroy();
   });
   it('failed A→B GPU candidate and static upload restore old valid visible frame',async()=>{
-    const d=decoder(),h=await setup(d.decode);await h.renderer.loadPack(star,signal());
+    const d=decoder(),h=await setup(d.decode);await h.renderer.loadPack(fluffy,signal());
     const original=h.resources[0]!;
     h.surface.draw.mockImplementation((resource)=>{if(resource!==original)throw Error('candidate upload rejected');});
-    await expect(h.renderer.loadPack(ranger,signal())).rejects.toThrow('No usable');
-    expect(h.renderer.activeCharacterId).toBe('star-singer');expect(h.surface.draw.mock.lastCall?.[0]).toBe(original);
+    await expect(h.renderer.loadPack(nova,signal())).rejects.toThrow('No usable');
+    expect(h.renderer.activeCharacterId).toBe('fluffy-ranger');expect(h.surface.draw.mock.lastCall?.[0]).toBe(original);
     expect(h.renderer.hasDrawnFrame).toBe(true);expect(h.onHealth).not.toHaveBeenCalled();
     expect(original.destroy).not.toHaveBeenCalled();expect(h.resources.slice(1).every(item=>item.destroy.mock.calls.length===1)).toBe(true);
     h.renderer.destroy();expect(original.destroy).toHaveBeenCalledTimes(1);
@@ -92,43 +92,43 @@ describe('Pixi adapter over verified atlas and injected runtime',()=>{
   it('an aborted decode rejects promptly; late bitmap never paints and closes',async()=>{
     const d=decoder(),late=deferred<ImageBitmap>(),delay=bitmap(768,512);let count=0;
     const h=await setup(async (bytes,signal)=>++count===2?late.promise:d.decode(bytes,signal));
-    await h.renderer.loadPack(star,signal());const c=new AbortController();const pending=h.renderer.loadPack(ranger,c.signal);
+    await h.renderer.loadPack(fluffy,signal());const c=new AbortController();const pending=h.renderer.loadPack(nova,c.signal);
     const rejection=expect(pending).rejects.toMatchObject({name:'AbortError'});
     await micro();c.abort();await rejection;late.resolve(delay.value);await micro();
-    expect(delay.close).toHaveBeenCalledTimes(1);expect(h.renderer.activeCharacterId).toBe('star-singer');expect(h.resources).toHaveLength(1);
+    expect(delay.close).toHaveBeenCalledTimes(1);expect(h.renderer.activeCharacterId).toBe('fluffy-ranger');expect(h.resources).toHaveLength(1);
     h.renderer.destroy();
   });
   it('A→B→C supersession never lets delayed B touch C or close its resource',async()=>{
     const d=decoder(),late=deferred<ImageBitmap>(),delayed=bitmap(768,512);let count=0;
     const h=await setup(async(bytes,s)=>++count===2?late.promise:d.decode(bytes,s));
-    await h.renderer.loadPack(star,signal());const oldAction=h.renderer.play(action('happy'));
-    const b=h.renderer.loadPack(ranger,signal()),rejected=expect(b).rejects.toMatchObject({name:'AbortError'});await micro();
-    await h.renderer.loadPack(nova,signal());await rejected;late.resolve(delayed.value);await micro();
-    expect(h.renderer.activeCharacterId).toBe('nova');expect(delayed.close).toHaveBeenCalledTimes(1);
+    await h.renderer.loadPack(fluffy,signal());const oldAction=h.renderer.play(action('happy'));
+    const b=h.renderer.loadPack(nova,signal()),rejected=expect(b).rejects.toMatchObject({name:'AbortError'});await micro();
+    await h.renderer.loadPack(starSinger,signal());await rejected;late.resolve(delayed.value);await micro();
+    expect(h.renderer.activeCharacterId).toBe('star-singer');expect(delayed.close).toHaveBeenCalledTimes(1);
     expect(h.surface.draw.mock.lastCall?.[0]).toBe(h.resources[1]);expect(h.resources[1]!.destroy).not.toHaveBeenCalled();
     await expect(oldAction).resolves.toEqual({requestId:'happy',status:'interrupted'});h.renderer.destroy();
   });
   it('abort during synchronous candidate draw restores prior resource before returning',async()=>{
-    const d=decoder(),h=await setup(d.decode);await h.renderer.loadPack(star,signal());const controller=new AbortController();
+    const d=decoder(),h=await setup(d.decode);await h.renderer.loadPack(fluffy,signal());const controller=new AbortController();
     const old=h.resources[0]!;
     h.surface.draw.mockImplementation(resource=>{if(resource!==old)controller.abort();});
-    await expect(h.renderer.loadPack(ranger,controller.signal)).rejects.toMatchObject({name:'AbortError'});
+    await expect(h.renderer.loadPack(nova,controller.signal)).rejects.toMatchObject({name:'AbortError'});
     expect(h.surface.draw.mock.lastCall?.[0]).toBe(old);expect(h.renderer.hasDrawnFrame).toBe(true);h.renderer.destroy();
   });
   it('DPR and resolutionScale affect physical buffer only; mirrored anchor hit test stays CSS-local',async()=>{
-    const d=decoder(),h=await setup(d.decode);await h.renderer.loadPack(star,signal());
+    const d=decoder(),h=await setup(d.decode);await h.renderer.loadPack(fluffy,signal());
     h.renderer.resize(301,237,1.5);h.renderer.setQuality({maxFps:15,resolutionScale:.75,reducedMotion:false});
     expect(h.surface.resize.mock.lastCall?.[0]).toEqual({w:339,h:267});
     const pose={x:4,y:-7,scale:1.1,facing:-1 as const};h.renderer.setPose(pose);
-    const g=calculateModelGeometry({w:301,h:237},star.manifest.logicalSize,star.manifest.anchor,pose)!;
-    const head=star.manifest.hitRegions.find(item=>item.id==='head')!;
+    const g=calculateModelGeometry({w:301,h:237},fluffy.manifest.logicalSize,fluffy.manifest.anchor,pose)!;
+    const head=fluffy.manifest.hitRegions.find(item=>item.id==='head')!;
     const pt=modelToCss(g,{x:(head.rect[0]+head.rect[2]/2)*g.logicalSize.w,y:(head.rect[1]+head.rect[3]/2)*g.logicalSize.h});
     expect(h.surface.draw.mock.lastCall?.[2]).toEqual(g);expect(h.renderer.hitTest(pt.x,pt.y)).toEqual({id:'head'});
     h.renderer.resize(10000,10000,4);expect(h.renderer.hitTest(pt.x,pt.y)).toBeNull();expect(h.surface.resize.mock.lastCall?.[0]).toEqual({w:1,h:1});
     h.renderer.destroy();
   });
   it('paused ticks stop changes; reduced motion displays first clip frame but one-shot settles',async()=>{
-    const d=decoder(),h=await setup(d.decode);await h.renderer.loadPack(star,signal());h.renderer.setPaused(true);
+    const d=decoder(),h=await setup(d.decode);await h.renderer.loadPack(fluffy,signal());h.renderer.setPaused(true);
     const draws=h.surface.draw.mock.calls.length;h.renderer.tick(1);expect(h.surface.draw).toHaveBeenCalledTimes(draws);
     h.renderer.setPaused(false);h.renderer.setQuality({maxFps:15,resolutionScale:1,reducedMotion:true});
     const play=h.renderer.play(action('happy'));const first=h.surface.draw.mock.lastCall?.[1];h.renderer.tick(.2);
@@ -136,7 +136,7 @@ describe('Pixi adapter over verified atlas and injected runtime',()=>{
     h.renderer.destroy();
   });
   it('authored actual mouth sample patch only within verified pack; stale/cancelled generation cannot reopen',async()=>{
-    const d=decoder(),h=await setup(d.decode);await h.renderer.loadPack(star,signal());
+    const d=decoder(),h=await setup(d.decode);await h.renderer.loadPack(fluffy,signal());
     h.renderer.setBaseAction('talk');expect(h.surface.draw.mock.lastCall?.[1].mouth?.level).toBe(0);
     h.renderer.setMouth({generation:3,atMs:10,open:.95});expect(h.surface.draw.mock.lastCall?.[1].mouth?.level).toBeGreaterThan(0);
     h.renderer.clearMouth();expect(h.surface.draw.mock.lastCall?.[1].mouth?.level).toBe(0);
@@ -145,19 +145,19 @@ describe('Pixi adapter over verified atlas and injected runtime',()=>{
     h.renderer.setPaused(true);expect(h.surface.draw.mock.lastCall?.[1].mouth?.level).toBe(0);h.renderer.destroy();
   });
   it('context loss releases current resource/action, fails closed hit testing, and requires explicit verified reload on restore',async()=>{
-    const d=decoder(),h=await setup(d.decode);await h.renderer.loadPack(star,signal());
+    const d=decoder(),h=await setup(d.decode);await h.renderer.loadPack(fluffy,signal());
     const play=h.renderer.play(action('happy'));h.notify('context-lost');h.notify('context-lost');
     expect(h.onHealth).toHaveBeenCalledTimes(1);expect(h.onHealth).toHaveBeenCalledWith('context-lost');
     expect(h.renderer.activeCharacterId).toBeNull();expect(h.renderer.hitTest(64,64)).toBeNull();
     await expect(play).resolves.toMatchObject({status:'interrupted'});
     expect(h.resources[0]!.destroy).toHaveBeenCalledTimes(1);expect(d.images[0]!.close).toHaveBeenCalledTimes(1);
-    await expect(h.renderer.loadPack(star,signal())).rejects.toThrow('unavailable');
+    await expect(h.renderer.loadPack(fluffy,signal())).rejects.toThrow('unavailable');
     h.notify('context-restored');expect(h.onHealth).toHaveBeenLastCalledWith('context-restored');expect(h.renderer.hasDrawnFrame).toBe(false);
-    await h.renderer.loadPack(star,signal());expect(h.renderer.hasDrawnFrame).toBe(true);
+    await h.renderer.loadPack(fluffy,signal());expect(h.renderer.hasDrawnFrame).toBe(true);
     expect(h.resources).toHaveLength(2);h.renderer.destroy();expect(h.surface.destroy).toHaveBeenCalledTimes(1);
   });
   it('reports render fault once, blocks interaction, then can recover actual draw without stale hit area',async()=>{
-    const d=decoder(),h=await setup(d.decode);await h.renderer.loadPack(star,signal());
+    const d=decoder(),h=await setup(d.decode);await h.renderer.loadPack(fluffy,signal());
     h.surface.draw.mockImplementation(()=>{throw Error('GPU fault');});
     h.renderer.setPose({x:1,y:0,scale:1,facing:1});h.renderer.tick(.5);
     expect(h.onHealth.mock.calls).toEqual([['render-error']]);expect(h.renderer.hasDrawnFrame).toBe(false);
@@ -205,7 +205,7 @@ describe('adaptive desktop render host', () => {
   it('commits the fallback if WebGL init fails and blocks old-identity input while switching pets', async () => {
     const { host, surfaces, onState } = hostFixture(true);
     try {
-      await host.loadPack(star, signal());
+      await host.loadPack(starSinger, signal());
       expect(host.backend).toBe('canvas2d');
       expect(surfaces[0]?.destroy).toHaveBeenCalledOnce();
       expect(onState).toHaveBeenLastCalledWith({ characterId: 'star-singer', stage: 'ready', backend: 'canvas2d', hasFrame: true });
@@ -221,7 +221,7 @@ describe('adaptive desktop render host', () => {
   it('treats WebGL loss as non-interactive until a fallback draws, then restores the same pet', async () => {
     const { host, gpu } = hostFixture();
     try {
-      await host.loadPack(star, signal());
+      await host.loadPack(starSinger, signal());
       expect(host.backend).toBe('pixi-webgl');
       gpu.notify('context-lost');
       expect(host.interactive).toBe(false);

@@ -26,6 +26,7 @@
 | 004F | Pixi WebGL 与 Canvas2D 降级接入桌宠窗口 | 专项测试与生产构建通过，Windows GPU 待验收 | [004f-pixi-desktop](004f-pixi-desktop.md) |
 | 004G | 本地角色资源包导入、版本切换与星咏新立绘预览 | 文件、权限和版本回退测试通过，Windows 图形验收待测 | [004g-character-pack-management](004g-character-pack-management.md) |
 | 004H | Cubism 本地预览适配、导出资源打包和星咏表情分层 | 软件接入及降级专项通过，真实模型导出和渲染待验 | [004h-cubism-local-preview](004h-cubism-local-preview.md) |
+| 004I | 更换星咏默认外观并移除旧版桌宠素材 | Windows 隔离运行通过首页显示、旧选项回退及桌宠首帧 | [004i-star-singer-default](004i-star-singer-default.md) |
 | 004-Q | V1.1 功能及代码规模复核 | 产品覆盖约34.0% | [004-progress-audit](004-progress-audit.md) |
 | 005 | Windows 安装包与真机 P0 验收 | 按用户要求推迟至约90%开发覆盖 | — |
 | 006A-1 | 角色模板与获得规则、诺瓦内置资源 | 代码与专项测试通过 | [006a1-character-catalog](006a1-character-catalog.md) |

@@ -6,10 +6,10 @@ import type { ActionRequest, RenderProfile } from '../src/renderer/rendering/con
 import { calculateModelGeometry, modelToCss } from '../src/renderer/rendering/geometry';
 
 const profile: RenderProfile = { maxFps: 30, resolutionScale: 1, reducedMotion: false };
-let star: ResolvedPack;
-let ranger: ResolvedPack;
+let fluffy: ResolvedPack;
+let nova: ResolvedPack;
 beforeAll(async () => {
-  [star, ranger] = await Promise.all([loadBuiltinPack('star-singer'), loadBuiltinPack('fluffy-ranger')]);
+  [fluffy, nova] = await Promise.all([loadBuiltinPack('fluffy-ranger'), loadBuiltinPack('nova')]);
 });
 
 function mockBitmap(w: number, h: number) {
@@ -68,7 +68,7 @@ describe('Canvas2D verified sprite fallback adapter', () => {
   it('draws actual verified mouth patches from the audio sample levels, preserving body frame and clearing old generations immediately', async () => {
     const { decode, images } = decoder();
     const { renderer, context } = await setup(decode);
-    await renderer.loadPack(star, signal());
+    await renderer.loadPack(fluffy, signal());
     renderer.setMouth({ generation: 2, atMs: 34, open: .9 });
     expect(context.drawImage.mock.calls.at(-2)).toEqual([images[0]!.value, 0, 0, 128, 128, 0, 0, 128, 128]);
     // Talk frame 2 is the highest authored ellipse, at cell (0,384), dy=-3.
@@ -96,10 +96,10 @@ describe('Canvas2D verified sprite fallback adapter', () => {
   it('reduced motion and pack replacement cannot leave an open speech patch on a new character', async () => {
     const { decode, images } = decoder();
     const { renderer, context } = await setup(decode);
-    await renderer.loadPack(star, signal()); renderer.setMouth({ generation: 2, atMs: 30, open: .9 });
+    await renderer.loadPack(fluffy, signal()); renderer.setMouth({ generation: 2, atMs: 30, open: .9 });
     renderer.setQuality({ ...profile, reducedMotion: true }); expect(context.drawImage.mock.lastCall?.[3]).toBe(128);
     renderer.setQuality(profile); renderer.setMouth({ generation: 2, atMs: 60, open: .9 }); expect(context.drawImage.mock.lastCall?.[3]).toBe(128);
-    renderer.setMouth({ generation: 3, atMs: 30, open: .9 }); await renderer.loadPack(ranger, signal());
+    renderer.setMouth({ generation: 3, atMs: 30, open: .9 }); await renderer.loadPack(nova, signal());
     expect(context.drawImage).toHaveBeenLastCalledWith(images[1]!.value, 0, 0, 128, 128, 0, 0, 128, 128);
     renderer.setMouth({ generation: 3, atMs: 60, open: .9 }); expect(context.drawImage.mock.lastCall?.[3]).toBe(128);
     renderer.destroy();
@@ -107,8 +107,8 @@ describe('Canvas2D verified sprite fallback adapter', () => {
   it('decodes the built-in atlas and actually draws changing source rects with frame durations', async () => {
     const { decode, images } = decoder();
     const { renderer, context } = await setup(decode);
-    await renderer.loadPack(star, signal());
-    expect(renderer.activeCharacterId).toBe('star-singer');
+    await renderer.loadPack(fluffy, signal());
+    expect(renderer.activeCharacterId).toBe('fluffy-ranger');
     expect(renderer.activeVariant?.renderer).toBe('sprite');
     expect(context.drawImage).toHaveBeenLastCalledWith(images[0]!.value, 0, 0, 128, 128, 0, 0, 128, 128);
     const draws = context.drawImage.mock.calls.length;
@@ -138,7 +138,7 @@ describe('Canvas2D verified sprite fallback adapter', () => {
     const image = mockBitmap(768, 512);
     const create = vi.fn(async (blob: Blob) => {
       expect(blob.type).toBe('image/png');
-      expect(new Uint8Array(await blob.arrayBuffer())).toEqual(star.readAsset('assets/atlas.png'));
+      expect(new Uint8Array(await blob.arrayBuffer())).toEqual(fluffy.readAsset('assets/atlas.png'));
       return image.value;
     });
     vi.stubGlobal('createImageBitmap', create);
@@ -147,7 +147,7 @@ describe('Canvas2D verified sprite fallback adapter', () => {
       const renderer = new CanvasRenderer();
       await renderer.init(canvas, profile);
       renderer.resize(128, 128, 1);
-      await renderer.loadPack(star, signal());
+      await renderer.loadPack(fluffy, signal());
       expect(create).toHaveBeenCalledTimes(1);
       expect(context.drawImage).toHaveBeenCalledTimes(1);
       renderer.destroy();
@@ -164,7 +164,7 @@ describe('Canvas2D verified sprite fallback adapter', () => {
       .mockResolvedValueOnce(invalid.value)
       .mockResolvedValueOnce(still.value);
     const { renderer, context } = await setup(decode);
-    await renderer.loadPack(star, signal());
+    await renderer.loadPack(fluffy, signal());
     expect(invalid.close).toHaveBeenCalledTimes(1);
     expect(renderer.activeVariant?.renderer).toBe('static');
     expect(context.drawImage).toHaveBeenLastCalledWith(still.value, 0, 0, 128, 128, 0, 0, 128, 128);
@@ -194,7 +194,7 @@ describe('Canvas2D verified sprite fallback adapter', () => {
       const { canvas, context } = mockSurface();
       await renderer.init(canvas, profile);
       renderer.resize(128, 128, 1);
-      const pending = renderer.loadPack(star, signal());
+      const pending = renderer.loadPack(fluffy, signal());
       await started.promise;
       await vi.advanceTimersByTimeAsync(10);
       await pending;
@@ -217,13 +217,13 @@ describe('Canvas2D verified sprite fallback adapter', () => {
       .mockResolvedValueOnce(first.value)
       .mockRejectedValue(new Error('broken image'));
     const { renderer, context } = await setup(decode);
-    await renderer.loadPack(star, signal());
+    await renderer.loadPack(fluffy, signal());
     const action = renderer.play(request('happy'));
     const oldDraws = context.drawImage.mock.calls.length;
-    await expect(renderer.loadPack(ranger, signal())).rejects.toThrow('No usable Canvas2D character variant');
+    await expect(renderer.loadPack(nova, signal())).rejects.toThrow('No usable Canvas2D character variant');
     expect(decode).toHaveBeenCalledTimes(3); // A sprite, B sprite, B static
     expect(context.drawImage).toHaveBeenCalledTimes(oldDraws);
-    expect(renderer.activeCharacterId).toBe('star-singer');
+    expect(renderer.activeCharacterId).toBe('fluffy-ranger');
     expect(first.close).not.toHaveBeenCalled();
     expect(renderer.hitTest(64, 64)).toEqual({ id: 'head' });
     renderer.tick(1);
@@ -240,12 +240,12 @@ describe('Canvas2D verified sprite fallback adapter', () => {
       .mockResolvedValueOnce(candidate.value)
       .mockResolvedValueOnce(still.value);
     const { renderer, context } = await setup(decode);
-    await renderer.loadPack(star, signal());
+    await renderer.loadPack(fluffy, signal());
     context.drawImage.mockImplementation((image: ImageBitmap) => {
       if (image !== first.value) throw new Error('draw failed');
     });
-    await expect(renderer.loadPack(ranger, signal())).rejects.toThrow();
-    expect(renderer.activeCharacterId).toBe('star-singer');
+    await expect(renderer.loadPack(nova, signal())).rejects.toThrow();
+    expect(renderer.activeCharacterId).toBe('fluffy-ranger');
     expect(context.drawImage.mock.lastCall?.[0]).toBe(first.value);
     expect(first.close).not.toHaveBeenCalled();
     expect(candidate.close).toHaveBeenCalledTimes(1);
@@ -260,7 +260,7 @@ describe('Canvas2D verified sprite fallback adapter', () => {
       .mockResolvedValueOnce(sprite.value).mockResolvedValueOnce(still.value);
     const { renderer, context } = await setup(decode);
     context.drawImage.mockImplementation(() => { throw new Error('draw failed'); });
-    await expect(renderer.loadPack(star, signal())).rejects.toThrow();
+    await expect(renderer.loadPack(fluffy, signal())).rejects.toThrow();
     expect(renderer.activeCharacterId).toBeNull();
     expect(renderer.hitTest(64, 64)).toBeNull();
     expect(context.clearRect).toHaveBeenLastCalledWith(0, 0, 128, 128);
@@ -280,17 +280,17 @@ describe('Canvas2D verified sprite fallback adapter', () => {
       .mockImplementationOnce(() => { started.resolve(); return b.promise; })
       .mockResolvedValueOnce(latest.value);
     const { renderer, context } = await setup(decode);
-    await renderer.loadPack(star, signal());
+    await renderer.loadPack(fluffy, signal());
     const oldAction = renderer.play(request('happy'));
-    const pending = renderer.loadPack(ranger, signal());
+    const pending = renderer.loadPack(nova, signal());
     const cancelled = expect(pending).rejects.toMatchObject({ name: 'AbortError' });
     await started.promise;
-    expect(renderer.activeCharacterId).toBe('star-singer');
+    expect(renderer.activeCharacterId).toBe('fluffy-ranger');
     expect(first.close).not.toHaveBeenCalled();
 
-    await renderer.loadPack(star, signal());
+    await renderer.loadPack(fluffy, signal());
     await cancelled;
-    expect(renderer.activeCharacterId).toBe('star-singer');
+    expect(renderer.activeCharacterId).toBe('fluffy-ranger');
     expect(context.drawImage.mock.lastCall?.[0]).toBe(latest.value);
     expect(first.close).toHaveBeenCalledTimes(1);
     await expect(oldAction).resolves.toMatchObject({ status: 'interrupted' });
@@ -311,15 +311,15 @@ describe('Canvas2D verified sprite fallback adapter', () => {
       .mockResolvedValueOnce(first.value)
       .mockImplementationOnce(() => { started.resolve(); return b.promise; });
     const { renderer, context } = await setup(decode);
-    await renderer.loadPack(star, signal());
+    await renderer.loadPack(fluffy, signal());
     const before = context.drawImage.mock.calls.length;
     const controller = new AbortController();
-    const pending = renderer.loadPack(ranger, controller.signal);
+    const pending = renderer.loadPack(nova, controller.signal);
     const cancelled = expect(pending).rejects.toMatchObject({ name: 'AbortError' });
     await started.promise;
     controller.abort();
     await cancelled;
-    expect(renderer.activeCharacterId).toBe('star-singer');
+    expect(renderer.activeCharacterId).toBe('fluffy-ranger');
     expect(context.drawImage).toHaveBeenCalledTimes(before);
     expect(first.close).not.toHaveBeenCalled();
     b.resolve(late.value);
@@ -336,9 +336,9 @@ describe('Canvas2D verified sprite fallback adapter', () => {
       .mockResolvedValueOnce(first.value)
       .mockImplementationOnce(() => { started.resolve(); return b.promise; });
     const { renderer, context, canvas } = await setup(decode);
-    await renderer.loadPack(star, signal());
+    await renderer.loadPack(fluffy, signal());
     const action = renderer.play(request('happy'));
-    const pending = renderer.loadPack(ranger, signal());
+    const pending = renderer.loadPack(nova, signal());
     const cancelled = expect(pending).rejects.toMatchObject({ name: 'AbortError' });
     await started.promise;
     const before = context.drawImage.mock.calls.length;
@@ -354,13 +354,13 @@ describe('Canvas2D verified sprite fallback adapter', () => {
     b.resolve(late.value);
     await vi.waitFor(() => expect(late.close).toHaveBeenCalledTimes(1));
     expect(context.drawImage).toHaveBeenCalledTimes(before);
-    await expect(renderer.loadPack(star, signal())).rejects.toThrow();
+    await expect(renderer.loadPack(fluffy, signal())).rejects.toThrow();
   });
 
   it('renders and hit-tests with the same CSS geometry across DPR and quality changes', async () => {
     const { decode } = decoder();
     const { renderer, context, canvas } = await setup(decode, { w: 240, h: 120 });
-    await renderer.loadPack(star, signal());
+    await renderer.loadPack(fluffy, signal());
     renderer.resize(240, 120, 1.5);
     expect(canvas.width).toBe(360);
     expect(canvas.height).toBe(180);
@@ -375,7 +375,7 @@ describe('Canvas2D verified sprite fallback adapter', () => {
 
     const pose = { x: 20, y: -10, scale: 0.5, facing: -1 as const };
     renderer.setPose(pose);
-    const geometry = calculateModelGeometry({ w: 240, h: 120 }, star.manifest.logicalSize, star.manifest.anchor, pose)!;
+    const geometry = calculateModelGeometry({ w: 240, h: 120 }, fluffy.manifest.logicalSize, fluffy.manifest.anchor, pose)!;
     const point = modelToCss(geometry, { x: 50, y: 60 });
     expect(renderer.hitTest(point.x, point.y)).toEqual({ id: 'head' });
     expect(context.setTransform.mock.calls.at(-2)?.[0]).toBeLessThan(0);
@@ -394,7 +394,7 @@ describe('Canvas2D verified sprite fallback adapter', () => {
   it('pauses time, supports reduced motion, and settles a reduced-motion one shot', async () => {
     const { decode } = decoder();
     const { renderer, context } = await setup(decode);
-    await renderer.loadPack(star, signal());
+    await renderer.loadPack(fluffy, signal());
     renderer.setPaused(true);
     const before = context.drawImage.mock.calls.length;
     renderer.tick(10);

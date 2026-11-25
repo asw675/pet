@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import starSingerPortrait from '../asset-packs/builtin/star-singer/assets/portrait.png?url';
+
 withDefaults(defineProps<{
   characterId: string;
   sleeping?: boolean;
@@ -8,45 +10,11 @@ withDefaults(defineProps<{
 </script>
 
 <template>
-  <!-- Original anime heroine placeholders, independent of game state and model SDK. -->
+  <!-- Decorative character previews independent of the model runtime. -->
   <svg class="portrait" :class="{ paused, sleeping, away }" viewBox="0 0 180 184" fill="none" aria-hidden="true">
     <ellipse cx="90" cy="169" rx="61" ry="9" fill="#271d32" opacity=".26" />
-    <g v-if="characterId === 'star-singer'" class="breathe" stroke-linecap="round" stroke-linejoin="round">
-      <!-- Long pink hair and two curved fantasy horns, not animal ears. -->
-      <path d="M39 79C37 45 61 27 90 27s53 19 52 54c-1 27 13 54 17 80l-11 11-13-7-10 6-7-23-17 13H78l-17-13-8 23-10-6-14 7-10-11c4-25 20-55 20-82Z" fill="#ad507d" stroke="#433451" stroke-width="3" />
-      <path d="M42 79q-1 40-15 83l12 6q19-24 20-63l-17-26Zm98 0q1 40 15 83l-12 6q-19-24-20-63l17-26Z" fill="#e47d98" />
-      <path d="M37 110q-5 27-11 43m117-43q5 27 11 43" stroke="#ffb2c8" stroke-width="3.2" />
-      <path d="M59 58C43 56 30 45 28 31c-2-11 2-20 14-25-5 12-4 21 3 28l17 12Z" fill="#3d304d" stroke="#433451" stroke-width="3" />
-      <path d="M121 58c16-2 29-13 31-27 2-11-2-20-14-25 5 12 4 21-3 28l-17 12Z" fill="#3d304d" stroke="#433451" stroke-width="3" />
-      <path d="M34 24q-1 14 16 24m96-24q1 14-16 24" stroke="#876a96" stroke-width="3" />
-      <!-- Dark purple tailored skirt, long stockings and boots. -->
-      <path d="M67 151v15c-7 0-11 4-9 7h25l3-19m10 0 2 19h25c2-3-3-7-10-7v-15" fill="#30263f" stroke="#433451" stroke-width="3" />
-      <path d="M72 155v11m36-11v11" stroke="#8b759d" stroke-width="2.5" />
-      <path d="M65 135h50l13 25H52l13-25Z" fill="#726082" stroke="#433451" stroke-width="3" />
-      <path d="M75 142l-9 14m40-14 9 14m-55 1h60" stroke="#473752" stroke-width="2.2" />
-      <path d="M64 119h18l8 12 8-12h18l5 23H59l5-23Z" fill="#30263f" stroke="#433451" stroke-width="3" />
-      <path d="m78 120 12 11 12-11-5 20H83l-5-20Z" fill="#69527d" stroke="#b67ab1" stroke-width="2" />
-      <path d="M61 140h58" stroke="#b67ab1" stroke-width="3" />
-      <path d="m90 128 2 5 6 1-4 4 1 6-5-3-5 3 1-6-4-4 6-1 2-5Z" fill="#ffe29a" />
-      <path d="M60 129q-14-4-18 8l7 7 11-5m60-10q14-4 18 8l-7 7-11-5" fill="#ffe5cf" stroke="#433451" stroke-width="2.5" />
-      <!-- Human face, swept bangs and feminine eye styling. -->
-      <ellipse cx="90" cy="95" rx="39" ry="34" fill="#ffe5cf" stroke="#403051" stroke-width="2.5" />
-      <path d="M48 83c0-35 18-48 46-48 25 0 42 22 42 47-16-7-27-13-32-25-4 12-10 16-13 23l-9-12C73 77 60 84 48 83Z" fill="#e17a98" stroke="#433451" stroke-width="2.5" />
-      <path d="M51 78q-10 27 2 54l9-6q-7-20 0-38m67-10q10 27-2 54l-9-6q7-20 0-38" fill="#e47d98" stroke="#433451" stroke-width="2.5" />
-      <path d="M57 61q10-9 24-11m-28 40q-2 16 3 29m72-29q2 16-3 29" stroke="#ffb2c8" stroke-width="3" />
-      <g v-if="sleeping" stroke="#493451" stroke-width="3"><path d="M67 95q6 7 12 0m22 0q6 7 12 0" /></g>
-      <g v-else class="eyes" stroke="#493451" stroke-width="1.5">
-        <ellipse cx="74" cy="96" rx="9" ry="10.4" fill="#fff9ee" /><ellipse cx="107" cy="96" rx="9" ry="10.4" fill="#fff9ee" />
-        <ellipse cx="74" cy="96" rx="6.4" ry="9.1" fill="#638ec8" /><ellipse cx="107" cy="96" rx="6.4" ry="9.1" fill="#d779a7" />
-        <ellipse cx="74.5" cy="100.5" rx="4.7" ry="3.2" fill="#b4ddf7" stroke="none" /><ellipse cx="107.5" cy="100.5" rx="4.7" ry="3.2" fill="#ffc3dc" stroke="none" />
-        <ellipse cx="74" cy="95" rx="3.5" ry="5.3" fill="#433451" /><ellipse cx="107" cy="95" rx="3.5" ry="5.3" fill="#433451" />
-        <path d="M65 91l-3-3m53 3 3-3M67 87q7-4 14 0m19 0q7-4 14 0" fill="none" stroke-width="2.5" />
-        <circle cx="71.5" cy="92" r="2.5" fill="#fff9ee" stroke="none" /><circle cx="104.5" cy="92" r="2.5" fill="#fff9ee" stroke="none" />
-        <circle cx="77.1" cy="100.3" r="1.2" fill="#fff9ee" stroke="none" /><circle cx="110.1" cy="100.3" r="1.2" fill="#fff9ee" stroke="none" />
-      </g>
-      <ellipse cx="63" cy="106" rx="6" ry="3" fill="#f3a8ad" opacity=".7" /><ellipse cx="118" cy="106" rx="6" ry="3" fill="#f3a8ad" opacity=".7" />
-      <path d="M86 106q4.5 4 9 0" stroke="#8f5260" stroke-width="2" />
-    </g>
+    <image v-if="characterId === 'star-singer'" class="breathe" :href="starSingerPortrait"
+      x="16" y="0" width="148" height="168" preserveAspectRatio="xMidYMax meet" />
     <g v-else-if="characterId === 'fluffy-ranger'" class="breathe" stroke-linecap="round" stroke-linejoin="round">
       <!-- Auburn-haired human woodland adventurer. -->
       <path d="M39 77C38 34 59 25 90 25s53 19 52 52c-1 31 10 53 12 78l-10 9-13-6-7 6-6-25-17 14H79l-17-14-6 25-7-6-13 6-10-9c2-25 13-47 12-78Z" fill="#844537" stroke="#614334" stroke-width="3" />

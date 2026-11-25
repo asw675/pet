@@ -11,7 +11,6 @@ import { PackResolveError, resolvePack, type ResolvedPack } from '../shared/reso
 const manifestName = 'manifest.json';
 const selectionName = 'active.json';
 const manifestLimit = 256 * 1024;
-const starSingerPreview = Object.freeze({ characterId: 'star-singer', packVersion: '1.1.0' } satisfies CharacterPackChanged);
 
 export class CharacterPackStoreError extends Error {
   constructor(readonly code: CharacterPackFailure) {
@@ -131,7 +130,7 @@ async function writeNewFile(path: string, data: Uint8Array | string): Promise<vo
 }
 
 export class InstalledCharacterPacks {
-  constructor(private readonly userData: string, private readonly appVersion: string, private readonly bundledPacks?: string) {}
+  constructor(private readonly userData: string, private readonly appVersion: string) {}
 
   private async characterDirectory(characterId: BuiltinCharacterId, create = false): Promise<string | undefined> {
     const parent = await realpath(this.userData);
@@ -156,20 +155,10 @@ export class InstalledCharacterPacks {
   private async versions(directory: string | undefined, characterId: BuiltinCharacterId): Promise<string[]> {
     const builtIn = builtinPackVersion(characterId)!;
     const entries = directory ? await readdir(directory, { withFileTypes: true }) : [];
-    const versions = new Set(entries.filter(entry => entry.isDirectory() && !entry.isSymbolicLink()
+    return entries.filter(entry => entry.isDirectory() && !entry.isSymbolicLink()
       && packVersionSchema.safeParse(entry.name).success && comparePackVersions(entry.name, builtIn) > 0)
-      .map(entry => entry.name));
-    if (characterId === starSingerPreview.characterId && await this.bundledPath(starSingerPreview)) versions.add(starSingerPreview.packVersion);
-    return [...versions].sort((a, b) => comparePackVersions(b, a));
-  }
-
-  private async bundledPath(change: CharacterPackChanged): Promise<string | undefined> {
-    if (!this.bundledPacks || change.characterId !== starSingerPreview.characterId || change.packVersion !== starSingerPreview.packVersion) {
-      return undefined;
-    }
-    const path = join(this.bundledPacks, `${change.characterId}-${change.packVersion}`);
-    const stat = await statIfPresent(path);
-    return stat?.isDirectory() && !stat.isSymbolicLink() ? path : undefined;
+      .map(entry => entry.name)
+      .sort((a, b) => comparePackVersions(b, a));
   }
 
   async list(): Promise<CharacterPackRow[]> {
@@ -195,9 +184,8 @@ export class InstalledCharacterPacks {
     const change = { characterId, packVersion };
     const directory = (await this.characterDirectory(characterId, true))!;
     const destination = join(directory, packVersion);
-    const existingPath = await this.bundledPath(change) ?? (await statIfPresent(destination) ? destination : undefined);
-    if (existingPath) {
-      const existing = await verifyPack(existingPath, this.appVersion, change);
+    if (await statIfPresent(destination)) {
+      const existing = await verifyPack(destination, this.appVersion, change);
       if (JSON.stringify(existing.manifest) !== JSON.stringify(pack.manifest)) throw new CharacterPackStoreError('VERSION_CONFLICT');
       return this.select(directory, change);
     }
@@ -227,12 +215,13 @@ export class InstalledCharacterPacks {
 
   async activate(input: CharacterPackChanged): Promise<CharacterPackChanged> {
     const change = characterPackChangedSchema.parse(input);
-    const builtIn = builtinPackVersion(change.characterId);
-    const bundled = await this.bundledPath(change);
-    const directory = await this.characterDirectory(change.characterId, change.packVersion === builtIn || bundled !== undefined);
+    const builtIn = builtinPackVersion(change.characterId)!;
+    const comparison = comparePackVersions(change.packVersion, builtIn);
+    if (comparison < 0) throw new CharacterPackStoreError('NOT_FOUND');
+    const directory = await this.characterDirectory(change.characterId, comparison === 0);
     if (!directory) throw new CharacterPackStoreError('NOT_FOUND');
-    if (change.packVersion !== builtIn) {
-      const candidate = bundled ?? join(directory, change.packVersion);
+    if (comparison > 0) {
+      const candidate = join(directory, change.packVersion);
       if (!await statIfPresent(candidate)) throw new CharacterPackStoreError('NOT_FOUND');
       await verifyPack(candidate, this.appVersion, change);
     }
@@ -246,8 +235,7 @@ export class InstalledCharacterPacks {
     if (!packVersion || comparePackVersions(packVersion, builtinPackVersion(characterId)!) <= 0) return null;
     try {
       const change = { characterId, packVersion };
-      const candidate = await this.bundledPath(change) ?? join(directory, packVersion);
-      const pack = await verifyPack(candidate, this.appVersion, change);
+      const pack = await verifyPack(join(directory, packVersion), this.appVersion, change);
       return {
         manifest: pack.manifest,
         assets: pack.manifest.files.map(file => ({ path: file.path, data: pack.readAsset(file.path)!.buffer })),

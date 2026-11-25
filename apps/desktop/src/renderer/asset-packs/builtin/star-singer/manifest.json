@@ -1,22 +1,17 @@
 {
   "schemaVersion": 1,
   "characterId": "star-singer",
-  "packVersion": "1.0.1",
+  "packVersion": "1.1.0",
   "minAppVersion": "0.0.0",
   "displayName": {
     "zh-CN": "星咏"
   },
-  "thumbnail": "assets/thumbnail.png",
+  "thumbnail": "assets/portrait.png",
   "variants": [
     {
-      "id": "sprite",
-      "renderer": "sprite",
-      "entry": "assets/atlas.json"
-    },
-    {
-      "id": "still",
       "renderer": "static",
-      "entry": "assets/idle.png"
+      "entry": "assets/portrait.png",
+      "id": "still"
     }
   ],
   "anchor": {
@@ -24,75 +19,44 @@
     "y": 1
   },
   "logicalSize": {
-    "w": 128,
-    "h": 128
+    "h": 1536,
+    "w": 1024
   },
   "hitRegions": [
     {
-      "id": "head",
       "rect": [
-        0.3,
-        0.35,
-        0.4,
-        0.24
-      ]
+        0.405,
+        0.119,
+        0.19,
+        0.14
+      ],
+      "id": "head"
     },
     {
-      "id": "body",
       "rect": [
-        0.35,
-        0.67,
-        0.3,
-        0.2
-      ]
+        0.385,
+        0.268,
+        0.23,
+        0.244
+      ],
+      "id": "body"
     }
   ],
   "actions": {
     "idle": {
-      "sprite": "idle",
       "still": "idle"
-    },
-    "sleep": {
-      "sprite": "sleep"
-    },
-    "happy": {
-      "sprite": "happy"
-    },
-    "tap.head": {
-      "sprite": "tap.head"
-    },
-    "talk": {
-      "sprite": "talk"
-    },
-    "walk": {
-      "sprite": "walk"
     }
   },
   "cgIds": [],
   "license": {
-    "owner": "Pet Desktop",
-    "reference": "original-poc-fixture"
+    "owner": "Pet Desktop prototype",
+    "reference": "Generated character art draft based on user reference"
   },
   "files": [
     {
-      "path": "assets/atlas.png",
-      "bytes": 33489,
-      "sha256": "332e062fa42e201514790222245b6bfac67659a467ec37b330c6187ecf113a3e"
-    },
-    {
-      "path": "assets/atlas.json",
-      "bytes": 3955,
-      "sha256": "701f66b111a4d07dd616e86121bec5631176027e1d3e66f70c9717940ffdbc56"
-    },
-    {
-      "path": "assets/idle.png",
-      "bytes": 4554,
-      "sha256": "6c5e830a06ad4382217b1182ec01b5c49511d4576657556764e972980d01fb9b"
-    },
-    {
-      "path": "assets/thumbnail.png",
-      "bytes": 4554,
-      "sha256": "6c5e830a06ad4382217b1182ec01b5c49511d4576657556764e972980d01fb9b"
+      "path": "assets/portrait.png",
+      "bytes": 1554167,
+      "sha256": "965e00efdaf550ddf9adbaecc69d6f2733fe51bb20bf74112f41b1353ac4b4db"
     }
   ]
 }

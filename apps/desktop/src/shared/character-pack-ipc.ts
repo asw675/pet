@@ -6,7 +6,7 @@ export const builtinCharacterIdSchema = z.enum(builtinCharacterIds);
 export type BuiltinCharacterId = z.infer<typeof builtinCharacterIdSchema>;
 
 const builtinVersions: Readonly<Record<BuiltinCharacterId, string>> = {
-  'star-singer': '1.0.1',
+  'star-singer': '1.1.0',
   'fluffy-ranger': '1.0.1',
   nova: '1.0.0',
 };

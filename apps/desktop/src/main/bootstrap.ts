@@ -138,8 +138,7 @@ function spawnService(databasePath: string, recoverySource?: string): ServiceChi
 }
 
 export class DesktopHost {
-  private readonly characterPacks = new InstalledCharacterPacks(app.getPath('userData'), appVersion,
-    app.isPackaged ? join(process.resourcesPath ?? '', 'character-packs') : join(app.getAppPath(), 'content-packs'));
+  private readonly characterPacks = new InstalledCharacterPacks(app.getPath('userData'), appVersion);
   private changingCharacterPack = false;
   private readonly service: HostService & ProactiveHostService;
   private readonly credentialVault: HostVault;

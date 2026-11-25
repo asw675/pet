@@ -1,13 +1,13 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { closeSync, openSync, readFileSync, readdirSync, readSync, statSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { computeNativeArtifactPins } from './native-artifact-pins.mjs';
 
 const desktop = fileURLToPath(new URL('..', import.meta.url));
-const release = join(desktop, 'release');
+const release = process.argv[2] === undefined ? join(desktop, 'release') : resolve(process.argv[2]);
 const unpacked = join(release, 'win-unpacked');
 const resources = join(unpacked, 'resources');
 const { version } = JSON.parse(readFileSync(join(desktop, 'package.json'), 'utf8'));
@@ -42,17 +42,20 @@ for (const [key, relative] of Object.entries(packaged)) {
 
 verifyExecutable(join(release, `Pet-Desktop-${version}-win-x64.exe`), false);
 verifyExecutable(join(unpacked, 'Pet Desktop.exe'), true);
-assert(statSync(join(resources, 'app.asar')).size > 0, 'Packaged Electron application is missing');
 assert(statSync(join(resources, 'native/voice/win-x64/whisper-LICENSE.txt')).size > 0, 'Whisper license is missing');
-const preview = join(resources, 'character-packs/star-singer-1.1.0');
-const previewManifest = JSON.parse(readFileSync(join(preview, 'manifest.json'), 'utf8'));
-assert.equal(previewManifest.characterId, 'star-singer');
-assert.equal(previewManifest.packVersion, '1.1.0');
-const portrait = readFileSync(join(preview, 'assets/portrait.png'));
-assert.equal(createHash('sha256').update(portrait).digest('hex'), previewManifest.files[0].sha256, 'Bundled portrait changed');
+const builtin = join(desktop, 'src/renderer/asset-packs/builtin/star-singer');
+const manifest = JSON.parse(readFileSync(join(builtin, 'manifest.json'), 'utf8'));
+assert.equal(manifest.characterId, 'star-singer');
+assert.equal(manifest.packVersion, '1.1.0');
+const portrait = readFileSync(join(builtin, manifest.thumbnail));
+const portraitDigest = createHash('sha256').update(portrait).digest('hex');
+assert.equal(portraitDigest, manifest.files.find(file => file.path === manifest.thumbnail)?.sha256, 'Built-in portrait changed');
+const archive = readFileSync(join(resources, 'app.asar'));
+assert(archive.includes(portrait) && archive.includes(portraitDigest), 'Desktop and control center must bundle the new Star Singer');
+assert(!archive.includes('332e062fa42e201514790222245b6bfac67659a467ec37b330c6187ecf113a3e'), 'Retired Star Singer atlas was packaged');
 const nativeAddonRoot = join(resources, 'app.asar.unpacked');
 const sqliteAddons = readdirSync(nativeAddonRoot, { recursive: true, withFileTypes: true })
   .filter(entry => entry.isFile() && entry.name === 'better_sqlite3.node');
 assert(sqliteAddons.length > 0, 'The packaged better-sqlite3 addon is missing');
 for (const addon of sqliteAddons) verifyExecutable(join(addon.parentPath, addon.name), true);
-console.log('Verified Windows installer, x64 runtime, SQLite addon and helper digests.');
+console.log('Verified Windows installer, x64 runtime, built-in Star Singer, SQLite addon and helper digests.');

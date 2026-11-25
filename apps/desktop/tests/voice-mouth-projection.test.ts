@@ -71,7 +71,7 @@ describe('Pet visual-only authoritative audio-clock projection', () => {
 });
 
 let packs: ResolvedPack[];
-beforeAll(async () => { packs = await Promise.all(['star-singer', 'fluffy-ranger', 'nova'].map(id => loadBuiltinPack(id))); });
+beforeAll(async () => { packs = await Promise.all(['fluffy-ranger', 'nova'].map(id => loadBuiltinPack(id))); });
 
 // Independent verification of the generated RGBA8/filter-zero engineering
 // PNG's actual bytes: this is not a canvas/device/window integration test.

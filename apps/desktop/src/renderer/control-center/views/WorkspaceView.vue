@@ -4,6 +4,8 @@ import type { LocalRecommendation, QuickActionView, QuickLaunchKind, Routine } f
 import { workspaceLimits } from '@pet-desktop/contracts/workspace';
 import Icon from '../components/Icon.vue';
 import { useWorkspaceProjection } from '../useWorkspaceProjection';
+import { applyStarterRoutineTemplate, starterRoutineTemplates } from '../workspace-routine-templates';
+import type { StarterRoutineTemplate } from '../workspace-routine-templates';
 import { actionCanRun, historyTime, moveRoutineTarget, newRoutineDraft, outcomeText, routineDefinitionForDraft, sourceText, targetKindText, visibleRecommendationTargetIds } from '../../shared/workspace-view-policy';
 
 const {
@@ -50,10 +52,18 @@ const actionById = (id: string) => page.value?.actions.find(action => action.id 
 const labelFor = (id: string) => actionById(id)?.label ?? id;
 
 const routineDraft = ref(newRoutineDraft()), editingRoutine = ref<{ id: string; revision: number } | null>(null), candidateId = ref('');
+const routineName = ref<HTMLInputElement | null>(null);
+const canCreateRoutine = computed(() => !!page.value && page.value.routines.length < workspaceLimits.routines);
+const canChooseTemplate = computed(() => canAct.value && !editingRoutine.value && canCreateRoutine.value);
 const candidates = computed(() => (page.value?.actions ?? []).filter(action => actionCanRun(action) && !routineDraft.value.targetIds.includes(action.id)));
 const draftDefinition = computed(() => routineDefinitionForDraft(routineDraft.value, page.value));
 watch(() => routineDraft.value.mode, mode => { if (mode === 'PARALLEL') { routineDraft.value.delayMs = 0; routineDraft.value.failurePolicy = 'CONTINUE'; } });
 function resetRoutine(): void { routineDraft.value = newRoutineDraft(); editingRoutine.value = null; candidateId.value = ''; }
+function useTemplate(template: StarterRoutineTemplate): void {
+  if (!canChooseTemplate.value) return;
+  routineDraft.value = applyStarterRoutineTemplate(template, routineDraft.value);
+  void nextTick(() => routineName.value?.focus());
+}
 function appendTarget(): void {
   if (routineDraft.value.targetIds.length >= workspaceLimits.routineTargets || !candidates.value.some(action => action.id === candidateId.value)) return;
   routineDraft.value.targetIds.push(candidateId.value); candidateId.value = '';
@@ -68,10 +78,10 @@ function reviewRoutine(): void {
   if (!page.value || !definition) return;
   const intent = editingRoutine.value ? { method: 'routine/update' as const, payload: { routineId: editingRoutine.value.id, expectedRevision: editingRoutine.value.revision, definition } }
     : { method: 'routine/create' as const, payload: { expectedRevision: page.value.revision, definition } };
-  beginConfirmation(intent, '确认保存工作场景？', `「${definition.name}」包含 ${definition.targetIds.map(labelFor).join(' → ')}。仅保存组合，不会启动任何目标。`);
+  beginConfirmation(intent, '确认保存快捷场景？', `「${definition.name}」包含 ${definition.targetIds.map(labelFor).join(' → ')}。仅保存组合，不会启动任何目标。`);
 }
 function removeRoutine(routine: Routine): void {
-  beginConfirmation({ method: 'routine/delete', payload: { routineId: routine.id, expectedRevision: routine.revision } }, '确认删除工作场景？',
+  beginConfirmation({ method: 'routine/delete', payload: { routineId: routine.id, expectedRevision: routine.revision } }, '确认删除快捷场景？',
     `删除「${routine.name}」的组合定义，不删除任何快捷收藏。`);
 }
 
@@ -210,16 +220,27 @@ watch(generation, () => { replacing.value = null; website.value = ''; addLabel.v
     </section>
 
     <section ref="routineSection" class="panel workspace-section">
-      <div class="section-heading"><div><span class="eyebrow">One-click routine</span><h2>{{ editingRoutine ? '编辑工作场景' : '组合工作场景' }}</h2></div><span class="workspace-badge">最多 12 个目标</span></div>
-      <p class="small muted">先排列你实际收藏的目标，再决定串行或有限并行。保存不会启动；每次运行都必须再次确认完整场景。</p>
-      <div class="workspace-form"><label>场景名称<input v-model="routineDraft.name" maxlength="80" placeholder="例如：晨间工作" :disabled="!canAct" /></label>
+      <div class="section-heading"><div><span class="eyebrow">One-click routine</span><h2>{{ editingRoutine ? '编辑快捷场景' : '组合快捷场景' }}</h2></div><span class="workspace-badge">最多 12 个目标</span></div>
+      <p class="small muted">添加并排列你已授权的收藏，可自行设置启动方式。每次运行都必须再次确认完整场景。</p>
+      <div v-if="!editingRoutine" class="routine-templates">
+        <h3 id="routine-templates-heading">从模板开始</h3>
+        <ul class="routine-template-list" aria-labelledby="routine-templates-heading">
+          <li v-for="template in starterRoutineTemplates" :key="template.id">
+            <button class="button button-secondary routine-template" type="button" :disabled="!canChooseTemplate" @click="useTemplate(template)">
+              <strong>{{ template.label }}</strong>
+              <span class="small muted">例如{{ template.examples }}</span>
+            </button>
+          </li>
+        </ul>
+      </div>
+      <div class="workspace-form"><label>场景名称<input ref="routineName" v-model="routineDraft.name" maxlength="80" placeholder="例如：晨间工作" :disabled="!canAct" /></label>
         <label>执行方式<select v-model="routineDraft.mode" :disabled="!canAct"><option value="SEQUENTIAL">串行启动</option><option value="PARALLEL">有限并行（最多 3 个）</option></select></label>
         <label>间隔（毫秒）<input v-model.number="routineDraft.delayMs" type="number" min="0" max="5000" step="100" :disabled="!canAct || routineDraft.mode === 'PARALLEL'" /></label>
         <label>失败策略<select v-model="routineDraft.failurePolicy" :disabled="!canAct || routineDraft.mode === 'PARALLEL'"><option value="CONTINUE">继续剩余目标</option><option value="STOP">停止剩余目标</option></select></label></div>
       <div class="workspace-form"><label>添加收藏<select v-model="candidateId" :disabled="!canAct || !candidates.length"><option value="">选择一个可用收藏</option><option v-for="action in candidates" :key="action.id" :value="action.id">{{ action.label }}</option></select></label><button type="button" class="button button-secondary" :disabled="!canAct || !candidateId || routineDraft.targetIds.length >= 12" @click="appendTarget">添加</button></div>
       <ol class="ordered-targets"><li v-for="(targetId,index) in routineDraft.targetIds" :key="targetId"><strong>{{ index+1 }}. {{ labelFor(targetId) }}</strong><span v-if="!actionCanRun(actionById(targetId))" class="danger-text small">不可用，请移除</span><div class="workspace-buttons"><button type="button" :disabled="!canAct || index === 0" @click="routineDraft.targetIds = moveRoutineTarget(routineDraft.targetIds,index,-1)">上移</button><button type="button" :disabled="!canAct || index === routineDraft.targetIds.length-1" @click="routineDraft.targetIds = moveRoutineTarget(routineDraft.targetIds,index,1)">下移</button><button type="button" :disabled="!canAct" @click="routineDraft.targetIds.splice(index,1)">移除</button></div></li></ol>
       <p class="small muted">{{ routineDraft.targetIds.length }}/12 · 重复目标固定跳过（无重复启动）</p>
-      <div class="workspace-buttons"><button class="button button-primary" type="button" :disabled="!canAct || !draftDefinition || (!editingRoutine && page.routines.length >= 100)" @click="reviewRoutine">{{ editingRoutine ? '保存修改' : '创建场景' }}</button><button type="button" class="button button-secondary" :disabled="busy" @click="resetRoutine">清空草稿</button></div>
+      <div class="workspace-buttons"><button class="button button-primary" type="button" :disabled="!canAct || !draftDefinition || (!editingRoutine && !canCreateRoutine)" @click="reviewRoutine">{{ editingRoutine ? '保存修改' : '创建场景' }}</button><button type="button" class="button button-secondary" :disabled="busy" @click="resetRoutine">清空草稿</button></div>
       <div class="workspace-grid saved-routines"><article v-for="routine in page.routines" :key="routine.id" class="workspace-card"><div class="card-title"><span class="workspace-badge">{{ routine.mode === 'SEQUENTIAL' ? '串行' : '并行' }}</span><span class="small muted">{{ routine.targetIds.length }} 项</span></div><h3>{{ routine.name }}</h3><p class="small muted">{{ routine.targetIds.map(labelFor).join(' → ') }}</p><p class="small">{{ routine.mode === 'SEQUENTIAL' ? `间隔 ${routine.delayMs}ms` : '最多 3 个并行' }} · {{ routine.failurePolicy === 'STOP' ? '失败后停止' : '继续剩余' }}</p>
         <div class="workspace-buttons"><button type="button" class="button button-primary" :disabled="!canAct" @click="runRoutine(routine.id)">{{ runningRoutineId === routine.id ? '正在运行…' : '运行场景' }}</button><button type="button" class="button button-secondary" :disabled="!canAct" @click="editRoutine(routine)">编辑</button><button type="button" class="button button-secondary" :disabled="!canAct" @click="removeRoutine(routine)">删除</button><button v-if="runningRoutineId === routine.id" type="button" class="button button-secondary" :disabled="cancelling" @click="cancelRoutine">{{ cancelling ? '取消请求中…' : '取消剩余任务' }}</button></div>
       </article></div>
@@ -242,5 +263,27 @@ watch(generation, () => { replacing.value = null; website.value = ''; addLabel.v
 </template>
 
 <style scoped>
+.routine-templates {
+  margin-top: 16px;
+}
+.routine-template-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 140px), 1fr));
+  gap: 8px;
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+}
+.routine-template {
+  display: grid;
+  justify-content: stretch;
+  justify-items: start;
+  align-content: start;
+  gap: 3px;
+  width: 100%;
+  height: 100%;
+  text-align: start;
+  white-space: normal;
+}
 .workspace-summary{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;padding:18px;margin-bottom:16px}.workspace-summary>div{display:grid;gap:5px}.workspace-summary strong{font-size:1.15rem}.workspace-section{padding:20px;margin-bottom:16px;min-width:0}.workspace-section h3,.workspace-card p{margin:0}.workspace-section>.section-heading{margin-bottom:10px}.workspace-form{display:flex;align-items:end;flex-wrap:wrap;gap:12px;margin-top:14px}.workspace-form label,.edit-box label{display:grid;gap:5px;font-size:.82rem;color:inherit;min-width:0;max-width:100%}.workspace-form input:not([type=checkbox]),.workspace-form select,.edit-box input:not([type=checkbox]){font:inherit;color:inherit;background:rgba(91,114,141,.08);border:1px solid rgba(110,137,169,.4);border-radius:8px;padding:8px 10px;min-width:130px;max-width:100%}.workspace-form label:has(input[type=url]){flex:1;min-width:200px}.workspace-form .check-field,.check-field{display:flex!important;align-items:center;gap:7px}.check-field input{accent-color:#6782b7}.workspace-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin-top:14px}.workspace-card{display:grid;align-content:start;gap:10px;padding:15px;border:1px solid rgba(111,140,174,.26);border-radius:12px;overflow-wrap:anywhere}.card-title,.workspace-inline{display:flex;justify-content:space-between;align-items:center;gap:8px}.workspace-badge{font-size:.7rem;border:1px solid rgba(111,140,174,.25);border-radius:20px;padding:4px 9px;white-space:nowrap;justify-self:start}.workspace-buttons{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.workspace-buttons .button{white-space:normal}.subtle-actions button,.ordered-targets button{background:transparent;border:0;border-radius:6px;padding:5px 7px;font:inherit;color:inherit;cursor:pointer;font-size:.78rem}.subtle-actions button:not(:disabled):hover,.ordered-targets button:not(:disabled):hover{background:rgba(111,140,174,.15)}.subtle-actions button:disabled,.ordered-targets button:disabled{opacity:.4}.state-ok{color:#3b9879}.danger-text{color:#b8536c!important}.workspace-notice{padding:12px 18px;margin-bottom:14px;color:#357f77}.workspace-receipt,.edit-box{display:grid;gap:9px;border:1px dashed rgba(111,140,174,.5);border-radius:10px;padding:14px;margin-top:14px;background:rgba(105,137,170,.06)}.ordered-targets{padding:0;list-style:none;display:grid;gap:6px;margin:12px 0}.ordered-targets li{display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;padding:9px 12px;background:rgba(111,140,174,.08);border-radius:8px;font-size:.84rem}.saved-routines,.preferences-list{margin-top:18px}.preferences-list .workspace-inline{padding:8px 0;border-bottom:1px solid rgba(111,140,174,.18);font-size:.84rem;flex-wrap:wrap}.history-table{display:grid;gap:1px;margin:14px 0;overflow-wrap:anywhere}.history-row{display:grid;grid-template-columns:1fr 1.45fr 1.6fr;gap:10px;padding:9px 8px;font-size:.78rem;border-bottom:1px solid rgba(111,140,174,.16)}.history-head{font-weight:700;background:rgba(111,140,174,.1)}.workspace-confirm{max-width:min(520px,92vw);border:1px solid rgba(111,140,174,.45);border-radius:15px;padding:24px;color:inherit;background:var(--panel-bg,#fff);box-shadow:0 18px 55px #19203530}.workspace-confirm::backdrop{background:#14213d55}.workspace-confirm p{white-space:pre-wrap;overflow-wrap:anywhere}.workspace-confirm .workspace-buttons{margin-top:20px;justify-content:flex-end}@media(max-width:720px){.workspace-grid{grid-template-columns:1fr}.workspace-summary{grid-template-columns:repeat(2,minmax(0,1fr))}.workspace-section{padding:14px}.history-row{grid-template-columns:1fr 1.2fr;gap:4px}.history-row span:last-child{grid-column:1/-1}.history-head span:last-child{grid-column:auto}}
 </style>

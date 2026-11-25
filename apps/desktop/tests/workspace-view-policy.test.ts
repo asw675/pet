@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { workspacePageSchema } from '@pet-desktop/contracts/workspace';
 import type { LocalRecommendation, WorkspacePage } from '@pet-desktop/contracts/workspace';
 import { workspaceIntentSchema, workspaceManagementIntentSchema } from '../src/shared/workspace-ipc';
+import { applyStarterRoutineTemplate, starterRoutineTemplates } from '../src/renderer/control-center/workspace-routine-templates';
 import {
   applicableWorkspaceIntent, approvalIntent, confirmWorkspaceIntent, createWorkspaceConfirmation, draftFromRecommendation, historyTime,
   moveRoutineTarget, newRoutineDraft, recommendationAction, routineDefinitionForDraft, validateWorkspaceResponse,
@@ -79,6 +80,28 @@ describe('workspace projection policy binds real worker generation and independe
 });
 
 describe('ordered scene and recommendation interaction', () => {
+  it('provides work, entertainment and study drafts that cannot be saved until the user adds targets', () => {
+    expect(starterRoutineTemplates.map(template => template.label)).toEqual(['工作', '娱乐', '学习']);
+    for (const template of starterRoutineTemplates) {
+      const draft = applyStarterRoutineTemplate(template, newRoutineDraft());
+      expect(draft).toEqual({
+        name: template.name, mode: template.mode, delayMs: template.delayMs, failurePolicy: template.failurePolicy, targetIds: [],
+      });
+      expect(routineDefinitionForDraft(draft, page())).toBeNull();
+    }
+  });
+  it('keeps manually chosen targets in order and rechecks current availability after changing templates', () => {
+    const original = { ...newRoutineDraft(), targetIds: ['b', 'a'] };
+    for (const template of starterRoutineTemplates) {
+      const draft = applyStarterRoutineTemplate(template, original);
+      const current = page();
+      expect(routineDefinitionForDraft(draft, current)).toMatchObject({ targetIds: ['b', 'a'], mode: template.mode, skipDuplicates: true });
+      current.actions[0]!.enabled = false;
+      expect(routineDefinitionForDraft(draft, current)).toBeNull();
+      draft.targetIds.pop();
+      expect(original.targetIds).toEqual(['b', 'a']);
+    }
+  });
   it('preserves explicit order, refuses invalid/unapproved targets, duplicate IDs and invalid parallel configuration', () => {
     const draft = { ...newRoutineDraft(), name:' 上午工作 ', targetIds:['b','a'] };
     expect(routineDefinitionForDraft(draft,page())).toMatchObject({ name:'上午工作', targetIds:['b','a'], skipDuplicates: true });

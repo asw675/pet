@@ -15,7 +15,8 @@
     "./route-catalog": "./src/route-catalog.ts",
     "./trip-preparation": "./src/trip-preparation.ts",
     "./event-engine": "./src/event-engine.ts",
-    "./event-catalog": "./src/event-catalog.ts"
+    "./event-catalog": "./src/event-catalog.ts",
+    "./recommendation-engine": "./src/recommendation-engine.ts"
   },
   "imports": {
     "#item-catalog": "./src/item-catalog.ts",

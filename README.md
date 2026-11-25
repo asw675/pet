@@ -19,13 +19,13 @@
 
 ```sh
 pnpm install
-pnpm typecheck
-pnpm test
+mise exec node@26.12.1 -- pnpm typecheck
+mise exec node@26.12.1 -- pnpm test
 ```
 
 纯旅行领域的依赖无关 smoke 已可运行：在项目根目录执行 `pnpm test:smoke`。
 
-当前只有公共契约和纯领域开发阶段，不存在可直接运行的 Electron 应用；`pnpm dev` 将在宿主与双 renderer 原型完成后启用。首次依赖安装成功后应提交真实生成的 `pnpm-lock.yaml`。
+完整 SQLite POC 测试需 Node 26.12.1（或后续验证过且 SQLite 满足项目版本门槛的开发环境）；旧 Node 25 的内置 SQLite 3.51.2 不满足本项目文件数据库门槛。当前公共契约、领域和应用服务已实现，尚不存在可直接运行的 Electron UI；`pnpm dev` 将在宿主与双 renderer 原型完成后启用。依赖变更应提交真实生成的 `pnpm-lock.yaml`。
 
 ## 目标环境
 

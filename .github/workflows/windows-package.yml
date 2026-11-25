@@ -57,9 +57,27 @@ jobs:
           }
           exit $testExit
       - name: Build Windows native helpers
-        run: ./apps/desktop/scripts/stage-win-native.ps1
+        run: |
+          $buildLog = Join-Path $env:RUNNER_TEMP 'pet-native-build.txt'
+          try {
+            & ./apps/desktop/scripts/stage-win-native.ps1 2>&1 | Tee-Object -FilePath $buildLog
+          } catch {
+            $details = (@(Get-Content -LiteralPath $buildLog -Tail 25 -ErrorAction SilentlyContinue) + @($_.Exception.Message)) -join "`n"
+            $message = $details.Replace('%','%25').Replace("`r",'%0D').Replace("`n",'%0A')
+            Write-Output "::error title=Windows native build log::$message"
+            throw
+          }
       - name: Build and verify NSIS installer
-        run: pnpm --filter @pet-desktop/desktop package:win
+        run: |
+          $buildLog = Join-Path $env:RUNNER_TEMP 'pet-installer-build.txt'
+          pnpm --filter @pet-desktop/desktop package:win 2>&1 | Tee-Object -FilePath $buildLog
+          $buildExit = $LASTEXITCODE
+          if ($buildExit -ne 0) {
+            $details = (Get-Content -LiteralPath $buildLog -Tail 25) -join "`n"
+            $message = $details.Replace('%','%25').Replace("`r",'%0D').Replace("`n",'%0A')
+            Write-Output "::error title=Windows installer build log::$message"
+          }
+          exit $buildExit
       - uses: actions/upload-artifact@v4
         with:
           name: Pet-Desktop-Windows-x64

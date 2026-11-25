@@ -93,8 +93,8 @@ describe('Pinned local whisper CLI and explicit availability', () => {
     const h = harness(); const recording = wav();
     const result = h.provider.transcribe(config, recording, signal()); await settle();
     expect(h.children).toHaveLength(1); const child = h.children[0]!;
-    expect(child.spec).toEqual({ executable: '/trusted-bundle/win-x64/whisper-cli.exe', cwd: '/trusted-temp/job-1', shell: false, windowsHide: true,
-      args: ['-m', '/trusted-models/ggml-base.bin', '-f', 'input.wav', '-l', 'zh', '-t', '2', '-ng', '-otxt', '-of', 'transcription', '-np', '-nt'] });
+    expect(child.spec).toEqual({ executable: join(pathOptions.bundledRoot, 'win-x64', 'whisper-cli.exe'), cwd: join(pathOptions.tempRoot, 'job-1'), shell: false, windowsHide: true,
+      args: ['-m', join(pathOptions.modelsRoot, 'ggml-base.bin'), '-f', 'input.wav', '-l', 'zh', '-t', '2', '-ng', '-otxt', '-of', 'transcription', '-np', '-nt'] });
     expect(h.workspaces[0]?.writes[0]).toEqual(recording.bytes);
     child.stdout('not used: private transcription diagnostic'); child.stderr('not logged');
     expect(h.workspaces[0]?.readTranscript).not.toHaveBeenCalled(); expect(h.workspaces[0]?.dispose).not.toHaveBeenCalled();
@@ -156,7 +156,7 @@ describe('Local Windows system voice protocol', () => {
   it('lists only strict actual enabled-voice options from fixed JSON stdin, exposes no arbitrary paths', async () => {
     const h = harness(); const result = h.provider.listSystemVoiceOptions(signal()); await settle();
     const child = h.children[0]!;
-    expect(child.spec).toMatchObject({ executable: `/trusted-bundle/${SAPI_EXECUTABLE}`, args: [], cwd: '/trusted-temp/job-1', shell: false, windowsHide: true });
+    expect(child.spec).toMatchObject({ executable: join(pathOptions.bundledRoot, 'win-x64', 'pet-desktop-sapi.exe'), args: [], cwd: join(pathOptions.tempRoot, 'job-1'), shell: false, windowsHide: true });
     expect(decodedStdin(child)).toEqual({ type: 'ENUMERATE' });
     child.stdout(JSON.stringify({ voices: [{ voiceId: ref.voiceId, locale: ref.locale, displayName: '真实系统音色' }] })); child.close();
     expect(await result).toEqual([{ ref: { providerId: 'WINDOWS_SYSTEM_SPEECH', voiceId: ref.voiceId, locale: ref.locale }, displayName: '真实系统音色' }]);
@@ -270,7 +270,7 @@ describe('Local process output limits, cancellation, deadline and single-flight 
     await expect(pre.provider.transcribe(config, wav(), preCancel.signal)).rejects.toMatchObject({ code: 'canceled' }); expect(pre.verify).not.toHaveBeenCalled();
     const verification = deferred<string>(), canceled = new AbortController();
     const h = harness({ verify: () => verification.promise }); const result = caught(h.provider.transcribe(config, wav(), canceled.signal));
-    canceled.abort(); verification.resolve(`/trusted-bundle/${WHISPER_EXECUTABLE}`); expect(await result).toMatchObject({ code: 'canceled' });
+    canceled.abort(); verification.resolve(join(pathOptions.bundledRoot, 'win-x64', 'whisper-cli.exe')); expect(await result).toMatchObject({ code: 'canceled' });
     expect(h.start).not.toHaveBeenCalled(); expect(h.createWorkspace).not.toHaveBeenCalled();
     const write = deferred<void>(), writeCancel = new AbortController();
     const w = harness({ workspace: workspace => workspace.writeRecording.mockReturnValue(write.promise) });

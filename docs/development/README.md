@@ -70,5 +70,6 @@
 | 010E | 固定 Windows 检出的角色图集校验字节 | 模拟自动换行检出通过，Windows CI 待复测 | [010e-character-pack-line-endings](010e-character-pack-line-endings.md) |
 | 010F | Windows 验证日志及用户备份文件忽略 | 本地忽略规则验证通过 | [010f-windows-verification-log](010f-windows-verification-log.md) |
 | 010G | Windows 原生路径测试夹具 | 开发机专项通过，Windows CI 待复测 | [010g-windows-test-temp-paths](010g-windows-test-temp-paths.md) |
+| 010H | Windows 语音用例路径及原生打包诊断 | 开发机专项通过，Windows CI 待复测 | [010h-windows-voice-test-paths](010h-windows-voice-test-paths.md) |
 
 每份记录包含：日期、范围、设计依据、具体变更、测试命令与真实结果、已知限制、下一步。完整验收状态见 [POC 矩阵](../qa/poc-matrix.md)。

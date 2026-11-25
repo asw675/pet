@@ -4,7 +4,7 @@
 
 ## 开发导航
 
-- [V1.1 产品与技术设计基线](docs/design/V1.1.md)
+- [V1.1 产品与技术设计基线](docs/design/V1.1.md) · [二次元美少女视觉方向](docs/design/character-art-direction.md)
 - [开发记录索引](docs/development/README.md)
 - [架构决策](docs/adr/0001-architecture-baseline.md) · [Electron 构建与沙箱](docs/adr/0003-electron-build-and-sandbox.md)
 - [POC 验收矩阵](docs/qa/poc-matrix.md)

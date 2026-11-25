@@ -35,7 +35,7 @@ describe('versioned built-in character fixtures', () => {
     const resolved = await resolvePack(manifest, {
       paths: () => expected.filter((path) => path !== 'manifest.json'),
       read: async (path) => new Uint8Array(readFileSync(join(directory, path))),
-    }, { characterId, packVersion: '1.0.0', appVersion: '0.0.0' });
+    }, { characterId, packVersion: '1.0.1', appVersion: '0.0.0' });
     expect(resolved.manifest.characterId).toBe(characterId);
     expect(resolved.variants.some((variant) => variant.renderer === 'sprite')).toBe(true);
     expect(resolved.variants.some((variant) => variant.renderer === 'static')).toBe(true);

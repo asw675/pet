@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "characterId": "star-singer",
-  "packVersion": "1.0.0",
+  "packVersion": "1.0.1",
   "minAppVersion": "0.0.0",
   "displayName": {
     "zh-CN": "星咏"
@@ -76,8 +76,8 @@
   "files": [
     {
       "path": "assets/atlas.png",
-      "bytes": 25771,
-      "sha256": "64f940de8d3fa130c807ba4a1d67e0c57018a1f4a682e4f390e54685d0b71969"
+      "bytes": 33489,
+      "sha256": "332e062fa42e201514790222245b6bfac67659a467ec37b330c6187ecf113a3e"
     },
     {
       "path": "assets/atlas.json",
@@ -86,13 +86,13 @@
     },
     {
       "path": "assets/idle.png",
-      "bytes": 3089,
-      "sha256": "c5f292dc0d5a5de3fcfddf2d83f142c9415989e9cb2fde9bbcd0abbef00906bf"
+      "bytes": 4554,
+      "sha256": "6c5e830a06ad4382217b1182ec01b5c49511d4576657556764e972980d01fb9b"
     },
     {
       "path": "assets/thumbnail.png",
-      "bytes": 3089,
-      "sha256": "c5f292dc0d5a5de3fcfddf2d83f142c9415989e9cb2fde9bbcd0abbef00906bf"
+      "bytes": 4554,
+      "sha256": "6c5e830a06ad4382217b1182ec01b5c49511d4576657556764e972980d01fb9b"
     }
   ]
 }

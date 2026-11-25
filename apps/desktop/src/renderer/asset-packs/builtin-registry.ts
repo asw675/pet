@@ -12,8 +12,8 @@ const atlasFiles = import.meta.glob<string>('./builtin/*/assets/**/*.json', { qu
 const imageFiles = import.meta.glob<string>('./builtin/*/assets/**/*.png', { query: '?inline', import: 'default' });
 
 const BUILTIN_VERSIONS = new Map([
-  ['star-singer', '1.0.0'],
-  ['fluffy-ranger', '1.0.0'],
+  ['star-singer', '1.0.1'],
+  ['fluffy-ranger', '1.0.1'],
 ]);
 
 function decodePngDataUrl(url: string): Uint8Array<ArrayBuffer> {

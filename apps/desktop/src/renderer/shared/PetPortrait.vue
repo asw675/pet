@@ -8,69 +8,84 @@ withDefaults(defineProps<{
 </script>
 
 <template>
-  <!-- Original vector placeholder, deliberately independent of game state or a model SDK. -->
+  <!-- Original anime heroine placeholders, independent of game state and model SDK. -->
   <svg class="portrait" :class="{ paused, sleeping, away }" viewBox="0 0 180 184" fill="none" aria-hidden="true">
     <ellipse cx="90" cy="169" rx="61" ry="9" fill="#271d32" opacity=".26" />
     <g v-if="characterId === 'star-singer'" class="breathe" stroke-linecap="round" stroke-linejoin="round">
-      <!-- Cape and little boots -->
-      <path d="M62 120C53 131 45 149 45 159c20 10 70 10 90-1l-17-39" fill="#7563b6" stroke="#403051" stroke-width="3" />
-      <path d="M68 156v8c-7 0-10 3-8 6h23l2-12M96 159l1 11h23c2-4-2-7-9-7v-7" fill="#53446c" stroke="#403051" stroke-width="3" />
-      <path d="M66 120h49l9 38H55l11-38Z" fill="#b9a7ec" stroke="#403051" stroke-width="3" />
-      <path d="m90 123-17 34h34L90 123Z" fill="#fff2d6" />
-      <path d="M90 129v13m-6-6h12" stroke="#9a68b6" stroke-width="2.5" />
-      <!-- Face and moon-colored hair -->
-      <path d="M39 92c-4-37 17-58 51-59 35-1 55 23 52 55l6 23c-10 20-29 29-58 29-32 0-54-12-58-32l7-16Z" fill="#a494df" stroke="#403051" stroke-width="3" />
+      <!-- Long pink hair and two curved fantasy horns, not animal ears. -->
+      <path d="M39 79C37 45 61 27 90 27s53 19 52 54c-1 27 13 54 17 80l-11 11-13-7-10 6-7-23-17 13H78l-17-13-8 23-10-6-14 7-10-11c4-25 20-55 20-82Z" fill="#ad507d" stroke="#433451" stroke-width="3" />
+      <path d="M42 79q-1 40-15 83l12 6q19-24 20-63l-17-26Zm98 0q1 40 15 83l-12 6q-19-24-20-63l17-26Z" fill="#e47d98" />
+      <path d="M37 110q-5 27-11 43m117-43q5 27 11 43" stroke="#ffb2c8" stroke-width="3.2" />
+      <path d="M59 58C43 56 30 45 28 31c-2-11 2-20 14-25-5 12-4 21 3 28l17 12Z" fill="#3d304d" stroke="#433451" stroke-width="3" />
+      <path d="M121 58c16-2 29-13 31-27 2-11-2-20-14-25 5 12 4 21-3 28l-17 12Z" fill="#3d304d" stroke="#433451" stroke-width="3" />
+      <path d="M34 24q-1 14 16 24m96-24q1 14-16 24" stroke="#876a96" stroke-width="3" />
+      <!-- Dark purple tailored skirt, long stockings and boots. -->
+      <path d="M67 151v15c-7 0-11 4-9 7h25l3-19m10 0 2 19h25c2-3-3-7-10-7v-15" fill="#30263f" stroke="#433451" stroke-width="3" />
+      <path d="M72 155v11m36-11v11" stroke="#8b759d" stroke-width="2.5" />
+      <path d="M65 135h50l13 25H52l13-25Z" fill="#726082" stroke="#433451" stroke-width="3" />
+      <path d="M75 142l-9 14m40-14 9 14m-55 1h60" stroke="#473752" stroke-width="2.2" />
+      <path d="M64 119h18l8 12 8-12h18l5 23H59l5-23Z" fill="#30263f" stroke="#433451" stroke-width="3" />
+      <path d="m78 120 12 11 12-11-5 20H83l-5-20Z" fill="#69527d" stroke="#b67ab1" stroke-width="2" />
+      <path d="M61 140h58" stroke="#b67ab1" stroke-width="3" />
+      <path d="m90 128 2 5 6 1-4 4 1 6-5-3-5 3 1-6-4-4 6-1 2-5Z" fill="#ffe29a" />
+      <path d="M60 129q-14-4-18 8l7 7 11-5m60-10q14-4 18 8l-7 7-11-5" fill="#ffe5cf" stroke="#433451" stroke-width="2.5" />
+      <!-- Human face, swept bangs and feminine eye styling. -->
       <ellipse cx="90" cy="95" rx="39" ry="34" fill="#ffe5cf" stroke="#403051" stroke-width="2.5" />
-      <path d="M48 86c0-35 18-43 46-43 25 0 41 15 41 37-15-3-33-9-41-19-7 13-24 22-46 25Z" fill="#cbbdf8" stroke="#403051" stroke-width="2.5" />
-      <path d="M53 83c-4 16 0 32 8 39m67-40c4 14 0 32-8 39" stroke="#7966b2" stroke-width="3.5" />
-      <!-- Lavender wizard's hat -->
-      <path d="M32 66 58 56 71 16l27-6 35 43 20 11c-21 11-75 18-121 2Z" fill="#6e5aa7" stroke="#403051" stroke-width="3" />
-      <path d="m58 56 75-3 5 7c-22 9-55 9-85 5l5-9Z" fill="#cab7f1" />
-      <path d="m90 18 4 9 10 1-7 7 2 10-9-5-9 5 2-10-7-7 10-1 4-9Z" fill="#ffe29a" stroke="#f5d087" stroke-width="1.5" />
-      <path d="M69 12C63 10 62 5 61 3" stroke="#7c6abd" stroke-width="2.5" />
-      <!-- Eyes and blush -->
+      <path d="M48 83c0-35 18-48 46-48 25 0 42 22 42 47-16-7-27-13-32-25-4 12-10 16-13 23l-9-12C73 77 60 84 48 83Z" fill="#e17a98" stroke="#433451" stroke-width="2.5" />
+      <path d="M51 78q-10 27 2 54l9-6q-7-20 0-38m67-10q10 27-2 54l-9-6q7-20 0-38" fill="#e47d98" stroke="#433451" stroke-width="2.5" />
+      <path d="M57 61q10-9 24-11m-28 40q-2 16 3 29m72-29q2 16-3 29" stroke="#ffb2c8" stroke-width="3" />
       <g v-if="sleeping" stroke="#493451" stroke-width="3"><path d="M67 95q6 7 12 0m22 0q6 7 12 0" /></g>
-      <g v-else class="eyes" fill="#4d355e">
-        <ellipse cx="74" cy="96" rx="4.4" ry="7.2" /><ellipse cx="107" cy="96" rx="4.4" ry="7.2" />
-        <circle cx="75.2" cy="93.4" r="1.6" fill="#fff9ec" /><circle cx="108.2" cy="93.4" r="1.6" fill="#fff9ec" />
+      <g v-else class="eyes" stroke="#493451" stroke-width="1.5">
+        <ellipse cx="74" cy="96" rx="9" ry="10.4" fill="#fff9ee" /><ellipse cx="107" cy="96" rx="9" ry="10.4" fill="#fff9ee" />
+        <ellipse cx="74" cy="96" rx="6.4" ry="9.1" fill="#638ec8" /><ellipse cx="107" cy="96" rx="6.4" ry="9.1" fill="#d779a7" />
+        <ellipse cx="74.5" cy="100.5" rx="4.7" ry="3.2" fill="#b4ddf7" stroke="none" /><ellipse cx="107.5" cy="100.5" rx="4.7" ry="3.2" fill="#ffc3dc" stroke="none" />
+        <ellipse cx="74" cy="95" rx="3.5" ry="5.3" fill="#433451" /><ellipse cx="107" cy="95" rx="3.5" ry="5.3" fill="#433451" />
+        <path d="M65 91l-3-3m53 3 3-3M67 87q7-4 14 0m19 0q7-4 14 0" fill="none" stroke-width="2.5" />
+        <circle cx="71.5" cy="92" r="2.5" fill="#fff9ee" stroke="none" /><circle cx="104.5" cy="92" r="2.5" fill="#fff9ee" stroke="none" />
+        <circle cx="77.1" cy="100.3" r="1.2" fill="#fff9ee" stroke="none" /><circle cx="110.1" cy="100.3" r="1.2" fill="#fff9ee" stroke="none" />
       </g>
       <ellipse cx="63" cy="106" rx="6" ry="3" fill="#f3a8ad" opacity=".7" /><ellipse cx="118" cy="106" rx="6" ry="3" fill="#f3a8ad" opacity=".7" />
       <path d="M86 106q4.5 4 9 0" stroke="#8f5260" stroke-width="2" />
-      <path d="M132 96l10 42" stroke="#67404a" stroke-width="4" />
-      <path d="m130 82 4 7 8 1-5 6 1 8-7-4-7 4 1-8-6-6 8-1 3-7Z" fill="#ffdc91" stroke="#bd8551" stroke-width="1.8" />
     </g>
     <g v-else-if="characterId === 'fluffy-ranger'" class="breathe" stroke-linecap="round" stroke-linejoin="round">
-      <!-- Fluffy tail, vest and boots -->
-      <path d="M125 140c22-19 46-13 34 9-6 12-18 20-39 14Z" fill="#dc925e" stroke="#614334" stroke-width="3" />
-      <path d="M143 132c13-2 20 4 16 17-4 7-8 11-12 13-4-9-7-18-4-30Z" fill="#ffecc7" />
+      <!-- Auburn-haired human woodland adventurer. -->
+      <path d="M39 77C38 34 59 25 90 25s53 19 52 52c-1 31 10 53 12 78l-10 9-13-6-7 6-6-25-17 14H79l-17-14-6 25-7-6-13 6-10-9c2-25 13-47 12-78Z" fill="#844537" stroke="#614334" stroke-width="3" />
+      <path d="M38 87q3 37-10 65l11 9q19-23 18-61l-19-13Zm104 0q-3 37 10 65l-11 9q-19-23-18-61l19-13Z" fill="#ac604e" />
+      <path d="M42 118l-8 31m104-31 8 31" stroke="#df956e" stroke-width="3" />
       <path d="M68 157v8c-8-1-12 4-10 6h25l2-13m10 0 2 13h25c1-3-4-6-10-6l-1-8" fill="#6f5148" stroke="#614334" stroke-width="3" />
       <path d="M64 119h52l12 40H53l11-40Z" fill="#71977b" stroke="#614334" stroke-width="3" />
-      <path d="m79 123 11 29 12-29 13 34H65l14-34Z" fill="#fbddac" />
+      <path d="m72 119 18 15 18-15 5 25H67l5-25Z" fill="#fbddac" stroke="#614334" stroke-width="1.5" />
+      <path d="M64 139l-7 10 13-3 20 10 19-10 15 3-8-10-11-14-15 10-15-10Z" fill="#71977b" stroke="#614334" stroke-width="2" />
       <path d="M70 142h40" stroke="#805d48" stroke-width="6" /><rect x="85" y="139" width="10" height="7" rx="1.5" fill="#f8cb70" />
-      <!-- Animal ears and hair -->
-      <path d="M48 66 38 20q1-9 14-2l31 30m14 0 31-30q13-7 14 2l-10 46" fill="#dc925e" stroke="#614334" stroke-width="3" />
-      <path d="m48 30 9 28 16-6Zm84 0-9 28-16-6Z" fill="#f5b7a4" />
-      <path d="M34 95c0-35 22-55 56-55s56 20 56 55l-6 18-10 9c-14 13-65 15-80 0l-10-9-6-18Z" fill="#e6a66f" stroke="#614334" stroke-width="3" />
-      <ellipse cx="90" cy="97" rx="39" ry="34" fill="#ffe9ca" stroke="#614334" stroke-width="2.5" />
-      <path d="M52 86c0-29 14-37 37-37 24 0 40 14 40 32-12-5-21-8-26-18-9 12-29 23-51 23Z" fill="#e7a66e" stroke="#614334" stroke-width="2.5" />
-      <path d="M43 91c4 8 4 18 1 27 7-1 10-6 13-12m80-15c-4 8-4 18-1 27-7-1-10-6-13-12" fill="#ffe0b6" stroke="#614334" stroke-width="2.5" />
-      <path d="M61 56q16-16 41-7" stroke="#f4c57d" stroke-width="4" />
+      <ellipse cx="90" cy="97" rx="39" ry="34" fill="#ffe5cf" stroke="#614334" stroke-width="2.5" />
+      <path d="M50 86c0-31 16-48 39-48 24 0 44 21 44 44-12-6-22-10-29-23-4 9-15 13-22 21l-8-8c-7 9-15 13-24 14Z" fill="#ac604e" stroke="#614334" stroke-width="2.5" />
+      <path d="M51 83q-11 26 0 53l11-7q-9-17-3-37m71-9q10 26 0 53l-11-7q9-17 3-37" fill="#ac604e" stroke="#614334" stroke-width="2.5" />
+      <path d="M61 56q16-16 41-7m-49 43q-2 16 3 29m72-29q2 16-3 29" stroke="#df956e" stroke-width="3.2" />
       <path d="m111 53 14-8 7 10-14 5-7-7Z" fill="#76ac83" stroke="#477356" stroke-width="2" />
-      <!-- Eyes, freckles and smile -->
       <g v-if="sleeping" stroke="#624235" stroke-width="3"><path d="M67 97q6 7 12 0m22 0q6 7 12 0" /></g>
-      <g v-else class="eyes" fill="#71513b">
-        <ellipse cx="74" cy="98" rx="4.6" ry="7" /><ellipse cx="106" cy="98" rx="4.6" ry="7" />
-        <circle cx="75.4" cy="95.5" r="1.5" fill="#fff9ec" /><circle cx="107.4" cy="95.5" r="1.5" fill="#fff9ec" />
+      <g v-else class="eyes" stroke="#624235" stroke-width="1.5">
+        <ellipse cx="74" cy="98" rx="9" ry="10.4" fill="#fff9ee" /><ellipse cx="107" cy="98" rx="9" ry="10.4" fill="#fff9ee" />
+        <ellipse cx="74" cy="98" rx="6.4" ry="9.1" fill="#588e78" /><ellipse cx="107" cy="98" rx="6.4" ry="9.1" fill="#588e78" />
+        <ellipse cx="74.5" cy="102.5" rx="4.7" ry="3.2" fill="#aed9a7" stroke="none" /><ellipse cx="107.5" cy="102.5" rx="4.7" ry="3.2" fill="#aed9a7" stroke="none" />
+        <ellipse cx="74" cy="97" rx="3.5" ry="5.3" fill="#624235" /><ellipse cx="107" cy="97" rx="3.5" ry="5.3" fill="#624235" />
+        <path d="M65 93l-3-3m53 3 3-3M67 89q7-4 14 0m19 0q7-4 14 0" fill="none" stroke-width="2.5" />
+        <circle cx="71.5" cy="94" r="2.5" fill="#fff9ee" stroke="none" /><circle cx="104.5" cy="94" r="2.5" fill="#fff9ee" stroke="none" />
+        <circle cx="77.1" cy="102.3" r="1.2" fill="#fff9ee" stroke="none" /><circle cx="110.1" cy="102.3" r="1.2" fill="#fff9ee" stroke="none" />
       </g>
       <ellipse cx="63" cy="108" rx="6" ry="3" fill="#ed9b88" opacity=".7" /><ellipse cx="117" cy="108" rx="6" ry="3" fill="#ed9b88" opacity=".7" />
       <path d="M85 108q5 6 10 0" stroke="#a76b53" stroke-width="2.2" />
-      <path d="M54 132c-11-2-15 7-14 14l10 3 7-7" fill="#ffe9ca" stroke="#614334" stroke-width="2.5" />
-      <path d="M125 131c9-4 15 3 15 12l-9 6-8-7" fill="#ffe9ca" stroke="#614334" stroke-width="2.5" />
+      <path d="M54 132c-11-2-15 7-14 14l10 3 7-7" fill="#ffe5cf" stroke="#614334" stroke-width="2.5" />
+      <path d="M125 131c9-4 15 3 15 12l-9 6-8-7" fill="#ffe5cf" stroke="#614334" stroke-width="2.5" />
     </g>
     <g v-else class="breathe" stroke="#51435a" stroke-width="3" stroke-linecap="round">
-      <path d="M39 106c0-43 23-66 51-66s51 23 51 66-21 54-51 54-51-11-51-54Z" fill="#ccb9d6" />
-      <circle cx="73" cy="99" r="5" fill="#51435a" /><circle cx="107" cy="99" r="5" fill="#51435a" />
-      <path d="M83 114q7 5 14 0" />
+      <!-- Neutral human heroine silhouette for a missing character pack. -->
+      <path d="M46 85c0-32 18-52 44-52s44 20 44 52c0 29 8 44 9 73l-20 5-13-15H70l-13 15-20-5c1-29 9-44 9-73Z" fill="#a497b8" />
+      <path d="M69 151v16l-9 5h23l3-18m10 0 2 18h23l-9-5v-16" fill="#796a8e" />
+      <path d="M66 116h48l14 42H52l14-42Z" fill="#bfb3cc" />
+      <path d="M59 130q-18-2-16 12l9 5 9-8m60-9q18-2 16 12l-9 5-9-8" fill="#d7cce0" />
+      <ellipse cx="90" cy="87" rx="37" ry="34" fill="#d7cce0" />
+      <path d="M50 79c0-30 18-41 43-41 23 0 38 17 38 39-14-6-27-11-33-23-7 13-22 20-48 25Z" fill="#a497b8" />
+      <path d="M68 89q5-4 10 0m24 0q5-4 10 0m-26 12q4 3 8 0" fill="none" stroke-width="2" />
     </g>
     <g v-if="sleeping && !away" class="sleep-marks" fill="#fbe7bd" stroke="#6a597c" stroke-width=".8" stroke-linejoin="round">
       <path d="M144 13h11l-11 12h11v3h-15v-3l11-9h-7Z" />

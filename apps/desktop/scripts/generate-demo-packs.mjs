@@ -1,5 +1,5 @@
 /**
- * Deterministic original engineering-only sprites. Nothing here downloads art
+ * Deterministic original engineering-only anime chibi heroine sprites. Nothing here downloads art
  * or uses an image library. The installed application consumes only the PNGs
  * and validated JSON, never this generator.
  *
@@ -118,11 +118,14 @@ class Raster {
 
 const color = {
   ink: rgba('433451'), rangerInk: rgba('64483c'), white: rgba('fff9ee'), gold: rgba('ffe29a'),
-  hair: rgba('b5a4ed'), hairShade: rgba('8d7ac8'), hat: rgba('7964b5'), cloth: rgba('baaaea'),
-  robe: rgba('7563b0'), boot: rgba('554365'), skin: rgba('ffe5cf'), blush: rgba('ed8ba1', 180),
-  orange: rgba('dfa36e'), orangeDark: rgba('bc7f50'), cream: rgba('ffecc7'),
+  skin: rgba('ffe5cf'), blush: rgba('ed8ba1', 180),
+  demonHair: rgba('e17a98'), demonHairShade: rgba('a94d78'), demonHairShine: rgba('ffaac1'),
+  horn: rgba('3d304d'), hornShine: rgba('80668b'), demonCloth: rgba('473752'), demonBlack: rgba('30263f'),
+  demonAccent: rgba('a46ba1'), demonSkirt: rgba('726082'), azure: rgba('638ec8'), ice: rgba('b4ddf7'),
+  rose: rgba('d779a7'), roseLight: rgba('ffc3dc'),
+  copper: rgba('ac604e'), copperDark: rgba('844537'), copperShine: rgba('df956e'), cream: rgba('ffecc7'),
   pink: rgba('f6b5a4'), green: rgba('71977b'), vest: rgba('8eb08d'), brown: rgba('76523e'),
-  leaf: rgba('76b383'), mouth: rgba('9c5d65'), shadow: rgba('2b203c', 48),
+  leaf: rgba('76b383'), jade: rgba('588e78'), mint: rgba('aed9a7'), mouth: rgba('9c5d65'), shadow: rgba('2b203c', 48),
   sparkle: rgba('ffd275'), heart: rgba('f3a0b8'),
 };
 
@@ -149,21 +152,33 @@ function shapeAt(frame, dx, dy) {
   };
 }
 
-function face(draw, ink, clip, i) {
+function face(draw, ink, iris, irisLight, clip, i, rightIris = iris, rightIrisLight = irisLight) {
   const eyesClosed = clip === 'sleep' || (clip === 'idle' && i === 3) ||
     (clip === 'happy' && i >= 1 && i <= 2) || (clip === 'tap.head' && i === 2);
   for (const x of [52, 76]) {
+    const outer = x < 64 ? -1 : 1;
+    draw.line(x - 5, 51, x + 3, 50.5, 1.35, ink);
     if (eyesClosed) {
-      draw.line(x - 4, 61, x, 64, 2.3, ink);
-      draw.line(x, 64, x + 4, 61, 2.3, ink);
+      const mid = clip === 'happy' || clip === 'tap.head' ? 58 : 61.5;
+      draw.line(x - 5, 60, x, mid, 2.1, ink);
+      draw.line(x, mid, x + 5, 60, 2.1, ink);
+      draw.line(x + outer * 4.5, 60, x + outer * 6.5, 58.1, 1.3, ink);
     } else {
-      draw.ellipse(x, 61, 3.4, 5.2, ink);
-      draw.ellipse(x + 0.9, 58.9, 1.25, 1.25, color.white);
+      // Oversized almond-like eyes, layered irises and bright anime catchlights.
+      draw.ellipse(x, 61, 6.6, 7.0, color.white, ink, 0.9);
+      draw.ellipse(x + 0.25, 61, 4.7, 6.5, outer < 0 ? iris : rightIris, ink, 0.6);
+      draw.ellipse(x + 0.4, 64.1, 3.6, 2.8, outer < 0 ? irisLight : rightIrisLight);
+      draw.ellipse(x + 0.1, 60.0, 2.6, 3.8, ink);
+      draw.line(x - 5.3, 55.2, x + 4.8, 55.2, 1.9, ink);
+      draw.line(x + outer * 5, 55.5, x + outer * 7.0, 53.7, 1.6, ink);
+      draw.ellipse(x - 1.6, 57.8, 1.85, 1.55, color.white);
+      draw.ellipse(x + 2.3, 64.2, 0.8, 0.8, color.white);
     }
   }
   const rosy = clip === 'happy' || clip === 'tap.head';
-  draw.ellipse(45, 69, rosy ? 5.9 : 4.6, 2.5, color.blush);
-  draw.ellipse(83, 69, rosy ? 5.9 : 4.6, 2.5, color.blush);
+  draw.ellipse(44, 70.5, rosy ? 5.4 : 4.5, 2.4, color.blush);
+  draw.ellipse(84, 70.5, rosy ? 5.4 : 4.5, 2.4, color.blush);
+  draw.ellipse(64, 66.5, 0.85, 0.75, color.blush);
   if (clip === 'talk' || clip === 'happy') {
     const open = clip === 'happy' ? 3.2 : [0.9, 2.6, 4.1, 1.8][i];
     draw.ellipse(64, 71, 3.5, open, color.mouth);
@@ -177,68 +192,111 @@ function face(draw, ink, clip, i) {
 function drawStarSinger(draw, clip, i) {
   const ink = color.ink;
   const stride = clip === 'walk' ? [3, -2, -3, 2][i] : 0;
-  draw.polygon([[45, 82], [80, 82], [98, 109], [87, 115], [41, 115], [30, 109]], color.robe, ink);
-  draw.ellipse(50 - stride, 116 + Math.max(0, -stride), 10, 5, color.boot, ink);
-  draw.ellipse(78 + stride, 116 + Math.max(0, stride), 10, 5, color.boot, ink);
-  draw.polygon([[50, 82], [78, 82], [85, 111], [43, 111]], color.cloth, ink);
-  draw.polygon([[64, 82], [53, 107], [75, 107]], color.cream);
-  star(draw, 64, 92, 5.6);
-  // Hands and wand stay distinguishable in the body region.
-  draw.ellipse(38, 96, 6, 7, color.skin, ink);
+  // Original fantasy demon heroine: very long rose-pink hair, a dark
+  // tailored jacket and skirt, stockings / boots and human hands.
+  draw.polygon([[30, 43], [39, 25], [53, 18], [75, 17], [91, 27], [99, 44], [97, 69], [105, 91],
+    [111, 111], [103, 119], [94, 113], [91, 117], [86, 98], [75, 108], [50, 106], [42, 97],
+    [36, 118], [29, 113], [20, 119], [16, 112], [23, 90], [31, 69]], color.demonHairShade, ink);
+  draw.polygon([[29, 60], [37, 64], [38, 81], [31, 111], [24, 116], [21, 111], [26, 92]], color.demonHair);
+  draw.polygon([[91, 64], [98, 61], [102, 88], [107, 111], [102, 116], [95, 111], [90, 82]], color.demonHair);
+  draw.line(29, 77, 24, 108, 2, color.demonHairShine);
+  draw.line(98, 76, 104, 108, 2, color.demonHairShine);
+
+  draw.line(51 - stride, 105, 51 - stride, 118 + Math.max(0, -stride), 9, color.demonBlack);
+  draw.line(77 + stride, 105, 77 + stride, 118 + Math.max(0, stride), 9, color.demonBlack);
+  draw.line(49 - stride, 108, 49 - stride, 115 + Math.max(0, -stride), 2, color.hornShine);
+  draw.line(75 + stride, 108, 75 + stride, 115 + Math.max(0, stride), 2, color.hornShine);
+  draw.ellipse(50 - stride, 118 + Math.max(0, -stride), 10, 4.5, color.demonBlack, ink);
+  draw.ellipse(78 + stride, 118 + Math.max(0, stride), 10, 4.5, color.demonBlack, ink);
+  draw.polygon([[46, 96], [82, 96], [90, 112], [38, 112]], color.demonSkirt, ink);
+  draw.line(47, 108, 81, 108, 1.1, color.demonAccent);
+  draw.line(51, 102, 48, 110, 1.2, color.demonBlack);
+  draw.line(77, 102, 80, 110, 1.2, color.demonBlack);
+  draw.polygon([[47, 81], [58, 79], [70, 79], [81, 81], [84, 98], [44, 98]], color.demonBlack, ink);
+  draw.polygon([[53, 81], [64, 87], [75, 81], [69, 96], [59, 96]], color.demonCloth, color.demonAccent, 1.2);
+  draw.line(46, 98, 82, 98, 2.3, color.demonAccent);
+  star(draw, 64, 92, 4.1, color.gold, color.demonBlack);
+  draw.ellipse(38, 96, 6.5, 6.8, color.skin, ink);
   const lift = clip === 'happy' ? 9 : clip === 'walk' ? stride : 0;
-  draw.ellipse(89, 95 - lift, 6, 7, color.skin, ink);
-  draw.line(96, 98 - lift, 103, 74 - lift, 3.4, color.brown);
-  star(draw, 104, 71 - lift, 8, color.gold, color.brown);
-  // Hair silhouette, head and fringe.
-  draw.ellipse(64, 59, 36, 32, color.hairShade, ink);
+  draw.ellipse(89, 95 - lift, 6.5, 6.8, color.skin, ink);
+
+  // The horns are curved above the scalp, distinct from animal ears.
+  const leftHorn = [[42, 40], [33, 37], [25, 29], [22, 20], [24, 13], [31, 8], [29, 17], [33, 24], [42, 28], [48, 33]];
+  const rightHorn = leftHorn.map(([x, y]) => [128 - x, y]);
+  draw.polygon(leftHorn, color.horn, ink);
+  draw.polygon(rightHorn, color.horn, ink);
+  draw.line(27, 19, 28, 25, 2, color.hornShine);
+  draw.line(28, 25, 35, 32, 2, color.hornShine);
+  draw.line(101, 19, 100, 25, 2, color.hornShine);
+  draw.line(100, 25, 93, 32, 2, color.hornShine);
+
+  draw.ellipse(64, 59, 36, 32, color.demonHairShade, ink);
   draw.ellipse(64, 63, 28, 25, color.skin, ink);
-  draw.polygon([[35, 56], [37, 42], [49, 34], [64, 33], [80, 39], [93, 52], [89, 58],
-    [73, 50], [65, 43], [58, 52], [47, 58]], color.hair);
-  draw.line(38, 57, 43, 76, 3.3, color.hairShade);
-  draw.line(90, 57, 85, 76, 3.3, color.hairShade);
-  face(draw, ink, clip, i);
-  // Soft wizard hat brim and asymmetric point; gold star.
-  draw.polygon([[25, 44], [40, 36], [49, 14], [69, 9], [84, 22], [89, 36], [103, 44],
-    [91, 49], [64, 52], [38, 49]], color.hat, ink);
-  draw.polygon([[39, 36], [88, 35], [94, 41], [64, 45], [34, 41]], color.cloth);
-  star(draw, 65, 25, 8, color.gold, color.brown);
+  draw.polygon([[35, 56], [37, 42], [49, 34], [64, 33], [80, 39], [93, 52], [88, 57],
+    [76, 51], [69, 43], [63, 53], [57, 47], [47, 56]], color.demonHair);
+  draw.polygon([[36, 52], [43, 54], [42, 69], [46, 84], [39, 94], [32, 74]], color.demonHair, ink, 0.9);
+  draw.polygon([[88, 52], [92, 54], [94, 72], [91, 94], [82, 86], [87, 70]], color.demonHair, ink, 0.9);
+  draw.line(39, 43, 50, 37, 2.0, color.demonHairShine);
+  draw.line(50, 37, 61, 37.8, 2.0, color.demonHairShine);
+  draw.line(36, 58, 37.8, 74, 1.8, color.demonHairShine);
+  draw.line(89.5, 58, 90.5, 74, 1.8, color.demonHairShine);
+  face(draw, ink, color.azure, color.ice, clip, i, color.rose, color.roseLight);
 }
 
 function drawRanger(draw, clip, i) {
   const ink = color.rangerInk;
   const stride = clip === 'walk' ? [3, -2, -3, 2][i] : 0;
-  const tailY = clip === 'happy' ? 91 - i : 96 + stride;
-  draw.ellipse(104, tailY + 5, 17, 11, color.orange, ink);
-  draw.ellipse(114, tailY + 1, 8, 8, color.cream);
+  // Auburn hair extends from the human scalp behind both shoulders.
+  // There are no ears, muzzle, paws, tail or other animal features.
+  draw.polygon([[31, 39], [39, 26], [53, 18], [72, 17], [88, 27], [98, 42], [95, 64], [99, 84],
+    [105, 103], [98, 113], [88, 108], [86, 91], [76, 102], [51, 102], [41, 92], [38, 111],
+    [28, 113], [22, 103], [29, 81], [32, 65]], color.copperDark, ink);
+  draw.polygon([[28, 68], [38, 70], [38, 91], [30, 108], [25, 103]], color.copper);
+  draw.polygon([[90, 69], [97, 70], [99, 91], [102, 103], [96, 109], [89, 100]], color.copper);
+  draw.line(31, 83, 29, 101, 1.8, color.copperShine);
+  draw.line(96, 83, 99, 101, 1.8, color.copperShine);
+  draw.line(49 - stride, 107, 49 - stride, 116 + Math.max(0, -stride), 7, color.skin);
+  draw.line(79 + stride, 107, 79 + stride, 116 + Math.max(0, stride), 7, color.skin);
   draw.ellipse(49 - stride, 116 + Math.max(0, -stride), 10, 5, color.brown, ink);
   draw.ellipse(79 + stride, 116 + Math.max(0, stride), 10, 5, color.brown, ink);
-  draw.polygon([[48, 82], [80, 82], [91, 112], [36, 112]], color.green, ink);
-  draw.polygon([[52, 83], [62, 105], [76, 83], [80, 109], [48, 109]], color.cream);
-  draw.line(47, 99, 81, 99, 4.8, color.brown);
-  draw.polygon([[61, 96], [67, 96], [67, 102], [61, 102]], color.gold);
+  draw.line(45 - stride, 116 + Math.max(0, -stride), 51 - stride, 116 + Math.max(0, -stride), 1.2, color.gold);
+  draw.line(75 + stride, 116 + Math.max(0, stride), 81 + stride, 116 + Math.max(0, stride), 1.2, color.gold);
+  // Small forest capelet, blouse and pleated skirt with a travel belt.
+  draw.polygon([[50, 79], [77, 79], [88, 95], [78, 97], [91, 113], [36, 113], [49, 97], [40, 95]], color.green, ink);
+  draw.polygon([[53, 81], [63, 90], [75, 81], [78, 101], [50, 101]], color.cream, ink, 0.8);
+  draw.polygon([[39, 109], [50, 95], [63, 101], [78, 95], [89, 109], [83, 111], [45, 111]], color.vest);
+  draw.line(53, 104, 48, 110, 1.3, color.green);
+  draw.line(76, 104, 81, 110, 1.3, color.green);
+  draw.line(47, 100, 81, 100, 4.8, color.brown);
+  draw.polygon([[61, 97], [68, 97], [68, 103], [61, 103]], color.gold);
+  draw.polygon([[46, 83], [54, 81], [63, 86], [73, 81], [83, 83], [87, 91], [72, 89], [63, 93], [55, 89], [41, 91]], color.green, ink, 1.1);
+  draw.polygon([[60, 89], [65, 84], [69, 88], [64, 92]], color.gold, color.brown, 1.0);
   const lift = clip === 'happy' ? 9 : clip === 'walk' ? stride : 0;
-  draw.ellipse(33, 95 + stride, 7, 6, color.cream, ink);
-  draw.ellipse(94, 95 - lift, 7, 6, color.cream, ink);
-  // Triangular ears, cream inner fur, and face.
-  draw.polygon([[34, 45], [27, 10], [49, 22], [59, 43]], color.orange, ink);
-  draw.polygon([[94, 45], [101, 10], [79, 22], [69, 43]], color.orange, ink);
-  draw.polygon([[33, 18], [45, 28], [42, 40]], color.pink);
-  draw.polygon([[95, 18], [83, 28], [86, 40]], color.pink);
-  draw.ellipse(64, 57, 36, 33, color.orange, ink);
-  draw.ellipse(64, 63, 28, 25, color.cream, ink);
-  draw.polygon([[36, 56], [42, 34], [59, 31], [80, 36], [91, 51], [85, 54],
-    [74, 48], [71, 42], [60, 51], [49, 58]], color.orange);
-  draw.line(47, 37, 59, 34, 2.9, color.cream);
-  draw.polygon([[79, 35], [92, 27], [97, 34], [87, 41]], color.leaf, ink, 1.3);
-  draw.line(85, 36, 92, 31, 1.2, color.white);
-  face(draw, ink, clip, i);
+  draw.ellipse(35, 95 + stride, 6.5, 6, color.skin, ink);
+  draw.ellipse(93, 95 - lift, 6.5, 6, color.skin, ink);
+  draw.ellipse(64, 57, 36, 34, color.copperDark, ink);
+  draw.ellipse(64, 63, 28, 25, color.skin, ink);
+  // Rounded human hairline and swept long bangs, not pointed animal ears.
+  draw.polygon([[35, 53], [38, 40], [46, 31], [57, 26], [73, 27], [86, 34], [93, 46], [90, 57],
+    [79, 49], [72, 41], [67, 49], [58, 54], [48, 56], [45, 51], [40, 57]], color.copper, ink, 0.9);
+  draw.polygon([[36, 53], [43, 56], [42, 74], [50, 86], [42, 94], [35, 86], [31, 70]], color.copper, ink, 0.9);
+  draw.polygon([[89, 51], [94, 53], [96, 70], [91, 92], [83, 85], [88, 73]], color.copper, ink, 0.9);
+  draw.line(44, 39, 53, 32, 2.2, color.copperShine);
+  draw.line(53, 32, 64, 33, 2.2, color.copperShine);
+  draw.line(37, 61, 37, 77, 1.5, color.copperShine);
+  draw.line(91, 62, 92, 78, 1.5, color.copperShine);
+  // Woodland hair ornament, asymmetric ribbon and leaf.
+  draw.polygon([[82, 37], [91, 30], [96, 35], [90, 43], [84, 41]], color.leaf, ink, 1.1);
+  draw.polygon([[83, 39], [90, 45], [87, 50], [82, 44]], color.gold, color.brown, 0.8);
+  draw.line(85, 39, 92, 34, 1.1, color.white);
+  face(draw, ink, color.jade, color.mint, clip, i);
 }
 
 function renderFrame(characterId, clip, i) {
   const pixels = new Raster(SIZE, SIZE);
   const dx = clip === 'walk' ? [-2, 1, 2, -1][i] : 0;
-  const dy = clip === 'sleep' ? [2, 3, 4, 3][i] :
-    clip === 'happy' ? [0, -6, -9, -3][i] :
+  const dy = clip === 'sleep' ? [1, 2, 3, 2][i] :
+    clip === 'happy' ? [0, -4, -5, -3][i] :
       clip === 'tap.head' ? [0, 2, 3, 0][i] : [0, -1, -3, -1][i];
   pixels.ellipse(64, 124, clip === 'happy' ? 30 : 37, 2.8, color.shadow);
   const draw = shapeAt(pixels, dx, dy);
@@ -261,8 +319,13 @@ function renderFrame(characterId, clip, i) {
       pixels.line(x, y + s, x + s, y + s, 1.8, color.gold);
     }
   }
-  if (pixels.data[3] !== 0 || pixels.data[(SIZE * SIZE - 1) * 4 + 3] !== 0) {
-    throw new Error('Generated frame corners must remain transparent.');
+  // Clear all four cell borders (not just the corners) so full hair and
+  // curved horns are never clipped or bleed into neighboring atlas cells.
+  const alpha = (x, y) => pixels.data[(y * SIZE + x) * 4 + 3];
+  for (let p = 0; p < SIZE; p += 1) {
+    if (alpha(p, 0) || alpha(p, SIZE - 1) || alpha(0, p) || alpha(SIZE - 1, p)) {
+      throw new Error(`Generated frame border must remain transparent: ${characterId}:${clip}:${i}`);
+    }
   }
   return pixels;
 }
@@ -341,7 +404,7 @@ function generatePack(characterId, name) {
   const manifest = {
     schemaVersion: 1,
     characterId,
-    packVersion: '1.0.0',
+    packVersion: '1.0.1',
     minAppVersion: '0.0.0',
     displayName: { 'zh-CN': name },
     thumbnail: 'assets/thumbnail.png',

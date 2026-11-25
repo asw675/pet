@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "characterId": "fluffy-ranger",
-  "packVersion": "1.0.0",
+  "packVersion": "1.0.1",
   "minAppVersion": "0.0.0",
   "displayName": {
     "zh-CN": "绒绒"
@@ -76,8 +76,8 @@
   "files": [
     {
       "path": "assets/atlas.png",
-      "bytes": 24610,
-      "sha256": "5eab35392403c395a12fb625a75aea0f2f719e4bbd87eb360f21439fcaf594b2"
+      "bytes": 30242,
+      "sha256": "e0355da39251e955a9588bbe20b2c0c477b2a8dd615e34012f3407d0f598ff7e"
     },
     {
       "path": "assets/atlas.json",
@@ -86,13 +86,13 @@
     },
     {
       "path": "assets/idle.png",
-      "bytes": 2772,
-      "sha256": "3601798fbae6683b43844eb0392a0edad4aba17860c376891f308b6385566e97"
+      "bytes": 4109,
+      "sha256": "9bf1c09436d07643f416670c83a111c0e43d66f18828e80c842e1cad05c38a47"
     },
     {
       "path": "assets/thumbnail.png",
-      "bytes": 2772,
-      "sha256": "3601798fbae6683b43844eb0392a0edad4aba17860c376891f308b6385566e97"
+      "bytes": 4109,
+      "sha256": "9bf1c09436d07643f416670c83a111c0e43d66f18828e80c842e1cad05c38a47"
     }
   ]
 }

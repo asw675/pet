@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { appSnapshotSchema, idSchema, ipcRequestSchema, ipcResultSchema, nonnegativeIntegerSchema } from '@pet-desktop/contracts';
-import type { AppBridge, AppSnapshot, GalleryIpcResult, GalleryQuery } from '@pet-desktop/contracts';
+import type { AppBridge, AppSnapshot, CharactersIpcResult, GalleryIpcResult, GalleryQuery } from '@pet-desktop/contracts';
 
 export const DESKTOP_IPC = Object.freeze({
   request: 'pet-desktop:request:v1',
@@ -48,6 +48,7 @@ export interface PetDesktopBridge extends DesktopBridgeBase {
 export interface ControlCenterBridge extends DesktopBridgeBase {
   readonly role: 'control-center';
   listGallery(query: GalleryQuery): Promise<GalleryIpcResult>;
+  listCharacters(): Promise<CharactersIpcResult>;
 }
 export type DesktopBridge = PetDesktopBridge | ControlCenterBridge;
 

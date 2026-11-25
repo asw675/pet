@@ -56,6 +56,22 @@ describe('Main window identity and URL boundary', () => {
 });
 
 describe('Main request routing', () => {
+  it('keeps character catalog, acquisition and rename exclusive to the control center', async () => {
+    const query: IpcRequest = { ...getSnapshot, method: 'characters/list', payload: {} };
+    const acquire = dispatch({ ...common, type: 'PET_ACQUIRE', payload: { characterId: 'nova', catalogVersion: 1 } });
+    const rename = dispatch({ ...common, type: 'PET_RENAME', payload: { petId: 'pet-a', nickname: '星夜' } });
+    const forward = relay();
+    for (const request of [query, acquire, rename]) {
+      await expect(routeRequest(pet, sender(pet), [request], forward, 1)).resolves.toMatchObject({ ok: false, error: { code: 'FORBIDDEN' } });
+    }
+    expect(forward).not.toHaveBeenCalled();
+    const list = vi.fn(async (request: IpcRequest): Promise<IpcResult> => ({ schemaVersion: 1, ok: true, requestId: request.requestId,
+      snapshot, characters: { revision: snapshot.revision, walletCoins: snapshot.walletCoins, catalogVersion: 1, settledTrips: 0, rows: [] } }));
+    await expect(routeRequest(center, sender(center), [query], list, undefined)).resolves.toMatchObject({ ok: true, characters: { catalogVersion: 1 } });
+    await expect(routeRequest(center, sender(center), [query], forward, undefined)).resolves.toMatchObject({ ok: false, error: { code: 'INTERNAL_ERROR' } });
+    await expect(routeRequest(center, sender(center), [acquire], forward, undefined)).resolves.toMatchObject({ ok: true });
+    await expect(routeRequest(center, sender(center), [rename], forward, undefined)).resolves.toMatchObject({ ok: true });
+  });
   it('allows gallery queries and CG metadata changes only for the control center', async () => {
     const query: IpcRequest = { ...getSnapshot, method: 'gallery/list', payload: { filter: 'ALL', offset: 0, limit: 12 } };
     const favorite = dispatch({ ...common, type: 'CG_SET_FAVORITE', payload: { petId: 'pet-a', cgId: 'morning-dew', variant: 'default', favorite: true } });

@@ -1,9 +1,9 @@
 import {
-  CONTRACT_SCHEMA_VERSION, appSnapshotSchema, galleryIpcResultSchema, ipcRequestSchema,
+  CONTRACT_SCHEMA_VERSION, appSnapshotSchema, charactersIpcResultSchema, galleryIpcResultSchema, ipcRequestSchema,
   resultMatchesMethod, snapshotIpcResultSchema,
 } from '@pet-desktop/contracts';
 import type {
-  AppSnapshot, DomainCommand, GalleryIpcResult, GalleryQuery, IpcErrorCode, IpcRequest,
+  AppSnapshot, CharactersIpcResult, DomainCommand, GalleryIpcResult, GalleryQuery, IpcErrorCode, IpcRequest,
   IpcResult, SnapshotIpcResult,
 } from '@pet-desktop/contracts';
 import {
@@ -86,10 +86,20 @@ function subscribe<T>(ipc: DesktopIpcPort, channel: PushChannel, schema: Parser<
   return unsubscribe;
 }
 
+// Intentionally exhaustive: adding another authority method requires choosing
+// its exact parser, not silently defaulting to a broad union or snapshot shape.
+const requestResultParsers = {
+  'snapshot/get': snapshotIpcResultSchema,
+  'command/dispatch': snapshotIpcResultSchema,
+  'gallery/list': galleryIpcResultSchema,
+  'characters/list': charactersIpcResultSchema,
+} satisfies Record<IpcRequest['method'], Parser<IpcResult>>;
+
 /** Request and reply shapes are correlated by both id and closed request method.
- * In particular a gallery reply must not enter an ordinary snapshot/command API. */
+ * Catalog replies must not enter a different catalog or ordinary snapshot/command API. */
 function sendRequest(ipc: DesktopIpcPort, requestId: () => string, method: 'gallery/list', payload: unknown): Promise<GalleryIpcResult>;
-function sendRequest(ipc: DesktopIpcPort, requestId: () => string, method: Exclude<IpcRequest['method'], 'gallery/list'>, payload: unknown): Promise<SnapshotIpcResult>;
+function sendRequest(ipc: DesktopIpcPort, requestId: () => string, method: 'characters/list', payload: unknown): Promise<CharactersIpcResult>;
+function sendRequest(ipc: DesktopIpcPort, requestId: () => string, method: 'snapshot/get' | 'command/dispatch', payload: unknown): Promise<SnapshotIpcResult>;
 async function sendRequest(ipc: DesktopIpcPort, requestId: () => string, method: IpcRequest['method'], payload: unknown): Promise<IpcResult> {
   const id = requestId();
   const request = parse(ipcRequestSchema, {
@@ -98,9 +108,9 @@ async function sendRequest(ipc: DesktopIpcPort, requestId: () => string, method:
   if (request === undefined) return failure(id, 'INVALID_REQUEST', false);
   try {
     const response = await ipc.invoke(DESKTOP_IPC.request, request);
-    // Both parsers are strict; the gallery parser additionally checks that the
-    // gallery page and included snapshot use the same authority revision.
-    const result = parse<IpcResult>(method === 'gallery/list' ? galleryIpcResultSchema : snapshotIpcResultSchema, response);
+    // Catalog parsers additionally require coherence with the included
+    // authority snapshot (revision, and wallet for the character catalog).
+    const result = parse<IpcResult>(requestResultParsers[method], response);
     if (result === undefined || (result.ok ? result.requestId : result.error.requestId) !== id
       || !resultMatchesMethod(method, result)) {
       return failure(id, 'INTERNAL_ERROR', true);
@@ -181,5 +191,11 @@ export function createControlCenterBridge(ipc: DesktopIpcPort, requestId = newRe
     role: 'control-center',
     ...baseBridge(ipc, requestId),
     listGallery: (query: GalleryQuery) => sendRequest(ipc, requestId, 'gallery/list', query),
+    async listCharacters(...args: unknown[]): Promise<CharactersIpcResult> {
+      // This capability has no input. The rest parameter detects JS callers
+      // trying to supply their own data even when bypassing TypeScript.
+      if (args.length !== 0) return failure(requestId(), 'INVALID_REQUEST', false);
+      return sendRequest(ipc, requestId, 'characters/list', {});
+    },
   });
 }

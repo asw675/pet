@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { describe, expect, it } from 'vitest';
 import { advanceTrip, createTripCheckpoint, createTripSnapshot } from '@pet-desktop/domain';
-import { MIGRATION_001, SQLiteRepository } from '../src/sqlite-repository.ts';
+import { MIGRATION_001, MIGRATION_002, SQLiteRepository } from '../src/sqlite-repository.ts';
 
 const START = 1_700_000_000_000;
 const pet = (petId = 'pet-a') => ({
@@ -40,6 +40,24 @@ const receipt = () => ({
   createdAt: START,
 });
 
+const starterAcquisition = (petId = 'pet-a') => ({ petId, acquiredAt: START,
+  origin: 'STARTER', catalogVersion: 1, coinCost: 0, commandId: null });
+const gameAcquisition = (petId = 'pet-game', commandId = 'acquire-game') => ({ petId, acquiredAt: START+10,
+  origin: 'GAME', catalogVersion: 1, coinCost: 16, commandId });
+function successfulAcquireReceipt(acquisition, characterId = 'nova', catalogVersion = acquisition.catalogVersion,
+  resultPetId = acquisition.petId, resultCharacterId = characterId) {
+  return {
+    commandId: acquisition.commandId,
+    fingerprint: JSON.stringify({ commandId:acquisition.commandId,issuedAt:acquisition.acquiredAt,
+      payload:{catalogVersion,characterId},type:'PET_ACQUIRE' }),
+    outcome:{ok:true,snapshot:{revision:1,primaryPetId:resultPetId,pets:[{
+      petId:resultPetId,characterId:resultCharacterId,nickname:'诺瓦',presence:'HOME',activity:'IDLE',mood:'CALM',
+      healthStatus:'NORMAL',visibility:'HIDDEN',moodScore:50,healthPoints:100,energy:100,bond:0,level:1,xp:0,revision:0,
+    }],walletCoins:0,doNotDisturb:false,pausedRender:false}},
+    createdAt:acquisition.acquiredAt,
+  };
+}
+
 function withMemory(action) {
   const db = new DatabaseSync(':memory:');
   const repo = new SQLiteRepository(db, { persistent: false });
@@ -59,6 +77,7 @@ function rewardLine(trip, kind, targetId, amount) {
 }
 
 const OLD_MIGRATION_CHECKSUM = 'fnv1a32:9d3ced6f'; // Measured against the committed v1 repository.
+const OLD_MIGRATION_002_CHECKSUM = 'fnv1a32:a0036d79'; // Measured against committed 7fca3d0.
 const hash = 'a'.repeat(64);
 function departurePin(trip, version = '1.0.0', assetHash = hash) {
   return { tripId: trip.snapshot.tripId, petId: trip.snapshot.petId, cgId: 'postcard', variant: 'default',
@@ -127,6 +146,53 @@ function createV1Archive(db) {
   }
 }
 
+/** Genuine v2 archive: apply the original v1 and v2 SQL in order, preserve
+ * their historical checksums, then append a real v2 pinned CG and receipt. */
+function createV2Archive(db) {
+  const legacy = createV1Archive(db);
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    db.exec(MIGRATION_002);
+    db.prepare('INSERT INTO schema_migrations VALUES(2, ?, ?)').run(OLD_MIGRATION_002_CHECKSUM, START+1);
+    db.exec('PRAGMA user_version=2');
+    db.prepare('INSERT INTO pets VALUES (?, ?, ?, ?)').run('pet-c','character-a','pinned pet',2);
+    db.prepare('INSERT INTO pet_states VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run('pet-c','HOME','IDLE','HAPPY','NORMAL','HIDDEN',800,1000,700,200);
+    db.prepare('INSERT INTO pet_progression VALUES (?, ?, ?)').run('pet-c',100,4);
+    const trip = tripRecord('trip-v2','pet-c',START+200), s = trip.snapshot, c = trip.checkpoint;
+    db.prepare(`INSERT INTO trips(trip_id,pet_id,route_id,status,seed,snapshot_json,checkpoint_json,json_schema_version,
+      start_at,expected_return_at,actual_returned_at,next_due_at,rules_version,cg_pin_schema)
+      VALUES (?, ?, ?, 'TRAVELING', ?, ?, ?, 1, ?, ?, ?, ?, ?, 2)`)
+      .run(s.tripId,s.petId,s.routeId,s.seed,JSON.stringify(s),JSON.stringify(c),s.startAt,s.expectedReturnAt,c.actualReturnedAt,c.nextDueAt,s.rulesVersion);
+    const pin = departurePin(trip);
+    db.prepare('INSERT INTO trip_cg_asset_pins VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)').run(pin.tripId,pin.petId,pin.cgId,pin.variant,
+      pin.characterId,pin.eventDefId,pin.assetRef.state,pin.assetRef.assetVersion,pin.assetRef.assetHash);
+    const completed = advanceTrip(s,c,s.expectedReturnAt), settledAt = completed.checkpoint.actualReturnedAt;
+    for (const fact of completed.facts) {
+      db.prepare('INSERT INTO trip_events VALUES (?, ?, ?, ?, ?, ?, ?, 1)').run(fact.tripId,fact.petId,fact.sequence,fact.eventId,
+        fact.scheduledAt,fact.type,JSON.stringify(fact.payload));
+    }
+    db.prepare('INSERT INTO settlements VALUES (?, ?, ?, 1)').run(s.tripId,settledAt,JSON.stringify(completed.rewardDraft));
+    const line = rewardLine(trip,'CG','postcard:default',1);
+    db.prepare('INSERT INTO reward_ledger VALUES (?, ?, ?, ?, ?, ?, ?)').run(line.rewardKey,line.sourceType,line.sourceId,line.petId,line.kind,line.targetId,line.amount);
+    const input = { petId:s.petId,cgId:pin.cgId,variant:pin.variant,sourceTripId:s.tripId,unlockedAt:settledAt };
+    db.prepare(`INSERT INTO cg_unlocks(pet_id,cg_id,variant,source_trip_id,unlocked_at,asset_state,historical_character_id,historical_event_def_id,asset_version,asset_hash)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(input.petId,input.cgId,input.variant,input.sourceTripId,input.unlockedAt,pin.assetRef.state,
+      pin.characterId,pin.eventDefId,pin.assetRef.assetVersion,pin.assetRef.assetHash);
+    db.prepare('INSERT INTO trip_reports VALUES (?,?)').run(s.tripId,settledAt+1);
+    db.prepare("UPDATE trips SET status='SETTLED',checkpoint_json=?,actual_returned_at=?,next_due_at=NULL WHERE trip_id=?")
+      .run(JSON.stringify(completed.checkpoint),settledAt,s.tripId);
+    const viewAt = settledAt+2;
+    db.prepare('UPDATE cg_unlocks SET favorite=1,viewed_at=? WHERE pet_id=? AND cg_id=? AND variant=?').run(viewAt,input.petId,input.cgId,input.variant);
+    const command = receipt();
+    db.prepare('INSERT INTO commands VALUES (?, ?, ?, 1, ?)').run(command.commandId,command.fingerprint,JSON.stringify(command.outcome),command.createdAt);
+    db.exec('COMMIT');
+    return { ...legacy, trip: { ...trip, checkpoint:completed.checkpoint,status:'SETTLED',reportReadAt:settledAt+1 }, pin, cg:unlocked(input,pin,true,viewAt), command, line };
+  } catch (error) {
+    db.exec('ROLLBACK');
+    throw error;
+  }
+}
+
 describe('SQLite repository — schema and engine', () => {
   it('marks a writer unavailable when transaction rollback itself fails', () => {
     const db = new DatabaseSync(':memory:');
@@ -152,19 +218,20 @@ describe('SQLite repository — schema and engine', () => {
     }
   });
 
-  it('creates v1 and v2 in contiguous order with verified pragmas and no memory tables', () => withMemory((repo, db) => {
+  it('creates v1 through v3 in contiguous order with verified pragmas and no memory tables', () => withMemory((repo, db) => {
     expect(db.prepare('PRAGMA journal_mode').get().journal_mode).toBe('memory');
     expect(db.prepare('PRAGMA foreign_keys').get().foreign_keys).toBe(1);
     expect(db.prepare('PRAGMA synchronous').get().synchronous).toBe(2);
     expect(db.prepare('PRAGMA busy_timeout').get().timeout).toBe(5000);
-    expect(db.prepare('PRAGMA user_version').get().user_version).toBe(2);
+    expect(db.prepare('PRAGMA user_version').get().user_version).toBe(3);
     const history = db.prepare('SELECT version, checksum FROM schema_migrations ORDER BY version').all();
-    expect(history.map(row => row.version)).toEqual([1,2]);
+    expect(history.map(row => row.version)).toEqual([1,2,3]);
     expect(history[0].checksum).toBe(OLD_MIGRATION_CHECKSUM);
-    expect(history[1].checksum).toMatch(/^fnv1a32:[0-9a-f]{8}$/);
+    expect(history[1].checksum).toBe(OLD_MIGRATION_002_CHECKSUM);
+    expect(history[2].checksum).toMatch(/^fnv1a32:[0-9a-f]{8}$/);
     expect(db.prepare('SELECT name FROM sqlite_temp_schema').all()).toEqual([]);
     expect(db.prepare("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all().map(row => row.name)).toEqual([
-      'cg_unlocks', 'commands', 'inventory', 'outbox', 'pet_progression', 'pet_states', 'pets', 'preferences',
+      'cg_unlocks', 'commands', 'inventory', 'outbox', 'pet_acquisitions', 'pet_progression', 'pet_states', 'pets', 'preferences',
       'reward_ledger', 'schema_migrations', 'settlements', 'trip_cg_asset_pins', 'trip_events', 'trip_reports', 'trips', 'wallet',
     ]);
     expect(repo.transaction(tx => [tx.getPreferences(), tx.listPets(), tx.listTrips(), tx.getWalletCoins()])).toEqual([null, [], [], 0]);
@@ -250,11 +317,11 @@ describe('SQLite repository — real v1 archive migration', () => {
   it('verifies the old archive, runs a synchronous backup outside the transaction, preserves history and settles legacy in-flight only as unversioned', () => withFile(path => {
     const db = new DatabaseSync(path);
     const { old, active, oldUnlock, final } = createV1Archive(db);
-    const backupPath = `${path}.before-v2`;
+    const backupPath = `${path}.before-v3`;
     let callbacks = 0;
     const repo = new SQLiteRepository(db, { persistent: true, beforeMigration(from, to) {
       callbacks++;
-      expect([from,to]).toEqual([1,2]);
+      expect([from,to]).toEqual([1,3]);
       expect(db.prepare('PRAGMA user_version').get().user_version).toBe(1);
       expect(db.prepare('SELECT version, checksum FROM schema_migrations').all()).toEqual([{ version: 1, checksum: OLD_MIGRATION_CHECKSUM }]);
       expect(db.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
@@ -264,7 +331,7 @@ describe('SQLite repository — real v1 archive migration', () => {
     } });
     try {
       expect(callbacks).toBe(1);
-      expect(db.prepare('PRAGMA user_version').get().user_version).toBe(2);
+      expect(db.prepare('PRAGMA user_version').get().user_version).toBe(3);
       expect(db.prepare('SELECT trip_id, cg_pin_schema FROM trips ORDER BY trip_id').all()).toEqual([
         { trip_id: 'trip-legacy', cg_pin_schema: 1 }, { trip_id: 'trip-old', cg_pin_schema: 1 },
       ]);
@@ -273,6 +340,8 @@ describe('SQLite repository — real v1 archive migration', () => {
         expect(tx.listInventory()).toEqual([{ itemId: 'herb', quantity: 2 }]);
         expect(tx.getPreferences()).toEqual({ revision: 4, logicalTime: START + 123, primaryPetId: 'pet-a', doNotDisturb: true, pausedRender: false });
         expect(tx.getPet('pet-a').nickname).toBe('legacy pet-a');
+        expect(tx.getPetAcquisition('pet-a')).toBeNull();
+        expect(tx.getPetAcquisition('pet-b')).toBeNull();
         expect(tx.getTrip('trip-old')).toEqual({ ...old, checkpoint: final.checkpoint, status: 'SETTLED', reportReadAt: final.checkpoint.actualReturnedAt + 1 });
         expect(tx.listTripFacts('trip-old')).toEqual(final.facts);
         expect(tx.getCgUnlock('pet-a', 'postcard', 'default')).toEqual(unlocked(oldUnlock));
@@ -300,12 +369,12 @@ describe('SQLite repository — real v1 archive migration', () => {
       } finally { backup.close(); }
     } finally { repo.close(); }
     const reopened = new DatabaseSync(path);
-    const v2 = new SQLiteRepository(reopened, { persistent: true, beforeMigration() { throw new Error('should not back up v2 again'); } });
+    const v3 = new SQLiteRepository(reopened, { persistent: true, beforeMigration() { throw new Error('should not back up v3 again'); } });
     try {
-      expect(v2.transaction(tx => tx.listCgUnlocks('pet-a'))).toEqual([unlocked(oldUnlock)]);
+      expect(v3.transaction(tx => tx.listCgUnlocks('pet-a'))).toEqual([unlocked(oldUnlock)]);
       expect(reopened.prepare('PRAGMA integrity_check').all().map(row => row.integrity_check)).toEqual(['ok']);
       expect(reopened.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
-    } finally { v2.close(); }
+    } finally { v3.close(); }
   }));
 
   it('refuses to mutate a persistent v1 archive without a successful synchronous backup callback', () => withFile(path => {
@@ -359,24 +428,25 @@ describe('SQLite repository — real v1 archive migration', () => {
       expect(db.prepare('SELECT name FROM sqlite_schema WHERE name=?').get('trip_cg_asset_pins')).toBeUndefined();
       const repo = new SQLiteRepository(db, { persistent: true, beforeMigration });
       expect(backups).toBe(2);
+      expect(db.prepare('PRAGMA user_version').get().user_version).toBe(3);
       expect(repo.transaction(tx => tx.getCgUnlock('pet-a','postcard','default'))).toEqual(unlocked(oldUnlock));
     } finally { db.close(); }
   }));
 
-  it('verifies both applied checksums and refuses missing or noncontiguous history on v2 startup', () => withFile(path => {
+  it('verifies all three applied checksums and refuses missing or noncontiguous history on v3 startup', () => withFile(path => {
     const initial = new DatabaseSync(path);
     new SQLiteRepository(initial, { persistent: true }).close();
     const db = new DatabaseSync(path);
     try {
-      const v2 = db.prepare('SELECT checksum FROM schema_migrations WHERE version=2').get().checksum;
-      for (const [version, checksum] of [[1, OLD_MIGRATION_CHECKSUM],[2,v2]]) {
+      const v3 = db.prepare('SELECT checksum FROM schema_migrations WHERE version=3').get().checksum;
+      for (const [version, checksum] of [[1, OLD_MIGRATION_CHECKSUM],[2, OLD_MIGRATION_002_CHECKSUM],[3,v3]]) {
         db.prepare("UPDATE schema_migrations SET checksum='bad' WHERE version=?").run(version);
         expect(() => new SQLiteRepository(db, { persistent: true })).toThrow(/checksum mismatch/);
         db.prepare('UPDATE schema_migrations SET checksum=? WHERE version=?').run(checksum, version);
       }
-      db.exec('UPDATE schema_migrations SET version=3 WHERE version=2');
+      db.exec('UPDATE schema_migrations SET version=4 WHERE version=2');
       expect(() => new SQLiteRepository(db, { persistent: true })).toThrow(/not contiguous/);
-      db.exec('DELETE FROM schema_migrations WHERE version=3');
+      db.exec('DELETE FROM schema_migrations WHERE version=4');
       expect(() => new SQLiteRepository(db, { persistent: true })).toThrow(/history is invalid/);
     } finally { db.close(); }
   }));
@@ -395,6 +465,95 @@ describe('SQLite repository — real v1 archive migration', () => {
       expect(repo.transaction(tx => tx.listCgUnlocks('pet-a'))).toEqual([]);
     } finally { db.close(); }
   });
+});
+
+describe('SQLite repository — genuine v2 acquisition migration', () => {
+  it('preserves pinned CG/trips/receipt and legacy pets while invoking one v2→v3 pre-backup', () => withFile(path => {
+    const db = new DatabaseSync(path), fixture = createV2Archive(db);
+    const backupPath = `${path}.v2-copy`;
+    let calls = 0;
+    const repo = new SQLiteRepository(db, { persistent:true,beforeMigration(from,to) {
+      calls++;
+      expect([from,to]).toEqual([2,3]);
+      expect(db.prepare('PRAGMA user_version').get().user_version).toBe(2);
+      expect(db.prepare('SELECT version, checksum FROM schema_migrations ORDER BY version').all()).toEqual([
+        {version:1,checksum:OLD_MIGRATION_CHECKSUM},{version:2,checksum:OLD_MIGRATION_002_CHECKSUM},
+      ]);
+      expect(db.prepare('SELECT name FROM sqlite_schema WHERE name=?').get('pet_acquisitions')).toBeUndefined();
+      db.prepare('VACUUM INTO ?').run(backupPath);
+    } });
+    try {
+      expect(calls).toBe(1);
+      expect(db.prepare('PRAGMA user_version').get().user_version).toBe(3);
+      expect(db.prepare('SELECT * FROM pet_acquisitions').all()).toEqual([]);
+      repo.transaction(tx => {
+        expect(tx.listPets().map(p=>p.petId)).toEqual(['pet-a','pet-b','pet-c']);
+        expect(tx.getPet('pet-c').nickname).toBe('pinned pet');
+        for (const petId of ['pet-a','pet-b','pet-c','absent']) expect(tx.getPetAcquisition(petId)).toBeNull();
+        expect(tx.getTrip('trip-v2')).toEqual(fixture.trip);
+        expect(tx.getTrip('trip-legacy')).toEqual(fixture.active);
+        expect(tx.listTripCgAssetPins('trip-v2')).toEqual([fixture.pin]);
+        expect(tx.getCgUnlock('pet-c','postcard','default')).toEqual(fixture.cg);
+        expect(tx.getCgUnlock('pet-a','postcard','default')).toEqual(unlocked(fixture.oldUnlock));
+        expect(tx.listRewards('trip-v2')).toEqual([fixture.line]);
+        expect(tx.getCommandReceipt(fixture.command.commandId)).toEqual(fixture.command);
+        expect(tx.getWalletCoins()).toBe(42);
+      });
+      expect(db.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
+      const backup = new DatabaseSync(backupPath);
+      try {
+        expect(backup.prepare('PRAGMA user_version').get().user_version).toBe(2);
+        expect(backup.prepare('SELECT name FROM sqlite_schema WHERE name=?').get('pet_acquisitions')).toBeUndefined();
+        expect(backup.prepare('SELECT asset_version,asset_hash,favorite,viewed_at FROM cg_unlocks WHERE pet_id=?').get('pet-c')).toEqual({
+          asset_version:fixture.pin.assetRef.assetVersion,asset_hash:fixture.pin.assetRef.assetHash,favorite:1,viewed_at:fixture.cg.viewedAt,
+        });
+        expect(backup.prepare('SELECT fingerprint FROM commands WHERE command_id=?').get(fixture.command.commandId).fingerprint).toBe(fixture.command.fingerprint);
+      } finally { backup.close(); }
+    } finally { repo.close(); }
+  }));
+
+  it('stops a v2 upgrade on missing/failed backup without touching original pinned records or history', () => withFile(path => {
+    const db = new DatabaseSync(path);
+    createV2Archive(db);
+    const before = {
+      history:db.prepare('SELECT * FROM schema_migrations ORDER BY version').all(),
+      pets:db.prepare('SELECT * FROM pets ORDER BY pet_id').all(),
+      pins:db.prepare('SELECT * FROM trip_cg_asset_pins').all(),
+      cgs:db.prepare('SELECT * FROM cg_unlocks ORDER BY pet_id').all(),
+      commands:db.prepare('SELECT * FROM commands').all(),
+      trips:db.prepare('SELECT * FROM trips ORDER BY trip_id').all(),
+    };
+    try {
+      expect(() => new SQLiteRepository(db,{persistent:true})).toThrow(/pre-migration backup callback/);
+      expect(() => new SQLiteRepository(db,{persistent:true,beforeMigration(){throw new Error('v2 backup failed');}})).toThrow(/v2 backup failed/);
+      expect(db.prepare('PRAGMA user_version').get().user_version).toBe(2);
+      expect(db.prepare('SELECT name FROM sqlite_schema WHERE name=?').get('pet_acquisitions')).toBeUndefined();
+      expect({history:db.prepare('SELECT * FROM schema_migrations ORDER BY version').all(),pets:db.prepare('SELECT * FROM pets ORDER BY pet_id').all(),
+        pins:db.prepare('SELECT * FROM trip_cg_asset_pins').all(),cgs:db.prepare('SELECT * FROM cg_unlocks ORDER BY pet_id').all(),
+        commands:db.prepare('SELECT * FROM commands').all(),trips:db.prepare('SELECT * FROM trips ORDER BY trip_id').all()}).toEqual(before);
+    } finally { db.close(); }
+  }));
+
+  it('rolls back v3 DDL after an injected failure and retries from the same valid v2 archive', () => withFile(path => {
+    const db = new DatabaseSync(path), fixture = createV2Archive(db);
+    const failing = { prepare:sql=>db.prepare(sql),close:()=>db.close(),
+      exec(sql){db.exec(sql);if(sql.includes('CREATE TABLE pet_acquisitions'))throw new Error('injected post-v3-DDL failure');} };
+    let backups=0;
+    const beforeMigration=()=>{backups++;};
+    try {
+      expect(()=>new SQLiteRepository(failing,{persistent:true,beforeMigration})).toThrow(/injected post-v3-DDL failure/);
+      expect(backups).toBe(1);
+      expect(db.prepare('PRAGMA user_version').get().user_version).toBe(2);
+      expect(db.prepare('SELECT version,checksum FROM schema_migrations ORDER BY version').all()).toEqual([
+        {version:1,checksum:OLD_MIGRATION_CHECKSUM},{version:2,checksum:OLD_MIGRATION_002_CHECKSUM},
+      ]);
+      expect(db.prepare('SELECT name FROM sqlite_schema WHERE name=?').get('pet_acquisitions')).toBeUndefined();
+      const repo=new SQLiteRepository(db,{persistent:true,beforeMigration});
+      expect(backups).toBe(2);
+      expect(repo.transaction(tx=>[tx.getCgUnlock('pet-c','postcard','default'),tx.getCommandReceipt(fixture.command.commandId),tx.getPetAcquisition('pet-c')]))
+        .toEqual([fixture.cg,fixture.command,null]);
+    } finally { db.close(); }
+  }));
 });
 
 describe('SQLite repository — transaction and constraints', () => {
@@ -504,6 +663,145 @@ describe('SQLite repository — transaction and constraints', () => {
     expect(() => repo.transaction(tx => tx.appendOutbox(event('event-a', 5)))).toThrow(/Conflicting outbox/);
     expect(repo.transaction(tx => tx.getCommandReceipt('command-a'))).toEqual(receipt());
     expect(repo.transaction(tx => tx.listOutbox(0, 1))).toEqual([{ seq: 1, event: event() }]);
+  }));
+});
+
+describe('SQLite repository — immutable pet acquisition and deferred receipt', () => {
+  it('records new starters once and roundtrips game metadata with a receipt written later in the same WAL transaction', () => withFile(path => {
+    const db = new DatabaseSync(path), repo = new SQLiteRepository(db,{persistent:true});
+    const starter = starterAcquisition(), nextStarter = starterAcquisition('pet-b'), acquired = gameAcquisition();
+    const receipt = successfulAcquireReceipt(acquired);
+    try {
+      repo.transaction(tx => {
+        tx.savePet(pet()); tx.savePet(pet('pet-b'));
+        expect(tx.getPetAcquisition('pet-a')).toBeNull();
+        tx.insertPetAcquisition(starter); tx.insertPetAcquisition(nextStarter);
+        expect(() => tx.insertPetAcquisition(starter)).toThrow(/immutable and unique/);
+        expect(tx.getPetAcquisition('pet-a')).toEqual(starter);
+        expect(tx.getPetAcquisition('pet-b')).toEqual(nextStarter);
+        tx.setWalletCoins(16);
+        tx.savePet({...pet(acquired.petId),characterId:'nova',nickname:'诺瓦',visibility:'HIDDEN'});
+        tx.setWalletCoins(0);
+        tx.insertPetAcquisition(acquired);
+        // FK permits this temporary state but requires the exact successful
+        // command receipt by COMMIT.
+        expect(tx.getCommandReceipt(acquired.commandId)).toBeNull();
+        expect(tx.getPetAcquisition(acquired.petId)).toEqual(acquired);
+        tx.saveCommandReceipt(receipt);
+        tx.saveCommandReceipt(receipt);
+      });
+    } finally { repo.close(); }
+    const reopened = new DatabaseSync(path), after = new SQLiteRepository(reopened,{persistent:true});
+    try {
+      expect(after.transaction(tx=>[tx.getPetAcquisition(starter.petId),tx.getPetAcquisition(nextStarter.petId),tx.getPetAcquisition(acquired.petId),tx.getCommandReceipt(acquired.commandId),tx.getWalletCoins()]))
+        .toEqual([starter,nextStarter,acquired,receipt,0]);
+      expect(reopened.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
+      expect(reopened.prepare('PRAGMA integrity_check').all().map(r=>r.integrity_check)).toEqual(['ok']);
+    } finally { after.close(); }
+  }));
+
+  it('rolls back pet creation and shared coin debit when the deferred GAME receipt is missing', () => withMemory(repo => {
+    const acquired=gameAcquisition();
+    repo.transaction(tx=>tx.setWalletCoins(16));
+    expect(()=>repo.transaction(tx=>{
+      tx.savePet({...pet(acquired.petId),characterId:'nova'});
+      tx.setWalletCoins(0);
+      tx.insertPetAcquisition(acquired);
+      expect(tx.getPetAcquisition(acquired.petId)).toEqual(acquired);
+    })).toThrow(/foreign key/i);
+    expect(repo.transaction(tx=>[tx.getPet(acquired.petId),tx.getPetAcquisition(acquired.petId),tx.getWalletCoins(),tx.getCommandReceipt(acquired.commandId)]))
+      .toEqual([null,null,16,null]);
+  }));
+
+  it('rejects wrong command types, characters, versions, acquisition time, outcomes and result pet identity, with rollback', () => withMemory(repo => {
+    const acquired=gameAcquisition(), valid=successfulAcquireReceipt(acquired);
+    const wrongType={...valid,fingerprint:JSON.stringify({commandId:acquired.commandId,issuedAt:acquired.acquiredAt,
+      payload:{enabled:true,flag:'doNotDisturb'},type:'APP_SET_MODE'})};
+    const unsuccessful={...valid,outcome:{ok:false,error:{code:'BUSINESS_RULE',message:'denied',retryable:false}}};
+    const invalidReceipts=[wrongType,successfulAcquireReceipt(acquired,'star-singer'),successfulAcquireReceipt(acquired,'nova',2),
+      successfulAcquireReceipt(acquired,'nova',1,'other-pet'),successfulAcquireReceipt(acquired,'nova',1,acquired.petId,'star-singer'),
+      {...valid,createdAt:acquired.acquiredAt+1},unsuccessful];
+    repo.transaction(tx=>tx.setWalletCoins(16));
+    for(const wrong of invalidReceipts){
+      expect(()=>repo.transaction(tx=>{
+        tx.savePet({...pet(acquired.petId),characterId:'nova'});
+        tx.setWalletCoins(0);tx.insertPetAcquisition(acquired);tx.saveCommandReceipt(wrong);
+      })).toThrow(/exact immutable successful receipt/);
+      expect(repo.transaction(tx=>[tx.getPet(acquired.petId),tx.getPetAcquisition(acquired.petId),tx.getWalletCoins(),tx.getCommandReceipt(acquired.commandId)]))
+        .toEqual([null,null,16,null]);
+    }
+  }));
+
+  it('refuses to attach an acquisition to any already-existing command receipt, even a valid historical command', () => withMemory(repo => {
+    const acquired=gameAcquisition();
+    repo.transaction(tx=>{tx.savePet({...pet(acquired.petId),characterId:'nova'});tx.saveCommandReceipt(receipt());});
+    expect(()=>repo.transaction(tx=>tx.insertPetAcquisition({...acquired,commandId:'command-a'}))).toThrow(/receipt already exists/);
+    const prior=gameAcquisition(acquired.petId,'prior-success'), oldSuccess=successfulAcquireReceipt(prior);
+    oldSuccess.fingerprint=JSON.stringify({commandId:prior.commandId,issuedAt:prior.acquiredAt,
+      payload:{enabled:true,flag:'doNotDisturb'},type:'APP_SET_MODE'});
+    repo.transaction(tx=>tx.saveCommandReceipt(oldSuccess));
+    expect(()=>repo.transaction(tx=>tx.insertPetAcquisition(prior))).toThrow(/receipt already exists/);
+    expect(repo.transaction(tx=>tx.getPetAcquisition(acquired.petId))).toBeNull();
+  }));
+
+  it('disallows an orphan successful acquisition receipt, allows ordinary failure receipt, and forbids retroactive success or sidecar attachment', () => withMemory((repo,db) => {
+    const acquired=gameAcquisition(), valid=successfulAcquireReceipt(acquired);
+    repo.transaction(tx=>tx.savePet({...pet(acquired.petId),characterId:'nova'}));
+    expect(()=>repo.transaction(tx=>tx.saveCommandReceipt(valid))).toThrow(/exact immutable successful receipt/);
+    expect(repo.transaction(tx=>tx.getCommandReceipt(acquired.commandId))).toBeNull();
+    const failure={...valid,outcome:{ok:false,error:{code:'BUSINESS_RULE',message:'not enough coins',retryable:false}}};
+    repo.transaction(tx=>tx.saveCommandReceipt(failure));
+    expect(repo.transaction(tx=>[tx.getCommandReceipt(acquired.commandId),tx.getPetAcquisition(acquired.petId)])).toEqual([failure,null]);
+    expect(()=>repo.transaction(tx=>tx.insertPetAcquisition(acquired))).toThrow(/receipt already exists/);
+    expect(()=>db.prepare('UPDATE commands SET outcome_json=? WHERE command_id=?').run(JSON.stringify(valid.outcome),acquired.commandId))
+      .toThrow(/cannot be retroactively added/);
+    expect(repo.transaction(tx=>tx.getCommandReceipt(acquired.commandId))).toEqual(failure);
+  }));
+
+  it('validates closed records, safe integers, origin-specific cost/command and immediate pet FK', () => withMemory((repo,db) => {
+    const starter=starterAcquisition(), invalid=[{...starter,acquiredAt:-1},{...starter,acquiredAt:1.5},{...starter,catalogVersion:0},
+      {...starter,coinCost:1},{...starter,coinCost:Number.MAX_SAFE_INTEGER+1},{...starter,commandId:'unexpected'},
+      {...starter,origin:'LEGACY'},{...starter,origin:'GAME'},{...starter,origin:'GAME',commandId:'invalid id'},
+      {...starter,extra:'unexpected'},{petId:starter.petId}];
+    repo.transaction(tx=>tx.savePet(pet()));
+    for(const value of invalid) expect(()=>repo.transaction(tx=>tx.insertPetAcquisition(value))).toThrow();
+    expect(()=>repo.transaction(tx=>tx.insertPetAcquisition(starterAcquisition('absent')))).toThrow(/foreign key/i);
+    expect(()=>db.prepare('INSERT INTO pet_acquisitions VALUES (?, ?, ?, ?, ?, ?)').run('pet-a',START,'STARTER',1,9,null)).toThrow(/check constraint/i);
+    expect(()=>db.prepare('INSERT INTO pet_acquisitions VALUES (?, ?, ?, ?, ?, ?)').run('pet-a',START,'GAME',1,0,null)).toThrow(/check constraint/i);
+    expect(repo.transaction(tx=>tx.getPetAcquisition('pet-a'))).toBeNull();
+    // Corrupt persisted data is not silently read as a valid acquisition even
+    // if a broken external tool bypassed SQLite CHECK constraints.
+    db.exec('PRAGMA ignore_check_constraints=ON');
+    db.prepare('INSERT INTO pet_acquisitions VALUES (?, ?, ?, ?, ?, ?)').run('pet-a',START,'STARTER',1,9,null);
+    expect(()=>repo.transaction(tx=>tx.getPetAcquisition('pet-a'))).toThrow(/contradicts its cost/);
+  }));
+
+  it('prevents duplicate command reuse and record/receipt mutation via UPDATE, DELETE or REPLACE while allowing rename and ordinary pet changes', () => withMemory((repo,db) => {
+    const acquired=gameAcquisition(), correct=successfulAcquireReceipt(acquired);
+    // Even when the snapshot contains a second same-template instance, a
+    // single command receipt cannot authorize two acquisition records.
+    correct.outcome.snapshot.pets.push({...correct.outcome.snapshot.pets[0],petId:'other-pet'});
+    repo.transaction(tx=>{tx.savePet({...pet(acquired.petId),characterId:'nova'});tx.savePet({...pet('other-pet'),characterId:'nova'});
+      tx.insertPetAcquisition(acquired);tx.saveCommandReceipt(correct);});
+    expect(()=>repo.transaction(tx=>{
+      const duplicate=gameAcquisition('other-pet',acquired.commandId);
+      tx.savePet({...pet(duplicate.petId),characterId:'nova'});tx.insertPetAcquisition(duplicate);
+    })).toThrow(/immutable and unique|receipt already exists/);
+    expect(()=>db.exec('UPDATE pet_acquisitions SET acquired_at=acquired_at+1')).toThrow(/immutable/);
+    expect(()=>db.exec('DELETE FROM pet_acquisitions')).toThrow(/immutable/);
+    expect(()=>db.exec('INSERT OR REPLACE INTO pet_acquisitions SELECT * FROM pet_acquisitions')).toThrow(/immutable and unique|receipt already exists/);
+    expect(()=>db.exec("UPDATE commands SET outcome_json='{}' WHERE command_id='acquire-game'")).toThrow(/receipt is immutable/);
+    expect(()=>db.exec("DELETE FROM commands WHERE command_id='acquire-game'")).toThrow(/receipt is immutable/);
+    expect(()=>db.exec("INSERT OR REPLACE INTO commands SELECT * FROM commands WHERE command_id='acquire-game'")).toThrow(/immutable successful receipt/);
+    expect(()=>repo.transaction(tx=>tx.savePet({...tx.getPet(acquired.petId),characterId:'star-singer'}))).toThrow(/acquired pet character is immutable/);
+    expect(()=>db.prepare('INSERT OR REPLACE INTO pets VALUES (?, ?, ?, ?)').run(acquired.petId,'star-singer','different',1)).toThrow(/acquired pet character is immutable/);
+    repo.transaction(tx=>{tx.savePet({...tx.getPet(acquired.petId),nickname:'诺瓦改名',xp:9,revision:1});});
+    expect(repo.transaction(tx=>[tx.getPet(acquired.petId).nickname,tx.getPet(acquired.petId).xp,tx.getPetAcquisition(acquired.petId),tx.getCommandReceipt(acquired.commandId)]))
+      .toEqual(['诺瓦改名',9,acquired,correct]);
+    // Legacy instances without acquisition history retain the old storage
+    // behavior until a later explicit migration/feature changes it.
+    repo.transaction(tx=>{tx.savePet(pet('legacy'));tx.savePet({...tx.getPet('legacy'),characterId:'new-character'});});
+    expect(repo.transaction(tx=>[tx.getPet('legacy').characterId,tx.getPetAcquisition('legacy')])).toEqual(['new-character',null]);
   }));
 });
 

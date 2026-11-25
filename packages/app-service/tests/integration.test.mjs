@@ -7,6 +7,7 @@ import { verifyMigrationBackup } from '../src/migration-backup.ts';
 import { MIGRATION_001, SQLiteRepository } from '../src/sqlite-repository.ts';
 import { advanceTrip, createTripCheckpoint, createTripSnapshot, DEMO_ROUTE } from '@pet-desktop/domain';
 import { findBuiltinCg } from '@pet-desktop/domain/cg-catalog';
+import { CHARACTER_CATALOG_VERSION } from '@pet-desktop/domain/character-catalog';
 
 const initialTime = 1_800_000_000_000;
 const minutes = (n) => n * 60_000;
@@ -71,6 +72,14 @@ function readGallery(service, query = {}) {
     payload: { filter: 'ALL', offset: 0, limit: 50, ...query } });
   expect(result.ok).toBe(true);
   expect(result.gallery.revision).toBe(result.snapshot.revision);
+  return result;
+}
+
+function readCharacters(service) {
+  const result = service.handleRequest({ schemaVersion: 1, requestId: 'characters-query', method: 'characters/list', payload: {} });
+  expect(result.ok).toBe(true);
+  expect(result.characters.revision).toBe(result.snapshot.revision);
+  expect(result.characters.walletCoins).toBe(result.snapshot.walletCoins);
   return result;
 }
 
@@ -368,6 +377,9 @@ describe.skipIf(!supported)('application service + real SQLite persisted integra
     let instance = f.open((repo) => repo, { beforeMigration });
     expect(backupInvoked).toBe(true);
     expect(instance.repo.transaction((tx) => tx.listTripCgAssetPins(tripId))).toEqual([]);
+    expect(instance.repo.transaction((tx) => tx.getPetAcquisition(petId))).toBeNull();
+    expect(readCharacters(instance.service).characters.rows.find(row => row.characterId === 'star-singer')?.instances)
+      .toEqual([{ petId, nickname: '星咏', origin: 'LEGACY', acquiredAt: null }]);
     const settled = readGallery(instance.service, { petId });
     expect(settled.snapshot.walletCoins).toBe(8);
     expect(settled.gallery.rows).toHaveLength(1);
@@ -383,6 +395,78 @@ describe.skipIf(!supported)('application service + real SQLite persisted integra
     instance = f.open();
     expect(readGallery(instance.service, { petId, filter: 'FAVORITES' }).gallery.rows[0]).toMatchObject({ favorite: true,
       assetRef: { state: 'LEGACY_UNVERSIONED' }, viewedAt: null });
+    instance.close();
+  });
+
+  it('atomically acquires a new character with earned coins, rolls back failure, persists across restart and renames in flight', () => {
+    const f = fixture();
+    let failAcquisition = false;
+    let instance = f.open((repo) => ({
+      close: () => repo.close(),
+      transaction: (action) => repo.transaction((tx) => action(new Proxy(tx, {
+        get(target, key) {
+          if (key === 'appendOutbox' && failAcquisition) return (event) => {
+            if (event.type === 'PetAcquired') throw new Error('simulated acquisition failure');
+            return target.appendOutbox(event);
+          };
+          const value = Reflect.get(target, key);
+          return typeof value === 'function' ? value.bind(target) : value;
+        },
+      }))),
+    }));
+    const initial = readCharacters(instance.service);
+    expect(initial.characters.rows[0].instances).toEqual([{ petId: 'pet-1', nickname: '星咏', origin: 'STARTER', acquiredAt: initialTime }]);
+    expect(instance.repo.transaction(tx => tx.getPetAcquisition('pet-2'))).toEqual({ petId: 'pet-2', acquiredAt: initialTime,
+      origin: 'STARTER', catalogVersion: CHARACTER_CATALOG_VERSION, coinCost: 0, commandId: null });
+    for (let trip = 0; trip < 3; trip++) {
+      expectSuccess(f.request(instance.service, f.command('TRIP_START', { petId: 'pet-1', routeId: DEMO_ROUTE.routeId })));
+      f.advance(initialTime + minutes(15 * (trip + 1)));
+      instance.service.getSnapshot();
+    }
+    const unlocked = readCharacters(instance.service);
+    expect(unlocked.characters.settledTrips).toBe(3);
+    expect(unlocked.characters.walletCoins).toBe(24);
+    expect(unlocked.characters.rows.find(row => row.characterId === 'nova').availability).toBe('AVAILABLE');
+    const purchase = f.command('PET_ACQUIRE', { characterId: 'nova', catalogVersion: CHARACTER_CATALOG_VERSION },
+      'nova-purchase-once', unlocked.snapshot.revision);
+    const durableState = () => instance.repo.transaction(tx => ({ preferences: tx.getPreferences(), coins: tx.getWalletCoins(),
+      pets: tx.listPets(), acquisitions: tx.listPets().map(pet => tx.getPetAcquisition(pet.petId)),
+      outbox: tx.listOutbox(0, 100), receipt: tx.getCommandReceipt(purchase.commandId) }));
+    const before = durableState();
+    failAcquisition = true;
+    expect(f.request(instance.service, purchase)).toMatchObject({ ok: false, error: { code: 'INTERNAL_ERROR' } });
+    expect(durableState()).toEqual(before);
+    failAcquisition = false;
+    const bought = expectSuccess(f.request(instance.service, purchase));
+    const obtained = bought.pets.find(pet => pet.characterId === 'nova');
+    expect(bought.walletCoins).toBe(8);
+    expect(obtained).toMatchObject({ presence: 'HOME', level: 1, xp: 0, visibility: 'HIDDEN', nickname: '诺瓦' });
+    const record = { petId: obtained.petId, acquiredAt: initialTime + minutes(45), origin: 'GAME',
+      catalogVersion: CHARACTER_CATALOG_VERSION, coinCost: 16, commandId: purchase.commandId };
+    expect(instance.repo.transaction(tx => tx.getPetAcquisition(obtained.petId))).toEqual(record);
+    expect(instance.repo.transaction(tx => tx.getPet(obtained.petId).power)).toBe(28);
+    expect(expectSuccess(f.request(instance.service, purchase))).toEqual(bought);
+    expect(f.request(instance.service, f.command('PET_ACQUIRE', { characterId: 'nova', catalogVersion: CHARACTER_CATALOG_VERSION })))
+      .toMatchObject({ ok: false, error: { code: 'BUSINESS_RULE' } });
+    const departed = expectSuccess(f.request(instance.service, f.command('TRIP_START', { petId: obtained.petId, routeId: DEMO_ROUTE.routeId })));
+    const tripId = departed.pets.find(pet => pet.petId === obtained.petId).trip.tripId;
+    const beforeTrip = instance.repo.transaction(tx => ({ trip: tx.getTrip(tripId), facts: tx.listTripFacts(tripId), pins: tx.listTripCgAssetPins(tripId) }));
+    const rename = f.command('PET_RENAME', { petId: obtained.petId, nickname: '  No\u0301va 诺瓦 ' }, 'nick-once');
+    const renamed = expectSuccess(f.request(instance.service, rename));
+    expect(renamed.pets.find(pet => pet.petId === obtained.petId)).toMatchObject({ nickname: 'Nóva 诺瓦', presence: 'AWAY', trip: { tripId } });
+    expect(instance.repo.transaction(tx => ({ trip: tx.getTrip(tripId), facts: tx.listTripFacts(tripId), pins: tx.listTripCgAssetPins(tripId) }))).toEqual(beforeTrip);
+    expect(instance.repo.transaction(tx => tx.getPetAcquisition(obtained.petId))).toEqual(record);
+    instance.close();
+    instance = f.open();
+    expect(instance.service.getSnapshot()).toEqual(renamed);
+    expect(readCharacters(instance.service).characters.rows.find(row => row.characterId === 'nova')).toMatchObject({ availability: 'ALREADY_OWNED', instances: [
+      { petId: obtained.petId, nickname: 'Nóva 诺瓦', origin: 'GAME', acquiredAt: record.acquiredAt },
+    ] });
+    expect(expectSuccess(f.request(instance.service, purchase))).toEqual(bought);
+    expect(expectSuccess(f.request(instance.service, rename))).toEqual(renamed);
+    expect(instance.repo.transaction(tx => tx.getPetAcquisition(obtained.petId))).toEqual(record);
+    expect(instance.repo.transaction(tx => tx.listOutbox(0, 100).filter(entry => entry.event.type === 'PetAcquired'))).toHaveLength(1);
+    expect(instance.repo.transaction(tx => tx.getWalletCoins())).toBe(8);
     instance.close();
   });
 });

@@ -36,8 +36,12 @@ function testBridge() {
     schemaVersion: 1, ok: true, requestId: 'gallery-request', snapshot: snapshot(0),
     gallery: { revision: 0, rows: [], total: 0, offset: query.offset, limit: query.limit },
   }));
+  const listCharacters = vi.fn<ControlCenterBridge['listCharacters']>().mockResolvedValue({
+    schemaVersion: 1, ok: true, requestId: 'characters-request', snapshot: snapshot(0),
+    characters: { revision: 0, catalogVersion: 1, settledTrips: 0, walletCoins: 0, rows: [] },
+  });
   const bridge: ControlCenterBridge = {
-    role: 'control-center', getServiceStatus, getSnapshot, dispatch, listGallery,
+    role: 'control-center', getServiceStatus, getSnapshot, dispatch, listGallery, listCharacters,
     openControlCenter: () => Promise.resolve({ ok: true }),
     subscribeSnapshot: (listener) => {
       snapshots.add(listener);
@@ -49,7 +53,7 @@ function testBridge() {
     },
   };
   return {
-    bridge, getServiceStatus, getSnapshot, dispatch, listGallery, snapshots, statuses,
+    bridge, getServiceStatus, getSnapshot, dispatch, listGallery, listCharacters, snapshots, statuses,
     emitSnapshot(app: AppSnapshot) { for (const listener of snapshots) listener(app); },
     emitStatus(status: ServiceStatus) { for (const listener of statuses) listener(status); },
   };

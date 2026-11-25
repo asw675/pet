@@ -7,13 +7,13 @@ import { advanceTrip, MAX_TRIP_FACTS, MAX_TRIP_NODES } from '@pet-desktop/domain
 import type { RewardDraft, TripCheckpoint, TripFact, TripSnapshot } from '@pet-desktop/domain';
 import type {
   AppRepository, AppTransaction, CgUnlock, CgUnlockInput, CommandOutcome, CommandReceipt, InventoryItem, OutboxRecord,
-  PetRecord, PreferencesRecord, RewardLine, SettlementRecord, SqliteConnection, TripCgAssetPin, TripRecord,
+  PetAcquisitionRecord, PetRecord, PreferencesRecord, RewardLine, SettlementRecord, SqliteConnection, TripCgAssetPin, TripRecord,
 } from './ports.js';
 
 const MAX_SAFE = Number.MAX_SAFE_INTEGER;
 const UINT32_MAX = 0xffff_ffff;
 const BUSY_TIMEOUT_MS = 5_000;
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 const JSON_SCHEMA_VERSION = 1;
 const MIGRATION_001_JSON_SCHEMA_VERSION = 1;
 const MIGRATION_001_MAX_TRIP_FACTS = 14;
@@ -190,7 +190,7 @@ const migration002HashCheck = (column: string) => `length(${column}) = 64 AND ${
 // Existing trips never acquire invented departure metadata. Only newly
 // inserted v2 trips may receive pins; old v1 in-flight trips can complete with
 // an explicit legacy reference. Copy old unlock identities without guessing.
-const MIGRATION_002 = `
+export const MIGRATION_002 = `
 ALTER TABLE trips ADD COLUMN cg_pin_schema INTEGER NOT NULL DEFAULT 1 CHECK (cg_pin_schema IN (1,2));
 CREATE TRIGGER freeze_trip_cg_pin_schema BEFORE UPDATE ON trips
 WHEN OLD.cg_pin_schema IS NOT NEW.cg_pin_schema
@@ -283,9 +283,72 @@ CREATE TRIGGER preserve_cg_unlock BEFORE DELETE ON cg_unlocks
 BEGIN SELECT RAISE(ABORT, 'CG acquisition is immutable'); END;
 `;
 
+// An additive sidecar avoids guessing when pets from older saves were
+// acquired. GAME metadata references the command receipt committed by the
+// same transaction; deferral permits the service to save that receipt last.
+const migration003AcquisitionReceiptMatches = (receipt: string, acquisition: string, pet: string) => `
+  ${acquisition}.origin='GAME' AND ${acquisition}.acquired_at=${receipt}.created_at
+  AND json_extract(${receipt}.fingerprint,'$.commandId')=${receipt}.command_id
+  AND json_extract(${receipt}.fingerprint,'$.type')='PET_ACQUIRE'
+  AND json_extract(${receipt}.fingerprint,'$.payload.characterId')=${pet}.character_id
+  AND json_type(${receipt}.fingerprint,'$.payload.catalogVersion')='integer'
+  AND json_extract(${receipt}.fingerprint,'$.payload.catalogVersion')=${acquisition}.catalog_version
+  AND json_type(${receipt}.outcome_json,'$.ok')='true'
+  AND json_type(${receipt}.outcome_json,'$.snapshot.pets')='array'
+  AND EXISTS (SELECT 1 FROM json_each(${receipt}.outcome_json,'$.snapshot.pets') instance
+    WHERE json_extract(instance.value,'$.petId')=${acquisition}.pet_id
+      AND json_extract(instance.value,'$.characterId')=${pet}.character_id)`;
+const MIGRATION_003 = `
+CREATE TABLE pet_acquisitions (
+  pet_id TEXT PRIMARY KEY NOT NULL REFERENCES pets(pet_id) CHECK (${idCheck('pet_id')}),
+  acquired_at INTEGER NOT NULL CHECK (${unsigned('acquired_at')}),
+  origin TEXT NOT NULL CHECK (origin IN ('STARTER','GAME')),
+  catalog_version INTEGER NOT NULL CHECK (${positive('catalog_version')}),
+  coin_cost INTEGER NOT NULL CHECK (${unsigned('coin_cost')}),
+  command_id TEXT UNIQUE CHECK (command_id IS NULL OR (${idCheck('command_id')})),
+  FOREIGN KEY (command_id) REFERENCES commands(command_id) DEFERRABLE INITIALLY DEFERRED,
+  CHECK ((origin='STARTER' AND coin_cost=0 AND command_id IS NULL)
+    OR (origin='GAME' AND command_id IS NOT NULL))
+) STRICT;
+CREATE TRIGGER reject_duplicate_pet_acquisition BEFORE INSERT ON pet_acquisitions
+WHEN EXISTS (SELECT 1 FROM pet_acquisitions a WHERE a.pet_id=NEW.pet_id OR a.command_id=NEW.command_id)
+BEGIN SELECT RAISE(ABORT, 'pet acquisition is immutable and unique'); END;
+CREATE TRIGGER reject_historical_pet_acquisition_receipt BEFORE INSERT ON pet_acquisitions
+WHEN NEW.origin='GAME' AND EXISTS (SELECT 1 FROM commands c WHERE c.command_id=NEW.command_id)
+BEGIN SELECT RAISE(ABORT, 'pet acquisition command receipt already exists'); END;
+CREATE TRIGGER validate_pending_pet_acquisition_receipt BEFORE INSERT ON commands
+WHEN (EXISTS (SELECT 1 FROM pet_acquisitions a WHERE a.command_id=NEW.command_id)
+    OR (json_extract(NEW.fingerprint,'$.type')='PET_ACQUIRE' AND json_type(NEW.outcome_json,'$.ok')='true'))
+  AND (EXISTS (SELECT 1 FROM commands c WHERE c.command_id=NEW.command_id)
+    OR NOT EXISTS (SELECT 1 FROM pet_acquisitions a JOIN pets p USING(pet_id) WHERE a.command_id=NEW.command_id
+      AND ${migration003AcquisitionReceiptMatches('NEW','a','p')}))
+BEGIN SELECT RAISE(ABORT, 'pet acquisition requires its exact immutable successful receipt'); END;
+CREATE TRIGGER freeze_pet_acquisition_receipt BEFORE UPDATE ON commands
+WHEN EXISTS (SELECT 1 FROM pet_acquisitions a WHERE a.command_id=OLD.command_id)
+BEGIN SELECT RAISE(ABORT, 'pet acquisition receipt is immutable'); END;
+CREATE TRIGGER reject_orphan_successful_acquisition_receipt_update BEFORE UPDATE ON commands
+WHEN json_extract(NEW.fingerprint,'$.type')='PET_ACQUIRE' AND json_type(NEW.outcome_json,'$.ok')='true'
+BEGIN SELECT RAISE(ABORT, 'successful pet acquisition receipt cannot be retroactively added'); END;
+CREATE TRIGGER preserve_pet_acquisition_receipt BEFORE DELETE ON commands
+WHEN EXISTS (SELECT 1 FROM pet_acquisitions a WHERE a.command_id=OLD.command_id)
+BEGIN SELECT RAISE(ABORT, 'pet acquisition receipt is immutable'); END;
+CREATE TRIGGER freeze_pet_acquisition BEFORE UPDATE ON pet_acquisitions
+BEGIN SELECT RAISE(ABORT, 'pet acquisition is immutable'); END;
+CREATE TRIGGER preserve_pet_acquisition BEFORE DELETE ON pet_acquisitions
+BEGIN SELECT RAISE(ABORT, 'pet acquisition is immutable'); END;
+CREATE TRIGGER freeze_acquired_pet_character BEFORE UPDATE ON pets
+WHEN OLD.character_id IS NOT NEW.character_id AND EXISTS (SELECT 1 FROM pet_acquisitions a WHERE a.pet_id=OLD.pet_id)
+BEGIN SELECT RAISE(ABORT, 'acquired pet character is immutable'); END;
+CREATE TRIGGER protect_acquired_pet_character_insert BEFORE INSERT ON pets
+WHEN EXISTS (SELECT 1 FROM pet_acquisitions a JOIN pets p USING(pet_id)
+  WHERE a.pet_id=NEW.pet_id AND p.character_id IS NOT NEW.character_id)
+BEGIN SELECT RAISE(ABORT, 'acquired pet character is immutable'); END;
+`;
+
 const MIGRATIONS = Object.freeze([
   { version: 1, sql: MIGRATION_001 },
   { version: 2, sql: MIGRATION_002 },
+  { version: 3, sql: MIGRATION_003 },
 ]);
 
 /** FNV-1a is a migration-change detector, not a security signature. */
@@ -546,6 +609,27 @@ function petFromRow(value: unknown): PetRecord {
   });
 }
 
+function validatePetAcquisition(value: unknown): PetAcquisitionRecord {
+  const data = closed(value, 'pet acquisition', ['petId', 'acquiredAt', 'origin', 'catalogVersion', 'coinCost', 'commandId']);
+  const record: PetAcquisitionRecord = {
+    petId: id(data.petId), acquiredAt: integer(data.acquiredAt, 'pet acquisition time'),
+    origin: enumeration(data.origin, 'pet acquisition origin', ['STARTER', 'GAME']),
+    catalogVersion: integer(data.catalogVersion, 'character catalog version', 1), coinCost: integer(data.coinCost, 'pet acquisition cost'),
+    commandId: data.commandId === null ? null : id(data.commandId),
+  };
+  if (record.origin === 'STARTER' ? record.coinCost !== 0 || record.commandId !== null : record.commandId === null) {
+    throw new Error('Pet acquisition origin contradicts its cost or command');
+  }
+  return record;
+}
+
+function petAcquisitionFromRow(value: unknown): PetAcquisitionRecord {
+  const row = object(value, 'pet acquisition row');
+  return validatePetAcquisition({ petId: row.pet_id, acquiredAt: integer(row.acquired_at, 'pet acquisition time'),
+    origin: row.origin, catalogVersion: integer(row.catalog_version, 'character catalog version', 1),
+    coinCost: integer(row.coin_cost, 'pet acquisition cost'), commandId: row.command_id });
+}
+
 const PET_SELECT = `SELECT p.*, s.presence, s.activity, s.mood, s.health_status, s.visibility,
   s.mood_score10, s.health_points10, s.energy10, s.bond10, g.power, g.xp
   FROM pets p LEFT JOIN pet_states s USING(pet_id) LEFT JOIN pet_progression g USING(pet_id)`;
@@ -736,6 +820,20 @@ class SQLiteTransaction implements AppTransaction {
       .run(p.petId, p.presence, p.activity, p.mood, p.healthStatus, p.visibility, p.moodScore10, p.healthPoints10, p.energy10, p.bond10);
     db.prepare(`INSERT INTO pet_progression VALUES (?, ?, ?) ON CONFLICT(pet_id) DO UPDATE SET power=excluded.power, xp=excluded.xp`)
       .run(p.petId, p.power, p.xp);
+  }
+
+  getPetAcquisition(petId: string): PetAcquisitionRecord | null {
+    const value = this.db.prepare('SELECT * FROM pet_acquisitions WHERE pet_id=?').get(id(petId));
+    return value === undefined || value === null ? null : petAcquisitionFromRow(value);
+  }
+
+  insertPetAcquisition(record: PetAcquisitionRecord): void {
+    const db = this.db, acquisition = validatePetAcquisition(record);
+    // The first acquisition is a history record, not a state upsert.
+    if (this.getPetAcquisition(acquisition.petId) !== null) throw new Error('Pet acquisition is immutable and unique');
+    db.prepare(`INSERT INTO pet_acquisitions (pet_id,acquired_at,origin,catalog_version,coin_cost,command_id)
+      VALUES (?, ?, ?, ?, ?, ?)`).run(acquisition.petId, acquisition.acquiredAt, acquisition.origin,
+        acquisition.catalogVersion, acquisition.coinCost, acquisition.commandId);
   }
 
   listTrips(): TripRecord[] {
@@ -1153,6 +1251,7 @@ function migrate(db: SqliteConnection, persistent: boolean, beforeMigration?: (f
         trips: rowCount(db, 'SELECT count(*) AS count FROM trips'),
         unlocks: rowCount(db, 'SELECT count(*) AS count FROM cg_unlocks'),
       } : null;
+      const oldPetCount = migration.version === 3 ? rowCount(db, 'SELECT count(*) AS count FROM pets') : null;
       db.exec(migration.sql);
       if (oldCounts !== null && (oldCounts.trips !== rowCount(db, 'SELECT count(*) AS count FROM trips')
         || oldCounts.unlocks !== rowCount(db, 'SELECT count(*) AS count FROM cg_unlocks')
@@ -1160,6 +1259,10 @@ function migrate(db: SqliteConnection, persistent: boolean, beforeMigration?: (f
         || oldCounts.unlocks !== rowCount(db, `SELECT count(*) AS count FROM cg_unlocks WHERE asset_state='LEGACY_UNVERSIONED'
           AND historical_character_id IS NULL AND historical_event_def_id IS NULL AND asset_version IS NULL AND asset_hash IS NULL
           AND favorite=0 AND viewed_at IS NULL`))) throw new Error('CG migration changed legacy row count or invented historical metadata');
+      if (oldPetCount !== null && (oldPetCount !== rowCount(db, 'SELECT count(*) AS count FROM pets')
+        || rowCount(db, 'SELECT count(*) AS count FROM pet_acquisitions') !== 0)) {
+        throw new Error('Pet acquisition migration changed legacy pets or invented acquisition history');
+      }
       db.prepare('INSERT INTO schema_migrations (version, checksum, applied_at) VALUES (?, ?, ?)')
         .run(migration.version, migrationChecksum(migration.sql), Date.now());
       db.exec(`PRAGMA user_version = ${migration.version}`);

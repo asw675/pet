@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { cgMarkViewedPayloadSchema, cgSetFavoritePayloadSchema, galleryPageSchema, galleryQuerySchema } from '#gallery';
+import { characterCatalogPageSchema, petAcquirePayloadSchema, petRenamePayloadSchema } from '#characters';
 
 /** Independent from the application, database and game-rule versions. */
 export const CONTRACT_SCHEMA_VERSION = 1 as const;
@@ -106,6 +107,8 @@ export type ModeFlag = z.infer<typeof modeFlagSchema>;
 
 // Each command carries its own closed payload. No open-ended action or host API.
 export const domainCommandSchema = z.discriminatedUnion('type', [
+  z.strictObject({ ...commandFields, type: z.literal('PET_ACQUIRE'), payload: petAcquirePayloadSchema }),
+  z.strictObject({ ...commandFields, type: z.literal('PET_RENAME'), payload: petRenamePayloadSchema }),
   z.strictObject({
     ...commandFields,
     type: z.literal('PET_SELECT'),
@@ -207,6 +210,7 @@ export const ipcRequestSchema = z.discriminatedUnion('method', [
     payload: z.strictObject({ command: domainCommandSchema }),
   }),
   z.strictObject({ ...requestFields, method: z.literal('gallery/list'), payload: galleryQuerySchema }),
+  z.strictObject({ ...requestFields, method: z.literal('characters/list'), payload: z.strictObject({}) }),
 ]);
 export type IpcRequest = z.infer<typeof ipcRequestSchema>;
 
@@ -223,6 +227,22 @@ const errorResultSchema = z.strictObject({
 });
 const gallerySuccessSchema = snapshotSuccessSchema.extend({ gallery: galleryPageSchema })
   .refine((result) => result.gallery.revision === result.snapshot.revision, 'Gallery and snapshot revisions must match');
+const charactersSuccessSchema = snapshotSuccessSchema.extend({ characters: characterCatalogPageSchema })
+  .superRefine((result, ctx) => {
+    const { characters, snapshot } = result;
+    if (characters.revision !== snapshot.revision || characters.walletCoins !== snapshot.walletCoins) {
+      ctx.addIssue({ code: 'custom', path: ['characters'], message: 'Character catalog and snapshot must share an authority revision and wallet' });
+    }
+    for (const [index, row] of characters.rows.entries()) {
+      const expected = snapshot.pets.filter((pet) => pet.characterId === row.characterId);
+      if (expected.length !== row.instances.length || !row.instances.every((instance) => expected.some((pet) => pet.petId === instance.petId && pet.nickname === instance.nickname))) {
+        ctx.addIssue({ code: 'custom', path: ['characters', 'rows', index, 'instances'], message: 'Character instances must match the snapshot' });
+      }
+      if (row.availability === 'CAPACITY_REACHED' && snapshot.pets.length < 100) {
+        ctx.addIssue({ code: 'custom', path: ['characters', 'rows', index, 'availability'], message: 'Capacity result contradicts the snapshot' });
+      }
+    }
+  });
 
 // Old snapshot and persistent command result shape stays exactly as before.
 // The gallery query has a distinct closed success shape plus the same snapshot.
@@ -230,12 +250,17 @@ export const snapshotIpcResultSchema = z.union([snapshotSuccessSchema, errorResu
 export type SnapshotIpcResult = z.infer<typeof snapshotIpcResultSchema>;
 export const galleryIpcResultSchema = z.union([gallerySuccessSchema, errorResultSchema]);
 export type GalleryIpcResult = z.infer<typeof galleryIpcResultSchema>;
-export const ipcResultSchema = z.union([snapshotSuccessSchema, gallerySuccessSchema, errorResultSchema]);
+export const charactersIpcResultSchema = z.union([charactersSuccessSchema, errorResultSchema]);
+export type CharactersIpcResult = z.infer<typeof charactersIpcResultSchema>;
+export const ipcResultSchema = z.union([snapshotSuccessSchema, gallerySuccessSchema, charactersSuccessSchema, errorResultSchema]);
 export type IpcResult = z.infer<typeof ipcResultSchema>;
 
 /** Request correlation includes its method, not merely an equal request ID. */
 export function resultMatchesMethod(method: IpcRequest['method'], result: IpcResult): boolean {
-  return !result.ok || (method === 'gallery/list' ? 'gallery' in result : !('gallery' in result));
+  if (!result.ok) return true;
+  if (method === 'gallery/list') return 'gallery' in result;
+  if (method === 'characters/list') return 'characters' in result;
+  return !('gallery' in result) && !('characters' in result);
 }
 
 /** Explicit renderer-facing API, independent of Electron and transport internals. */
@@ -247,3 +272,4 @@ export interface AppBridge {
 
 export * from '#character-pack';
 export * from '#gallery';
+export * from '#characters';

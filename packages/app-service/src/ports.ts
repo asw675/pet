@@ -22,6 +22,18 @@ export interface PetRecord {
   revision: number;
 }
 
+/** Immutable metadata recorded with a newly obtained pet instance. Older
+ * archives can contain a pet without this sidecar; its acquisition time is
+ * unknown rather than invented during migration. */
+export interface PetAcquisitionRecord {
+  petId: string;
+  acquiredAt: number;
+  origin: 'STARTER' | 'GAME';
+  catalogVersion: number;
+  coinCost: number;
+  commandId: string | null;
+}
+
 export interface PreferencesRecord {
   revision: number;
   logicalTime: number;
@@ -110,6 +122,8 @@ export interface AppTransaction {
   listPets(): PetRecord[];
   getPet(petId: string): PetRecord | null;
   savePet(pet: PetRecord): void;
+  getPetAcquisition(petId: string): PetAcquisitionRecord | null;
+  insertPetAcquisition(record: PetAcquisitionRecord): void;
   listTrips(): TripRecord[];
   getTrip(tripId: string): TripRecord | null;
   insertTrip(trip: TripRecord): void;
@@ -160,6 +174,6 @@ export interface SqliteConnection {
 
 export interface AppRuntime {
   now(): number;
-  createId(kind: 'trip' | 'event' | 'request'): string;
+  createId(kind: 'trip' | 'event' | 'request' | 'pet'): string;
   seed(): number;
 }

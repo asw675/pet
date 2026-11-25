@@ -6,7 +6,8 @@
   "exports": "./src/index.ts",
   "imports": {
     "#character-pack": "./src/character-pack.ts",
-    "#gallery": "./src/gallery.ts"
+    "#gallery": "./src/gallery.ts",
+    "#characters": "./src/characters.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",

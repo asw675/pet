@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
-import { galleryIpcResultSchema, ipcRequestSchema, ipcResultSchema } from '@pet-desktop/contracts';
-import type { AppSnapshot, DomainCommand, GalleryIpcResult, GalleryQuery, IpcRequest, IpcResult } from '@pet-desktop/contracts';
+import { charactersIpcResultSchema, galleryIpcResultSchema, ipcRequestSchema, ipcResultSchema } from '@pet-desktop/contracts';
+import type { AppSnapshot, CharacterCatalogRow, CharactersIpcResult, DomainCommand, GalleryIpcResult, GalleryQuery, IpcRequest, IpcResult } from '@pet-desktop/contracts';
 import { createControlCenterBridge, createPetBridge } from '../src/preload/bridge.js';
 import type { DesktopIpcPort } from '../src/preload/bridge.js';
 import { DESKTOP_IPC } from '../src/shared/protocol.js';
@@ -30,6 +30,23 @@ function gallerySuccess(requestId: string, query: GalleryQuery = galleryQuery) {
   } satisfies GalleryIpcResult;
 }
 
+const characterRow = {
+  characterId: 'nova-mechanist', displayName: '诺瓦', species: '机械少女', profession: 'MECHANICAL_SUPPORT', professionLabel: '机械师',
+  background: '来自失落工坊的机械助手。',
+  personality: { summary: '认真而好奇', traits: ['认真'], likes: ['齿轮'], speechStyle: '短句' },
+  voiceStyleId: 'voice-nova', adventureFocus: ['采集'], basePower: 20,
+  baseStats: { hp: 100, atk: 10, def: 10, spd: 5, luk: 1 }, growthPerLevel: { hp: 5, atk: 1, def: 1, spd: 1, luk: 0 },
+  unlock: { kind: 'EXPLORATION_COINS', requiredSettledTrips: 1, coinCost: 2 },
+  instances: [], availability: 'AVAILABLE',
+} satisfies CharacterCatalogRow;
+
+function charactersSuccess(requestId: string) {
+  return {
+    schemaVersion: 1, ok: true, requestId, snapshot,
+    characters: { revision: snapshot.revision, catalogVersion: 1, settledTrips: 1, walletCoins: snapshot.walletCoins, rows: [characterRow] },
+  } satisfies CharactersIpcResult;
+}
+
 const privateDetail = '/Users/test/private.sqlite: database error';
 
 class FakeIpc implements DesktopIpcPort {
@@ -39,6 +56,7 @@ class FakeIpc implements DesktopIpcPort {
     if (channel === DESKTOP_IPC.request) {
       const request = ipcRequestSchema.parse(raw);
       if (request.method === 'gallery/list') return gallerySuccess(request.requestId, request.payload);
+      if (request.method === 'characters/list') return charactersSuccess(request.requestId);
       return { schemaVersion: 1, ok: true, requestId: request.requestId, snapshot } satisfies IpcResult;
     }
     if (channel === DESKTOP_IPC.getStatus) return status;
@@ -81,9 +99,10 @@ describe('role-specific preload bridges', () => {
     const pet = createPetBridge(ipc);
     const center = createControlCenterBridge(ipc);
     expect(Object.keys(pet).sort()).toEqual([...commonKeys, 'setInteractive', 'reportVisualReady'].sort());
-    expect(Object.keys(center).sort()).toEqual([...commonKeys, 'listGallery'].sort());
+    expect(Object.keys(center).sort()).toEqual([...commonKeys, 'listGallery', 'listCharacters'].sort());
     expect('reportVisualReady' in center).toBe(false);
     expect('listGallery' in pet).toBe(false);
+    expect('listCharacters' in pet).toBe(false);
     expect(pet.role).toBe('pet');
     expect(center.role).toBe('control-center');
     expect(Object.isFrozen(pet)).toBe(true);
@@ -171,6 +190,103 @@ describe('role-specific preload bridges', () => {
     expect(result).toEqual({ ok: false, code: 'INVALID_REQUEST' });
     expect(ipc.calls).toEqual([]);
     expect(JSON.stringify(result)).not.toContain(privateDetail);
+  });
+});
+
+describe('control-center-only character catalog', () => {
+  it('sends an exact empty request through the fixed channel and shares reply ID sequencing across methods', async () => {
+    const ipc = new FakeIpc();
+    const bridge = createControlCenterBridge(ipc, requestIds());
+    expect(await bridge.getSnapshot()).toEqual({ schemaVersion: 1, ok: true, requestId: 'request-1', snapshot });
+    expect(await bridge.listCharacters()).toEqual(charactersSuccess('request-2'));
+    expect(await bridge.listGallery(galleryQuery)).toEqual(gallerySuccess('request-3'));
+    expect(ipc.calls).toEqual([
+      [DESKTOP_IPC.request, { schemaVersion: 1, requestId: 'request-1', method: 'snapshot/get', payload: {} }],
+      [DESKTOP_IPC.request, { schemaVersion: 1, requestId: 'request-2', method: 'characters/list', payload: {} }],
+      [DESKTOP_IPC.request, { schemaVersion: 1, requestId: 'request-3', method: 'gallery/list', payload: galleryQuery }],
+    ]);
+  });
+
+  it('rejects any runtime input, even an empty object or explicit undefined, without invoking IPC', async () => {
+    const ipc = new FakeIpc();
+    const bridge = createControlCenterBridge(ipc, requestIds());
+    const invoke = bridge.listCharacters as (...args: unknown[]) => Promise<CharactersIpcResult>;
+    for (const args of [[{}], [undefined], [null], ['characters/list'], [{ path: privateDetail }], [{}, {}]]) {
+      const result = await invoke(...args);
+      expect(result).toMatchObject({ schemaVersion: 1, ok: false, error: { code: 'INVALID_REQUEST', retryable: false } });
+      expect(charactersIpcResultSchema.safeParse(result).success).toBe(true);
+      expect(JSON.stringify(result)).not.toContain(privateDetail);
+    }
+    expect(ipc.calls).toEqual([]);
+    expect(await bridge.listCharacters()).toEqual(charactersSuccess('request-7'));
+  });
+
+  it('allows acquire and rename requests through the existing command method, not the catalog query', async () => {
+    const ipc = new FakeIpc();
+    const bridge = createControlCenterBridge(ipc, requestIds());
+    const acquire: DomainCommand = { type: 'PET_ACQUIRE', commandId: 'acquire-1', issuedAt: 1234,
+      payload: { characterId: 'nova-mechanist', catalogVersion: 1 } };
+    const rename: DomainCommand = { type: 'PET_RENAME', commandId: 'rename-1', issuedAt: 1234,
+      payload: { petId: 'pet-1', nickname: '星光' } };
+    expect(await bridge.dispatch(acquire)).toEqual({ schemaVersion: 1, ok: true, requestId: 'request-1', snapshot });
+    expect(await bridge.dispatch(rename)).toEqual({ schemaVersion: 1, ok: true, requestId: 'request-2', snapshot });
+    expect(ipc.calls).toEqual([
+      [DESKTOP_IPC.request, { schemaVersion: 1, requestId: 'request-1', method: 'command/dispatch', payload: { command: acquire } }],
+      [DESKTOP_IPC.request, { schemaVersion: 1, requestId: 'request-2', method: 'command/dispatch', payload: { command: rename } }],
+    ]);
+  });
+
+  it('rejects globally schema-valid character replies through snapshot/dispatch/gallery despite an equal request ID', async () => {
+    for (const role of ['pet', 'control-center'] as const) {
+      const ipc = new FakeIpc();
+      const bridge = role === 'pet' ? createPetBridge(ipc, requestIds()) : createControlCenterBridge(ipc, requestIds());
+      ipc.handle = (_channel, raw) => {
+        const reply = charactersSuccess(ipcRequestSchema.parse(raw).requestId);
+        expect(ipcResultSchema.safeParse(reply).success).toBe(true);
+        return reply;
+      };
+      expect(await bridge.getSnapshot()).toMatchObject({ ok: false, error: { code: 'INTERNAL_ERROR', requestId: 'request-1' } });
+      expect(await bridge.dispatch(command)).toMatchObject({ ok: false, error: { code: 'INTERNAL_ERROR', requestId: 'request-2' } });
+      if (bridge.role === 'control-center') {
+        expect(await bridge.listGallery(galleryQuery)).toMatchObject({ ok: false, error: { code: 'INTERNAL_ERROR', requestId: 'request-3' } });
+      }
+    }
+  });
+
+  it.each([
+    { schemaVersion: 1, ok: true, requestId: 'request-1', snapshot },
+    gallerySuccess('request-1'),
+    charactersSuccess('wrong-id'),
+    { ...charactersSuccess('request-1'), gallery: gallerySuccess('request-1').gallery },
+    { ...charactersSuccess('request-1'), characters: { ...charactersSuccess('request-1').characters, revision: snapshot.revision + 1 } },
+    { ...charactersSuccess('request-1'), characters: { ...charactersSuccess('request-1').characters, walletCoins: snapshot.walletCoins + 1 } },
+    { ...charactersSuccess('request-1'), characters: { ...charactersSuccess('request-1').characters, catalogVersion: 0 } },
+    { ...charactersSuccess('request-1'), characters: { ...charactersSuccess('request-1').characters, settledTrips: -1 } },
+    { ...charactersSuccess('request-1'), characters: { ...charactersSuccess('request-1').characters, path: privateDetail } },
+    { ...charactersSuccess('request-1'), characters: { ...charactersSuccess('request-1').characters, rows: [characterRow, characterRow] } },
+  ])('rejects invalid character catalog success replies: case %#', async reply => {
+    const ipc = new FakeIpc();
+    ipc.handle = () => reply;
+    const result = await createControlCenterBridge(ipc, requestIds()).listCharacters();
+    expect(result).toMatchObject({ ok: false, error: { requestId: 'request-1', code: 'INTERNAL_ERROR', retryable: true } });
+    expect(charactersIpcResultSchema.safeParse(result).success).toBe(true);
+    expect(JSON.stringify(result)).not.toContain(privateDetail);
+  });
+
+  it('sanitizes character catalog IPC rejects and legitimate errors, including mismatched IDs', async () => {
+    const ipc = new FakeIpc();
+    const bridge = createControlCenterBridge(ipc, requestIds());
+    ipc.handle = () => ({ schemaVersion: 1, ok: false, error: {
+      requestId: 'request-1', code: 'NOT_FOUND', retryable: false, message: privateDetail,
+    } });
+    const first = await bridge.listCharacters();
+    expect(first).toMatchObject({ ok: false, error: { requestId: 'request-1', code: 'NOT_FOUND', retryable: false } });
+    expect(JSON.stringify(first)).not.toContain(privateDetail);
+    expect(await bridge.listCharacters()).toMatchObject({ ok: false, error: { requestId: 'request-2', code: 'INTERNAL_ERROR', retryable: true } });
+    ipc.handle = () => { throw new Error(privateDetail); };
+    const rejected = await bridge.listCharacters();
+    expect(rejected).toMatchObject({ ok: false, error: { requestId: 'request-3', code: 'SERVICE_UNAVAILABLE', retryable: true } });
+    expect(JSON.stringify(rejected)).not.toContain(privateDetail);
   });
 });
 

@@ -1,13 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import { CONTRACT_SCHEMA_VERSION, ipcResultSchema } from '@pet-desktop/contracts';
-import type { AppSnapshot, DomainCommand, DomainEvent, GalleryPage, GalleryQuery } from '@pet-desktop/contracts';
+import type { AppSnapshot, CharacterCatalogPage, DomainCommand, DomainEvent, GalleryPage, GalleryQuery } from '@pet-desktop/contracts';
 import { DEMO_ROUTE } from '@pet-desktop/domain';
 import { findBuiltinCg } from '@pet-desktop/domain/cg-catalog';
+import { CHARACTER_CATALOG_VERSION } from '@pet-desktop/domain/character-catalog';
 import type { TripFact } from '@pet-desktop/domain';
 import { AppService } from '../src/app-service.js';
 import type {
   AppRepository, AppRuntime, AppTransaction, CgUnlock, CgUnlockInput, CommandOutcome, CommandReceipt,
-  InventoryItem, OutboxRecord, PetRecord, PreferencesRecord, RewardLine, SettlementRecord, TripCgAssetPin, TripRecord,
+  InventoryItem, OutboxRecord, PetAcquisitionRecord, PetRecord, PreferencesRecord, RewardLine, SettlementRecord, TripCgAssetPin, TripRecord,
 } from '../src/ports.js';
 
 const MINUTE = 60_000;
@@ -21,6 +22,7 @@ function copy<T>(value: T): T {
 interface MemoryState {
   preferences: PreferencesRecord | null;
   pets: PetRecord[];
+  acquisitions: PetAcquisitionRecord[];
   trips: TripRecord[];
   facts: TripFact[];
   settlements: SettlementRecord[];
@@ -34,7 +36,7 @@ interface MemoryState {
 }
 
 function emptyState(): MemoryState {
-  return { preferences: null, pets: [], trips: [], facts: [], settlements: [], rewards: [],
+  return { preferences: null, pets: [], acquisitions: [], trips: [], facts: [], settlements: [], rewards: [],
     wallet: 0, inventory: [], cgs: [], cgPins: [], receipts: [], outbox: [] };
 }
 
@@ -66,6 +68,16 @@ class MemoryRepository implements AppRepository, AppTransaction {
     const index = this.state.pets.findIndex((entry) => entry.petId === pet.petId);
     if (index === -1) this.state.pets.push(copy(pet));
     else this.state.pets[index] = copy(pet);
+  }
+  getPetAcquisition(petId: string): PetAcquisitionRecord | null {
+    return copy(this.state.acquisitions.find(record => record.petId === petId) ?? null);
+  }
+  insertPetAcquisition(record: PetAcquisitionRecord): void {
+    if (!this.getPet(record.petId) || this.getPetAcquisition(record.petId)
+      || (record.commandId !== null && this.state.acquisitions.some(entry => entry.commandId === record.commandId))) {
+      throw new Error('Invalid or duplicate pet acquisition');
+    }
+    this.state.acquisitions.push(copy(record));
   }
   listTrips(): TripRecord[] { return copy(this.state.trips); }
   getTrip(tripId: string): TripRecord | null {
@@ -168,10 +180,13 @@ class MemoryRepository implements AppRepository, AppTransaction {
 class FakeRuntime implements AppRuntime {
   at = START;
   nextSeed = 8;
+  forcedPetId: string | null = null;
   private serial = 0;
   now(): number { return this.at; }
   seed(): number { return this.nextSeed; }
-  createId(kind: 'trip' | 'event' | 'request'): string { return `${kind}-${++this.serial}`; }
+  createId(kind: 'trip' | 'event' | 'request' | 'pet'): string {
+    return kind === 'pet' && this.forcedPetId !== null ? this.forcedPetId : `${kind}-${++this.serial}`;
+  }
 }
 
 function fixture() {
@@ -204,6 +219,15 @@ function requestGallery(service: AppService, query: GalleryQuery = galleryQuery)
   if (!result.ok || !('gallery' in result)) throw new Error('Expected revisioned gallery result');
   expect(result.gallery.revision).toBe(result.snapshot.revision);
   return { snapshot: result.snapshot, gallery: result.gallery };
+}
+
+function requestCharacters(service: AppService): { snapshot: AppSnapshot; characters: CharacterCatalogPage } {
+  const result = service.handleRequest({ schemaVersion: 1, requestId: 'characters-read', method: 'characters/list', payload: {} });
+  expect(ipcResultSchema.safeParse(result).success).toBe(true);
+  if (!result.ok || !('characters' in result)) throw new Error('Expected revisioned character catalog result');
+  expect(result.characters.revision).toBe(result.snapshot.revision);
+  expect(result.characters.walletCoins).toBe(result.snapshot.walletCoins);
+  return { snapshot: result.snapshot, characters: result.characters };
 }
 
 describe('application service request boundary', () => {
@@ -645,5 +669,174 @@ describe('historical CG acquisition and gallery projection', () => {
     expect(repo.listRewards(tripId)).toEqual(rewards);
     expect(repo.state.outbox.filter((record) => record.event.type === 'CGFavoriteChanged')).toHaveLength(1);
     expect(repo.state.outbox.filter((record) => record.event.type === 'CGViewed')).toHaveLength(1);
+  });
+});
+
+describe('authoritative character catalog, acquisition and nickname', () => {
+  const acquireNova = { characterId: 'nova', catalogVersion: CHARACTER_CATALOG_VERSION };
+
+  function settleTrips(service: AppService, runtime: FakeRuntime, count: number, prefix: string): void {
+    for (let i = 0; i < count; i++) {
+      depart(service, 'pet-1', `${prefix}-${i}`);
+      runtime.at += 15 * MINUTE;
+      service.getSnapshot();
+    }
+  }
+
+  it('records actual fresh starter origins without changing historic instance IDs, stats or visibility', () => {
+    const { service, repo } = fixture();
+    const result = requestCharacters(service);
+    expect(result.snapshot).toMatchObject({ revision: 0, primaryPetId: 'pet-1', walletCoins: 0, pets: [
+      { petId: 'pet-1', characterId: 'star-singer', nickname: '星咏', visibility: 'VISIBLE', presence: 'HOME', xp: 0, energy: 100 },
+      { petId: 'pet-2', characterId: 'fluffy-ranger', nickname: '绒绒', visibility: 'HIDDEN', presence: 'HOME', xp: 0, energy: 100 },
+    ] });
+    expect(repo.state.pets.map(pet => pet.power)).toEqual([30, 25]);
+    expect(repo.state.acquisitions).toEqual(['pet-1', 'pet-2'].map(petId => ({ petId, acquiredAt: START,
+      origin: 'STARTER', catalogVersion: CHARACTER_CATALOG_VERSION, coinCost: 0, commandId: null })));
+    expect(result.characters.rows.map(row => [row.characterId, row.availability])).toEqual([
+      ['star-singer','ALREADY_OWNED'], ['fluffy-ranger','ALREADY_OWNED'], ['nova','UNMET_REQUIREMENT'],
+    ]);
+    expect(result.characters.rows[0]?.instances).toEqual([{ petId: 'pet-1', nickname: '星咏', origin: 'STARTER', acquiredAt: START }]);
+    expect(repo.state.outbox).toEqual([]);
+  });
+
+  it('recomputes gate and coin requirement in the write transaction; one purchase creates exactly one independent pet', () => {
+    const { service, repo, runtime } = fixture();
+    settleTrips(service, runtime, 2, 'unlock-prefix');
+    const before = requestCharacters(service);
+    expect(before.characters.settledTrips).toBe(2);
+    expect(before.characters.walletCoins).toBe(16);
+    expect(service.dispatch(command('too-early', 'PET_ACQUIRE', acquireNova))).toMatchObject({ ok: false, error: { code: 'BUSINESS_RULE' } });
+    expect(repo.state.pets).toHaveLength(2);
+    expect(repo.state.wallet).toBe(16);
+    settleTrips(service, runtime, 1, 'unlock-final');
+    const ready = requestCharacters(service);
+    expect(ready.characters.rows.find(row => row.characterId === 'nova')?.availability).toBe('AVAILABLE');
+    expect(ready.snapshot.walletCoins).toBe(24);
+    const purchase = command('nova-acquire', 'PET_ACQUIRE', acquireNova, { expectedRevision: ready.snapshot.revision });
+    const accepted = success(service.dispatch(purchase));
+    const newPet = accepted.pets.find(pet => pet.characterId === 'nova')!;
+    expect(newPet).toMatchObject({ characterId: 'nova', nickname: '诺瓦', visibility: 'HIDDEN', presence: 'HOME', activity: 'IDLE',
+      level: 1, xp: 0, revision: 0, energy: 100, healthPoints: 100, moodScore: 50, bond: 0 });
+    expect(newPet.petId).not.toBe('pet-1');
+    expect(newPet.petId).not.toBe('pet-2');
+    expect(accepted.pets.filter(pet => pet.characterId !== 'nova')).toEqual(ready.snapshot.pets);
+    expect(accepted.primaryPetId).toBe(ready.snapshot.primaryPetId);
+    expect(accepted.revision).toBe(ready.snapshot.revision + 1);
+    expect(accepted.walletCoins).toBe(8);
+    expect(repo.getPet(newPet.petId)?.power).toBe(28);
+    expect(repo.getPetAcquisition(newPet.petId)).toEqual({ petId: newPet.petId, origin: 'GAME', acquiredAt: runtime.at,
+      catalogVersion: CHARACTER_CATALOG_VERSION, coinCost: 16, commandId: purchase.commandId });
+    expect(repo.state.outbox.filter(entry => entry.event.type === 'PetAcquired')).toHaveLength(1);
+    expect(success(service.dispatch(purchase))).toEqual(accepted); // command receipt, not another debit
+    expect(service.dispatch(command('another-purchase', 'PET_ACQUIRE', acquireNova))).toMatchObject({ ok: false, error: { code: 'BUSINESS_RULE' } });
+    expect(repo.state.wallet).toBe(8);
+    expect(repo.state.acquisitions).toHaveLength(3);
+    expect(requestCharacters(service).characters.rows.find(row => row.characterId === 'nova')).toMatchObject({ availability: 'ALREADY_OWNED',
+      instances: [{ petId: newPet.petId, nickname: '诺瓦', origin: 'GAME', acquiredAt: runtime.at }] });
+  });
+
+  it('rejects stale catalog/revision and unknown template identities without spending', () => {
+    const { service, repo } = fixture();
+    expect(service.dispatch(command('wrong-catalog', 'PET_ACQUIRE', { ...acquireNova, catalogVersion: 99 })))
+      .toMatchObject({ ok: false, error: { code: 'REVISION_CONFLICT' } });
+    expect(service.dispatch(command('stale-acquire', 'PET_ACQUIRE', acquireNova, { expectedRevision: 5 })))
+      .toMatchObject({ ok: false, error: { code: 'REVISION_CONFLICT' } });
+    expect(service.dispatch(command('missing-character', 'PET_ACQUIRE', { ...acquireNova, characterId: 'not-in-catalog' })))
+      .toMatchObject({ ok: false, error: { code: 'NOT_FOUND' } });
+    expect(repo.state.wallet).toBe(0);
+    expect(repo.state.pets).toHaveLength(2);
+    expect(repo.state.acquisitions).toHaveLength(2);
+  });
+
+  it('requires sixteen in-game coins even after three real settled recall trips', () => {
+    const { service, repo, runtime } = fixture();
+    for (let i = 0; i < 3; i++) {
+      const tripId = depart(service, 'pet-1', `short-trip-${i}`);
+      success(service.dispatch(command(`recall-short-${i}`, 'TRIP_RECALL', { petId: 'pet-1', tripId })));
+      runtime.at += 15 * MINUTE;
+      service.getSnapshot();
+    }
+    const page = requestCharacters(service).characters;
+    expect(page.settledTrips).toBe(3);
+    expect(page.walletCoins).toBe(0);
+    expect(page.rows.find(row => row.characterId === 'nova')?.availability).toBe('INSUFFICIENT_COINS');
+    expect(service.dispatch(command('poor-acquire', 'PET_ACQUIRE', acquireNova))).toMatchObject({ ok: false, error: { code: 'BUSINESS_RULE' } });
+    expect(repo.state.pets).toHaveLength(2);
+    expect(repo.state.wallet).toBe(0);
+  });
+
+  it('rolls back every acquisition effect when event persistence fails and retries the same command safely', () => {
+    const { service, repo, runtime } = fixture();
+    settleTrips(service, runtime, 3, 'acquire-rollback');
+    const before = copy(repo.state);
+    const purchase = command('rollback-purchase', 'PET_ACQUIRE', acquireNova);
+    repo.failOnEvent = 'PetAcquired';
+    expect(service.dispatch(purchase)).toMatchObject({ ok: false, error: { code: 'INTERNAL_ERROR' } });
+    expect(repo.state).toEqual(before);
+    expect(repo.getCommandReceipt(purchase.commandId)).toBeNull();
+    repo.failOnEvent = null;
+    expect(success(service.dispatch(purchase)).walletCoins).toBe(8);
+    expect(repo.state.acquisitions).toHaveLength(3);
+  });
+
+  it('refuses a generated pet ID collision instead of overwriting an existing pet or taking coins', () => {
+    const { service, repo, runtime } = fixture();
+    settleTrips(service, runtime, 3, 'collision-trip');
+    const before = copy(repo.state);
+    runtime.forcedPetId = 'pet-1';
+    expect(service.dispatch(command('collision-acquire', 'PET_ACQUIRE', acquireNova))).toMatchObject({ ok: false, error: { code: 'INTERNAL_ERROR' } });
+    expect(repo.state).toEqual(before);
+  });
+
+  it('renames an away pet with Unicode normalization without changing frozen trip, other pet or acquisition', () => {
+    const { service, repo } = fixture();
+    const tripId = depart(service);
+    const before = service.getSnapshot();
+    const tripBefore = repo.getTrip(tripId);
+    const acquisitionBefore = repo.getPetAcquisition('pet-1');
+    const factsBefore = repo.listTripFacts(tripId);
+    const rename = command('away-rename', 'PET_RENAME', { petId: 'pet-1', nickname: '  e\u0301 星咏  ' });
+    const after = success(service.dispatch(rename));
+    expect(after.pets[0]).toEqual({ ...before.pets[0], nickname: 'é 星咏', revision: before.pets[0]!.revision + 1 });
+    expect(after.pets[1]).toEqual(before.pets[1]);
+    expect(after.revision).toBe(before.revision + 1);
+    expect(repo.getTrip(tripId)).toEqual(tripBefore);
+    expect(repo.listTripFacts(tripId)).toEqual(factsBefore);
+    expect(repo.getPetAcquisition('pet-1')).toEqual(acquisitionBefore);
+    expect(success(service.dispatch(rename))).toEqual(after);
+    expect(success(service.dispatch(command('rename-no-op', 'PET_RENAME', { petId: 'pet-1', nickname: 'é 星咏' })))).toEqual(after);
+    expect(repo.state.outbox.filter(entry => entry.event.type === 'PetRenamed')).toHaveLength(1);
+    expect(requestCharacters(service).characters.rows.find(row => row.characterId === 'star-singer')?.instances[0]?.nickname).toBe('é 星咏');
+  });
+
+  it('rejects whitespace-only or control-character nicknames and missing pets', () => {
+    const { service, repo } = fixture();
+    const before = service.getSnapshot();
+    expect(service.dispatch(command('blank-name', 'PET_RENAME', { petId: 'pet-1', nickname: '   ' })))
+      .toMatchObject({ ok: false, error: { code: 'INVALID_REQUEST' } });
+    expect(service.dispatch(command('control-name', 'PET_RENAME', { petId: 'pet-1', nickname: '隐\u202e名' })))
+      .toMatchObject({ ok: false, error: { code: 'INVALID_REQUEST' } });
+    expect(service.dispatch(command('absent-name', 'PET_RENAME', { petId: 'pet-999', nickname: '新名称' })))
+      .toMatchObject({ ok: false, error: { code: 'NOT_FOUND' } });
+    expect(service.getSnapshot()).toEqual(before);
+    expect(repo.state.outbox.filter(entry => entry.event.type === 'PetRenamed')).toHaveLength(0);
+  });
+
+  it('does not synthesize missing acquisition dates or erase unknown historical characters on reload', () => {
+    const { repo, runtime } = fixture();
+    const legacy = copy(repo.state);
+    legacy.acquisitions = [];
+    legacy.pets[1]!.characterId = 'retired-character';
+    legacy.pets[1]!.nickname = '历史角色';
+    const reopened = new MemoryRepository(legacy);
+    runtime.at += 100_000;
+    const service = new AppService(reopened, runtime);
+    const result = requestCharacters(service);
+    expect(result.snapshot.pets.find(pet => pet.petId === 'pet-2')).toMatchObject({ characterId: 'retired-character', nickname: '历史角色' });
+    expect(result.characters.rows.find(row => row.characterId === 'star-singer')?.instances)
+      .toEqual([{ petId: 'pet-1', nickname: '星咏', acquiredAt: null, origin: 'LEGACY' }]);
+    expect(result.characters.rows.find(row => row.characterId === 'fluffy-ranger')).toMatchObject({ availability: 'AVAILABLE', instances: [] });
+    expect(reopened.state.acquisitions).toEqual([]);
   });
 });

@@ -26,7 +26,7 @@
 | 004-Q | V1.1 功能及代码规模复核 | 产品覆盖约34.0% | [004-progress-audit](004-progress-audit.md) |
 | 005 | Windows 安装包与真机 P0 验收 | 按用户要求推迟至约90%开发覆盖 | — |
 | 006A-1 | 角色模板与获得规则、诺瓦内置资源 | 代码与专项测试通过 | [006a1-character-catalog](006a1-character-catalog.md) |
-| 006A-2 | 真实角色获得、昵称、控制中心目录 | 开发中 | — |
+| 006A-2 | 真实角色获得、昵称、v3迁移与控制中心目录 | 代码、数据库与专项测试通过 | [006a2-character-authority](006a2-character-authority.md) |
 | 006B-1 | 家中状态与需求纯规则 | 领域 27 项通过 | [006b1-home-rules](006b1-home-rules.md) |
 | 006C-1 | 职业成长与装备纯规则 | 领域 72 项通过 | [006c1-progression-rules](006c1-progression-rules.md) |
 | 006B-2/C-2/D–F | 持久调度、成长投影、装备经济、旅行、随机事件 | 分模块开发中 | — |

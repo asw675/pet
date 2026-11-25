@@ -2,20 +2,23 @@ import {
   appSnapshotSchema, CONTRACT_SCHEMA_VERSION, domainCommandSchema, domainEventSchema,
   idSchema, ipcRequestSchema, timestampSchema,
 } from '@pet-desktop/contracts';
-import type { AppSnapshot, DomainCommand, DomainEvent, GalleryPage, GalleryQuery, IpcErrorCode, IpcResult, PetSnapshot } from '@pet-desktop/contracts';
+import type { AppSnapshot, CharacterCatalogPage, DomainCommand, DomainEvent, GalleryPage, GalleryQuery, IpcErrorCode, IpcResult, PetSnapshot } from '@pet-desktop/contracts';
 import {
   advanceTrip, createTripCheckpoint, createTripSnapshot, DEMO_ROUTE, recallTrip,
 } from '@pet-desktop/domain';
 import type { RewardDraft, TripAdvanceResult, TripFact } from '@pet-desktop/domain';
+import { CHARACTER_CATALOG_VERSION, evaluateCharacterAcquisition, normalizeCharacterNickname } from '@pet-desktop/domain/character-catalog';
 import type {
   AppRepository, AppRuntime, AppTransaction, CommandOutcome, PetRecord, PreferencesRecord, RewardLine, TripRecord,
 } from './ports.js';
 import { freezeTripCgAssets, projectGallery, TRIP_CG_VARIANT as CG_VARIANT } from '#gallery-service';
+import { characterAcquisitionContext, createCharacterPet, createStarterPets, projectCharacterCatalog } from '#character-service';
 
 const DEPARTURE_ENERGY10 = 150;
 
 type Failure = Extract<CommandOutcome, { ok: false }>;
 type GalleryOutcome = { ok: true; snapshot: AppSnapshot; gallery: GalleryPage } | Failure;
+type CharactersOutcome = { ok: true; snapshot: AppSnapshot; characters: CharacterCatalogPage };
 
 function failure(code: IpcErrorCode, message: string, retryable = false): Failure {
   return { ok: false, error: { code, message, retryable } };
@@ -68,17 +71,6 @@ function levelForXp(xp: number): number {
     level += 1;
   }
   return level;
-}
-
-function createDemoPets(): PetRecord[] {
-  const defaults = {
-    presence: 'HOME', activity: 'IDLE', mood: 'CALM', healthStatus: 'NORMAL',
-    moodScore10: 500, healthPoints10: 1000, energy10: 1000, bond10: 0, xp: 0, revision: 0,
-  } as const;
-  return [
-    { ...defaults, petId: 'pet-1', characterId: 'star-singer', nickname: '星咏', power: 30, visibility: 'VISIBLE' },
-    { ...defaults, petId: 'pet-2', characterId: 'fluffy-ranger', nickname: '绒绒', power: 25, visibility: 'HIDDEN' },
-  ];
 }
 
 /** A recall is a frozen input too. Its logical departure for return can be
@@ -158,10 +150,16 @@ export class AppService {
         // A partially initialized or damaged database is not an empty save.
         throw new Error('Cannot initialize over existing game data');
       }
-      for (const pet of createDemoPets()) tx.savePet(pet);
+      const starters = createStarterPets();
+      const startedAt = this.now();
+      for (const pet of starters) tx.savePet(pet);
       tx.setWalletCoins(0);
-      tx.savePreferences({ revision: 0, logicalTime: this.now(), primaryPetId: 'pet-1',
+      tx.savePreferences({ revision: 0, logicalTime: startedAt, primaryPetId: 'pet-1',
         doNotDisturb: false, pausedRender: false });
+      for (const pet of starters) {
+        tx.insertPetAcquisition({ petId: pet.petId, acquiredAt: startedAt, origin: 'STARTER',
+          catalogVersion: CHARACTER_CATALOG_VERSION, coinCost: 0, commandId: null });
+      }
     });
   }
 
@@ -378,6 +376,34 @@ export class AppService {
       }
       return;
     }
+    // Acquiring creates an instance and therefore has no existing petId to
+    // look up. Every check and the debit happen in this command transaction.
+    if (command.type === 'PET_ACQUIRE') {
+      const { characterId, catalogVersion } = command.payload;
+      if (catalogVersion !== CHARACTER_CATALOG_VERSION) {
+        return failure('REVISION_CONFLICT', 'The character catalog has changed. Refresh it before acquiring a character.', true);
+      }
+      const context = characterAcquisitionContext(tx);
+      const decision = evaluateCharacterAcquisition(characterId, context);
+      if (!decision.ok) {
+        switch (decision.reason) {
+          case 'UNKNOWN_CHARACTER': return failure('NOT_FOUND', 'The character does not exist.');
+          case 'ALREADY_OWNED': return failure('BUSINESS_RULE', 'This character has already been acquired.');
+          case 'CAPACITY_REACHED': return failure('BUSINESS_RULE', 'The pet capacity has been reached.');
+          case 'UNMET_REQUIREMENT': return failure('BUSINESS_RULE', 'More settled trips are required to acquire this character.');
+          case 'INSUFFICIENT_COINS': return failure('BUSINESS_RULE', 'There are not enough in-game coins.');
+        }
+      }
+      const petId = idSchema.parse(this.runtime.createId('pet'));
+      if (tx.getPet(petId) !== null) throw new Error('Generated pet ID already exists');
+      tx.savePet(createCharacterPet(decision.definition, petId, 'HIDDEN'));
+      if (decision.coinCost > 0) tx.setWalletCoins(context.walletCoins - decision.coinCost);
+      tx.insertPetAcquisition({ petId, acquiredAt: at, origin: 'GAME', catalogVersion,
+        coinCost: decision.coinCost, commandId: command.commandId });
+      this.revise(state);
+      this.event(state, 'PetAcquired', petId, command.commandId, at, { petId, characterId, catalogVersion, coinCost: decision.coinCost });
+      return;
+    }
     const pet = tx.getPet(command.payload.petId);
     if (pet === null) return failure('NOT_FOUND', 'The pet does not exist.');
     const updatePet = (changes: Partial<PetRecord>): void => {
@@ -385,6 +411,18 @@ export class AppService {
       this.revise(state);
     };
     switch (command.type) {
+      case 'PET_RENAME': {
+        let nickname: string;
+        try { nickname = normalizeCharacterNickname(command.payload.nickname); }
+        catch { return failure('INVALID_REQUEST', 'Invalid pet nickname.'); }
+        if (nickname !== pet.nickname) {
+          // Nickname is presentation metadata only; presence, travel, stats,
+          // acquisition identity and other pets are not changed by a rename.
+          updatePet({ nickname });
+          this.event(state, 'PetRenamed', pet.petId, command.commandId, at, { petId: pet.petId, nickname });
+        }
+        return;
+      }
       case 'PET_SELECT':
         if (preferences.primaryPetId !== pet.petId) {
           this.revise(state, { primaryPetId: pet.petId });
@@ -526,6 +564,15 @@ export class AppService {
     });
   }
 
+  private getCharacters(): CharactersOutcome {
+    return this.repository.transaction((tx) => {
+      const state = this.state(tx);
+      this.advanceAll(state);
+      const snapshot = this.snapshot(state);
+      return { ok: true, snapshot, characters: projectCharacterCatalog(tx, snapshot.revision) };
+    });
+  }
+
   dispatch(command: DomainCommand): CommandOutcome {
     if (this.closed) return unavailable();
     const parsed = domainCommandSchema.safeParse(command);
@@ -571,6 +618,11 @@ export class AppService {
         const outcome = this.getGallery(parsed.data.payload);
         return outcome.ok ? { schemaVersion: CONTRACT_SCHEMA_VERSION, ok: true, requestId,
           snapshot: outcome.snapshot, gallery: outcome.gallery } : respondError(outcome);
+      }
+      if (parsed.data.method === 'characters/list') {
+        const outcome = this.getCharacters();
+        return { schemaVersion: CONTRACT_SCHEMA_VERSION, ok: true, requestId,
+          snapshot: outcome.snapshot, characters: outcome.characters };
       }
       const outcome = parsed.data.method === 'snapshot/get' ? { ok: true as const, snapshot: this.getSnapshot() }
         : this.dispatch(parsed.data.payload.command);

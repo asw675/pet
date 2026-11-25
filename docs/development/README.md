@@ -11,7 +11,7 @@
 | 001-V | 真实依赖锁文件及完整测试 | 完成 | [001-validation](001-validation.md) |
 | 002A | SQLite 事务仓库、版本化迁移 | 开发机测试通过 | [002a-storage](002a-storage.md) |
 | 002B | 应用用例与原子结算 | 单元及真实数据库集成通过 | [002b-app-service](002b-app-service.md) |
-| 002C | 独立子进程验证 | 集成中 | — |
+| 002C | 独立子进程验证 | Node 真实进程验证通过 | [002c-process](002c-process.md) |
 | 003 | 宿主、preload 与双 renderer 原型 | 待开发 | — |
 | 004 | 角色渲染及最小端到端闭环 | 待开发 | — |
 | 005 | Windows 安装包与真机 P0 验收 | 待开发 | — |

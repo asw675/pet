@@ -11,6 +11,9 @@ import type { EventListQuery, EventReward } from '@pet-desktop/contracts/events'
 import { EVENT_LIMITS, EVENT_TRIGGERS, resolveEventOccurrence, validateFrozenOccurrence } from '@pet-desktop/domain/event-engine';
 import type { EventEffectDraft, EventHistoryEntry, FrozenEventOccurrence } from '@pet-desktop/domain/event-engine';
 import { canonicalTripDepartureLoadout, validateTripDepartureLoadoutRecord } from '#trip-departure-storage';
+import { AI_STATE_MIGRATION_SQL, AiStateStorage } from '#ai-state-storage';
+import { WORKSPACE_MIGRATION_SQL, WorkspaceStorage } from '#workspace-storage';
+import { VOICE_PROFILE_MIGRATION_SQL, VoiceProfileStorage } from '#voice-profile-storage';
 import { advanceTrip, MAX_TRIP_FACTS, MAX_TRIP_NODES } from '@pet-desktop/domain';
 import type { RewardDraft, TripCheckpoint, TripFact, TripSnapshot } from '@pet-desktop/domain';
 import type {
@@ -22,7 +25,7 @@ import type {
 const MAX_SAFE = Number.MAX_SAFE_INTEGER;
 const UINT32_MAX = 0xffff_ffff;
 const BUSY_TIMEOUT_MS = 5_000;
-const SCHEMA_VERSION = 7;
+const SCHEMA_VERSION = 10;
 const JSON_SCHEMA_VERSION = 1;
 const MIGRATION_001_JSON_SCHEMA_VERSION = 1;
 const MIGRATION_001_MAX_TRIP_FACTS = 14;
@@ -733,7 +736,7 @@ BEGIN SELECT RAISE(ABORT, 'trip departure receipt is immutable'); END;
 // Separate immutable occurrence and finalization rows make finalization a
 // compare-and-set insert. Deferred references forbid partial selection,
 // automatic resolution, effect evidence, acquisition or choice receipts.
-const MIGRATION_007 = `
+export const MIGRATION_007 = `
 CREATE TABLE event_trigger_receipts (
   trigger_key TEXT PRIMARY KEY NOT NULL CHECK(length(trigger_key) BETWEEN 1 AND 512 AND length(trim(trigger_key))>0),
   pet_id TEXT NOT NULL REFERENCES pets(pet_id),
@@ -926,6 +929,9 @@ const MIGRATIONS = Object.freeze([
   { version: 5, sql: MIGRATION_005 },
   { version: 6, sql: MIGRATION_006 },
   { version: 7, sql: MIGRATION_007 },
+  { version: 8, sql: AI_STATE_MIGRATION_SQL },
+  { version: 9, sql: WORKSPACE_MIGRATION_SQL },
+  { version: 10, sql: VOICE_PROFILE_MIGRATION_SQL },
 ]);
 
 /** FNV-1a is a migration-change detector, not a security signature. */
@@ -1620,6 +1626,10 @@ class SQLiteTransaction implements AppTransaction {
     if (!this.inScope()) throw new Error('Transaction is no longer active');
     return this.connection;
   }
+
+  aiState(): AiStateStorage { return new AiStateStorage(this.db, this.inScope); }
+  workspaceState(): WorkspaceStorage { return new WorkspaceStorage(this.db, this.inScope); }
+  voiceProfiles(): VoiceProfileStorage { return new VoiceProfileStorage(this.db, this.inScope); }
 
   getPreferences(): PreferencesRecord | null {
     const value = this.db.prepare('SELECT * FROM preferences WHERE singleton = 1').get();
@@ -2423,6 +2433,11 @@ function migrate(db: SqliteConnection, persistent: boolean, beforeMigration?: (f
       } : null;
       const oldDepartureTripCount = migration.version === 6 ? rowCount(db,'SELECT count(*) AS count FROM trips') : null;
       const oldEventCounts=migration.version===7?Object.fromEntries(['pets','trips','cg_unlocks','commands','reward_ledger'].map(table=>[table,rowCount(db,`SELECT count(*) AS count FROM ${table}`)])):null;
+      const oldExtensionCounts=migration.version>=8?Object.fromEntries([
+        'pets','trips','cg_unlocks','commands','reward_ledger','event_trigger_receipts','event_occurrences','event_finalizations','event_effects','event_cg_unlocks',
+        ...(migration.version>=9?['ai_provider_configs','ai_pet_provider_assignments','ai_conversations','ai_turns','ai_messages','ai_memories','ai_memory_grants']:[]),
+        ...(migration.version>=10?['workspace_settings','quick_actions','routines','routine_targets','launch_history','recommendation_preferences','recommendation_impressions']:[]),
+      ].map(table=>[table,rowCount(db,`SELECT count(*) AS count FROM ${table}`)])):null;
       db.exec(migration.sql);
       if (oldCounts !== null && (oldCounts.trips !== rowCount(db, 'SELECT count(*) AS count FROM trips')
         || oldCounts.unlocks !== rowCount(db, 'SELECT count(*) AS count FROM cg_unlocks')
@@ -2454,6 +2469,22 @@ function migrate(db: SqliteConnection, persistent: boolean, beforeMigration?: (f
       if(oldEventCounts!==null&&(Object.entries(oldEventCounts).some(([table,count])=>rowCount(db,`SELECT count(*) AS count FROM ${table}`)!==count)
         ||['event_trigger_receipts','event_occurrences','event_finalizations','event_effects','event_cg_unlocks'].some(table=>rowCount(db,`SELECT count(*) AS count FROM ${table}`)!==0))){
         throw new Error('Event migration changed legacy history or invented narrative occurrences');
+      }
+      if(oldExtensionCounts!==null&&Object.entries(oldExtensionCounts).some(([table,count])=>rowCount(db,`SELECT count(*) AS count FROM ${table}`)!==count)){
+        throw new Error('AI/workspace/voice migration changed existing authoritative history');
+      }
+      if(migration.version===8&&['ai_provider_configs','ai_pet_provider_assignments','ai_conversations','ai_turns','ai_messages','ai_turn_sources',
+        'ai_turn_memory_refs','ai_proposal_ids','ai_candidate_ids','ai_memory_ids','ai_action_proposals','ai_memory_candidates','ai_candidate_sources',
+        'ai_memories','ai_memory_sources','ai_memory_grants'].some(table=>rowCount(db,`SELECT count(*) AS count FROM ${table}`)!==0)){
+        throw new Error('AI migration must not invent provider configuration, consent, conversation or memory history');
+      }
+      if(migration.version===9&&(rowCount(db,'SELECT count(*) AS count FROM workspace_settings WHERE singleton=1 AND revision=0 AND recommendation_enabled=0 AND retention_days=30')!==1
+        ||['quick_actions','routines','routine_targets','launch_history','recommendation_preferences','recommendation_impressions']
+          .some(table=>rowCount(db,`SELECT count(*) AS count FROM ${table}`)!==0))){
+        throw new Error('Workspace migration must begin opt-out with no approved targets or recommendation history');
+      }
+      if(migration.version===10&&rowCount(db,'SELECT count(*) AS count FROM voice_profiles')!==0){
+        throw new Error('Voice migration must not invent voice preferences or consent');
       }
       db.prepare('INSERT INTO schema_migrations (version, checksum, applied_at) VALUES (?, ?, ?)')
         .run(migration.version, migrationChecksum(migration.sql), Date.now());

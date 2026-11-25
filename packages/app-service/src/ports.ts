@@ -6,6 +6,9 @@ import type { EventHistoryEntry, EventSelectionResult, EventTrigger, FrozenEvent
 import type { EquipmentSlot } from '@pet-desktop/contracts/inventory';
 import type { TripDepartureLoadout, TravelReportsQuery } from '@pet-desktop/contracts/travel';
 import type { TripDepartureLoadoutRecord } from './trip-departure-storage.js';
+import type { AiStateStorage } from './ai-state-storage.js';
+import type { WorkspaceStorage } from './workspace-storage.js';
+import type { VoiceProfileStorage } from './voice-profile-storage.js';
 export type { TripDepartureLoadoutRecord } from './trip-departure-storage.js';
 import type { RewardDraft, TripCheckpoint, TripFact, TripSnapshot } from '@pet-desktop/domain';
 
@@ -193,6 +196,10 @@ export interface OutboxRecord {
 
 /** No method is callable from a renderer. Only app-service owns this transaction. */
 export interface AppTransaction {
+  /** Same exclusive SQLite transaction and lifetime; neither view owns a connection. */
+  aiState(): AiStateStorage;
+  workspaceState(): WorkspaceStorage;
+  voiceProfiles(): VoiceProfileStorage;
   getPreferences(): PreferencesRecord | null;
   savePreferences(record: PreferencesRecord): void;
   listPets(): PetRecord[];

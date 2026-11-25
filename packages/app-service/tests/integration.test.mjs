@@ -983,7 +983,7 @@ describe.skipIf(!supported)('persisted HOME recovery and bounded interactions', 
     instance.close();
     const upgraded = new DatabaseSync(f.dbPath, { readOnly: true });
     try {
-      expect(upgraded.prepare('PRAGMA user_version').get().user_version).toBe(7);
+      expect(upgraded.prepare('PRAGMA user_version').get().user_version).toBe(10);
       expect(upgraded.prepare('SELECT fingerprint,outcome_json,created_at FROM commands WHERE command_id=?').get(oldCommand.commandId))
         .toEqual({ fingerprint, outcome_json: outcome, created_at: initialTime });
       expect(upgraded.prepare('SELECT acquired_at FROM pet_acquisitions WHERE pet_id=?').get(petId).acquired_at)

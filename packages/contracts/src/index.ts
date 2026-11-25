@@ -228,4 +228,5 @@ export interface AppBridge {
   subscribeSnapshot(listener: (snapshot: AppSnapshot) => void): () => void;
 }
 
-export * from './character-pack.js';
+export * from '#character-pack';
+export * from '#gallery';

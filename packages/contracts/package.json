@@ -4,6 +4,10 @@
   "private": true,
   "type": "module",
   "exports": "./src/index.ts",
+  "imports": {
+    "#character-pack": "./src/character-pack.ts",
+    "#gallery": "./src/gallery.ts"
+  },
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "vitest run"

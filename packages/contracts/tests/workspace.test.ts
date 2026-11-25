@@ -142,6 +142,13 @@ describe('renderer intents have no arbitrary launcher authority', () => {
     expect(approvedActionInputSchema.safeParse({ id: view.id, label: view.label, target: exe, approvedAt: 1234, enabled: true, recommendable: true }).success).toBe(true);
   });
 
+  it('takes untrusted HTTPS candidate text only through the distinct native approval intent', () => {
+    expect(workspaceNativeSelectIntentSchema.safeParse({ kind: 'HTTPS', expectedRevision: 0, manualHttpsUrl: 'https://example.com/manual' }).success).toBe(true);
+    expect(workspaceNativeSelectIntentSchema.safeParse({ kind: 'HTTPS', expectedRevision: 0 }).success).toBe(false);
+    expect(workspaceNativeSelectIntentSchema.safeParse({ kind: 'WIN32_EXE', expectedRevision: 0, manualHttpsUrl: 'https://example.com/' }).success).toBe(false);
+    expect(workspaceNativeSelectIntentSchema.safeParse({ kind: 'HTTPS', expectedRevision: 0, manualHttpsUrl: 'x'.repeat(2049) }).success).toBe(false);
+  });
+
   it.each([
     [workspaceNativeSelectIntentSchema, { ...nativeSelect, locator: exe.locator }],
     [workspaceNativeSelectIntentSchema, { ...nativeSelect, kind: 'SHELL' }],

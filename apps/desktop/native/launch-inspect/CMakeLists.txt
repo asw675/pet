@@ -1,0 +1,17 @@
+cmake_minimum_required(VERSION 3.24)
+project(pet_desktop_launch_inspect LANGUAGES CXX)
+
+if(NOT WIN32 OR NOT MSVC)
+  message(FATAL_ERROR "Build this helper with a Windows MSVC developer environment")
+endif()
+if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
+  message(FATAL_ERROR "The V1 helper must be built x64")
+endif()
+
+add_executable(launch-inspect main.cpp)
+target_compile_features(launch-inspect PRIVATE cxx_std_17)
+target_compile_definitions(launch-inspect PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00)
+set_property(TARGET launch-inspect PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+target_compile_options(launch-inspect PRIVATE /W4 /sdl /guard:cf /utf-8)
+target_link_options(launch-inspect PRIVATE /guard:cf /DYNAMICBASE /NXCOMPAT "/MANIFESTUAC:level='asInvoker' uiAccess='false'")
+target_link_libraries(launch-inspect PRIVATE bcrypt wintrust crypt32 advapi32)

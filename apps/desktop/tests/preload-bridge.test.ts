@@ -105,8 +105,9 @@ describe('role-specific preload bridges', () => {
     ];
     const pet = createPetBridge(ipc);
     const center = createControlCenterBridge(ipc);
-    expect(Object.keys(pet).sort()).toEqual([...commonKeys, 'setInteractive', 'reportVisualReady'].sort());
-    expect(Object.keys(center).sort()).toEqual([...commonKeys, 'listGallery', 'listCharacters', 'listInventory', 'listTravelCatalog', 'previewTravel', 'listTravelReports', 'listEvents'].sort());
+    expect(Object.keys(pet).sort()).toEqual([...commonKeys, 'setInteractive', 'reportVisualReady','subscribeVoiceMouth'].sort());
+    expect(Object.keys(center).sort()).toEqual([...commonKeys, 'listGallery', 'listCharacters', 'listInventory', 'listTravelCatalog', 'previewTravel', 'listTravelReports', 'listEvents',
+      'aiRequest','subscribeChatEvents','saveProviderCredential','revokeProviderCredential','voiceRequest','voiceSettingsRequest','workspaceRequest','authorizeMicrophone','requestMic','revokeMic','cancelVoiceChat','publishMouth','subscribeSuspend'].sort());
     expect('reportVisualReady' in center).toBe(false);
     expect('listGallery' in pet).toBe(false);
     expect('listCharacters' in pet).toBe(false);
@@ -115,6 +116,11 @@ describe('role-specific preload bridges', () => {
     expect('previewTravel' in pet).toBe(false);
     expect('listTravelReports' in pet).toBe(false);
     expect('listEvents' in pet).toBe(false);
+    expect('aiRequest' in pet).toBe(false);
+    expect('saveProviderCredential' in pet).toBe(false);
+    expect('requestMic' in pet).toBe(false);
+    expect('voiceRequest' in pet).toBe(false);
+    expect('subscribeVoiceMouth' in center).toBe(false);
     expect(pet.role).toBe('pet');
     expect(center.role).toBe('control-center');
     expect(Object.isFrozen(pet)).toBe(true);

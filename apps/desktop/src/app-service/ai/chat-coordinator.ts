@@ -27,7 +27,7 @@ export type ChatTurnIntent = UserChatTurnIntent | ProactiveChatTurnIntent;
  * exactly one pending assistant response, freezes the authorized context and
  * chooses the provider ID from durable settings. No caller-supplied context. */
 export type ChatBeginResult =
-  | { kind: 'STARTED'; turn: TurnRequest; providerId: string }
+  | { kind: 'STARTED'; turn: TurnRequest; providerId: string; providerRevision: number }
   | { kind: 'DUPLICATE' }
   | { kind: 'REJECTED'; error: AiError };
 
@@ -51,10 +51,14 @@ export interface ChatAuthorityPort {
   isProposalAllowed?(identity: TurnIdentity, draft: ActionProposalDraft): boolean;
 }
 
-export interface ResolvedChatProvider { config: ProviderConfig; provider: ModelProvider }
-export interface ChatProviderRegistry { resolve(providerId: string): ResolvedChatProvider | undefined }
+export interface ResolvedChatProvider { config: ProviderConfig; provider: ModelProvider; providerRevision: number }
+/** Resolve only a still-pending, currently authorized request's exact provider
+ * revision. Called again after any asynchronous credential retrieval. */
+export interface ChatProviderRegistry {
+  resolve(providerId: string, providerRevision: number, identity: TurnIdentity, at: number): ResolvedChatProvider | undefined;
+}
 export interface ChatCredentialBroker {
-  resolveCredential(providerId: string, credentialRef: string, signal: AbortSignal): Promise<string | null>;
+  resolveCredential(providerId: string, credentialRef: string, signal: AbortSignal, identity: TurnIdentity): Promise<string | null>;
 }
 export interface ChatCoordinatorOptions {
   authority: ChatAuthorityPort;
@@ -200,7 +204,7 @@ export class ChatCoordinator {
     // provider/credential wait. Even malformed trusted output is terminated
     // against the original request identity, never re-attributed elsewhere.
     const clonedTurn = turnRequestSchema.safeParse(begun.turn);
-    const frozenBegun = { kind: 'STARTED' as const, providerId: begun.providerId,
+    const frozenBegun = { kind: 'STARTED' as const, providerId: begun.providerId, providerRevision: begun.providerRevision,
       turn: clonedTurn.success ? clonedTurn.data : begun.turn };
     const job: Job = { identity: copyIdentity(frozenIntent), intent: frozenIntent, begun: frozenBegun, startedAt: at,
       deadline: Math.min(Number.MAX_SAFE_INTEGER, at + aiLimits.timeoutMs), controller: new AbortController(),
@@ -326,34 +330,46 @@ export class ChatCoordinator {
     try {
       const parsed = turnRequestSchema.safeParse(job.begun.turn);
       if (!parsed.success || !sameIdentity(parsed.data, job.identity) || parsed.data.trigger !== job.intent.trigger
-        || parsed.data.userText !== job.intent.userText || !id.safeParse(job.begun.providerId).success) {
+        || parsed.data.userText !== job.intent.userText || !id.safeParse(job.begun.providerId).success
+        || !Number.isSafeInteger(job.begun.providerRevision) || job.begun.providerRevision < 1) {
         throw new ModelProviderError('INTERNAL_ERROR');
       }
       const turn = parsed.data;
       this.armDeadline(job, turn.deadline);
-      const resolved = this.options.registry.resolve(job.begun.providerId);
+      const resolveCurrent = () => this.options.registry.resolve(job.begun.providerId, job.begun.providerRevision, { ...job.identity }, this.clock());
+      const resolved = resolveCurrent();
       const checked = providerConfigSchema.safeParse(resolved?.config);
       if (!resolved || !checked.success || checked.data.providerId !== job.begun.providerId
+        || resolved.providerRevision !== job.begun.providerRevision
         || typeof resolved.provider?.generate !== 'function') throw new ModelProviderError('UNSUPPORTED');
       const config = checked.data;
       this.armDeadline(job, Math.min(Number.MAX_SAFE_INTEGER, job.startedAt + config.timeoutMs));
       let credential: string | null = null;
       if (config.credentialRef !== null) {
         try {
-          credential = await abortable(this.options.credentialBroker.resolveCredential(config.providerId, config.credentialRef, job.controller.signal), job.controller.signal);
+          credential = await abortable(this.options.credentialBroker.resolveCredential(config.providerId, config.credentialRef, job.controller.signal, { ...job.identity }), job.controller.signal);
         } catch { if (!this.isActive(job)) return; throw new ModelProviderError('AUTH_REQUIRED'); }
         if (typeof credential !== 'string' || credential.length === 0 || credential.length > 8192 || /[^\x21-\x7e]/u.test(credential)) {
           throw new ModelProviderError('AUTH_REQUIRED');
         }
       }
       if (!this.checkDeadline(job)) return;
+      // Provider settings, assignment consent, and frozen sources may have
+      // changed while the broker was awaiting I/O. Obtain exact fresh
+      // authorization immediately before the first network/provider call.
+      const current = resolveCurrent();
+      const currentConfig = providerConfigSchema.safeParse(current?.config);
+      if (!current || current.providerRevision !== job.begun.providerRevision || !currentConfig.success
+        || JSON.stringify(currentConfig.data) !== JSON.stringify(config) || typeof current.provider?.generate !== 'function') {
+        throw new ModelProviderError('UNAVAILABLE');
+      }
       const outputMode = chooseMode(config);
       const request = providerRequestSchema.parse({ providerId: config.providerId, modelId: config.modelId,
         outputMode, maxOutputTokens: config.maxOutputTokens, turn: { ...turn, deadline: job.deadline } });
       if (hasKnownCredential(request, credential)) throw new ModelProviderError('UNSUPPORTED');
       // No credential is persisted in a job or emitted. The trusted provider
       // receives only this one broker result, never a cross-provider fallback.
-      const output = await abortable(resolved.provider.generate(config, request, credential, job.controller.signal,
+      const output = await abortable(current.provider.generate(config, request, credential, job.controller.signal,
         outputMode === 'TEXT' && config.capabilities.streamText ? value => this.delta(job, value, credential) : undefined), job.controller.signal);
       if (!this.checkDeadline(job)) return;
       const normalized = providerOutputSchema.safeParse(output);
@@ -434,6 +450,22 @@ export class ChatCoordinator {
     const job = this.jobs.get(parsed.data.petId);
     if (!job || !sameIdentity(job.identity, parsed.data)) return false;
     return this.finish(job, { ...job.identity, completedAt: this.completedAt(job), kind: 'CANCELLED', reason: validReason.data });
+  }
+
+  /** Call only after a trusted settings/source/memory mutation commits.
+   * Revocation invalidates outstanding jobs promptly, including streams
+   * already opened; late completions and credential lookups become inert. */
+  cancelStaleJobs(): number {
+    let count=0;
+    for(const job of [...this.jobs.values()]){
+      let authorized=false;
+      try{
+        const resolved=this.options.registry.resolve(job.begun.providerId,job.begun.providerRevision,{...job.identity},this.clock());
+        authorized=resolved!==undefined&&resolved.providerRevision===job.begun.providerRevision&&resolved.config.providerId===job.begun.providerId;
+      }catch{/* inability to establish current authorization is not consent */}
+      if(!authorized&&this.cancel(job.identity,'SUPERSEDED'))count++;
+    }
+    return count;
   }
 
   close(): void {

@@ -3,6 +3,12 @@ import { CONTRACT_SCHEMA_VERSION, idSchema, ipcRequestSchema, resultMatchesMetho
 import type { AppSnapshot, IpcErrorCode, IpcRequest, IpcResult } from '@pet-desktop/contracts';
 import { serviceInputSchema, serviceOutputSchema } from '../shared/protocol.js';
 import type { ServiceInput, ServiceStatus, SnapshotListener, StatusListener } from '../shared/protocol.js';
+import { FeatureClient } from './feature-client';
+import type { AiRequest,AiResult,ChatIdentity } from '../shared/ai-ipc';
+import type { AiCancelReason,ChatStreamEvent } from '@pet-desktop/contracts/ai';
+import type { VoiceOwnedJob,VoiceServiceRequest,VoiceServiceResult } from '../shared/voice-ipc';
+import type { WorkspaceAuthorityRequest,WorkspaceAuthorityResult } from '../shared/workspace-ipc';
+import type {VoiceSettingsRequest,VoiceSettingsResult} from '../shared/voice-settings-ipc';
 
 /** Narrow adapter over Electron UtilityProcess; no Electron APIs needed in tests. */
 export interface ServiceChild {
@@ -19,6 +25,7 @@ export interface ServiceClientOptions {
   shutdownTimeoutMs?: number;
   restartDelayMs?: number;
   maxRestarts?: number;
+  credential?: (providerId:string,credentialRef:string)=>Promise<string|null>;
 }
 
 type Timer = ReturnType<typeof setTimeout>;
@@ -39,6 +46,7 @@ interface Session {
   pending: Map<string, Pending>;
   usedIds: Set<string>;
   lastRevision: number;
+  features: FeatureClient|undefined;
 }
 
 function errorResult(requestId: string, code: IpcErrorCode, message: string, retryable: boolean): IpcResult {
@@ -72,6 +80,8 @@ export class ServiceClient {
   private readonly maxRestarts: number;
   private readonly snapshotListeners = new Set<SnapshotListener>();
   private readonly statusListeners = new Set<StatusListener>();
+  private readonly chatListeners = new Set<(event:ChatStreamEvent)=>void>();
+  private readonly credential: ServiceClientOptions['credential'];
   private status: ServiceStatus = { stage: 'UNAVAILABLE', generation: 0 };
   private current: Session | undefined;
   private restartTimer: Timer | undefined;
@@ -84,6 +94,7 @@ export class ServiceClient {
 
   constructor(options: ServiceClientOptions) {
     this.spawn = options.spawn;
+    this.credential=options.credential;
     this.requestTimeoutMs = duration(options.requestTimeoutMs, 10_000);
     this.startupTimeoutMs = duration(options.startupTimeoutMs, 15_000);
     this.shutdownTimeoutMs = duration(options.shutdownTimeoutMs, 5_000);
@@ -109,6 +120,29 @@ export class ServiceClient {
   subscribeStatus(listener: StatusListener): () => void {
     this.statusListeners.add(listener);
     return () => { this.statusListeners.delete(listener); };
+  }
+
+  subscribeChat(listener:(event:ChatStreamEvent)=>void):()=>void{this.chatListeners.add(listener);return()=>{this.chatListeners.delete(listener);};}
+  requestAi(request:AiRequest):Promise<AiResult>{
+    const session=this.current;
+    if(!session||session.phase!=='online'||this.stopping||!session.features)return Promise.resolve({ok:false,requestId:request.requestId,method:request.intent.method,error:{code:'UNAVAILABLE',message:'AI 服务暂不可用。',retryable:true}});
+    return session.features.requestAi(request);
+  }
+  requestVoice(request:VoiceServiceRequest):Promise<VoiceServiceResult>{
+    const session=this.current;
+    if(!session||session.phase!=='online'||this.stopping||!session.features)return Promise.resolve({ok:false,kind:'error',code:'unavailable',...('job'in request?{job:request.job}:{})});
+    return session.features.requestVoice(request);
+  }
+  cancelVoiceChat(identity:ChatIdentity,reason:AiCancelReason):void{this.current?.features?.cancelChat(identity,reason);}
+  revokeFeatureDocument():void{this.current?.features?.revokeDocument();}
+  ownsVoice(job:VoiceOwnedJob):boolean{return this.current?.phase==='online'&&this.current.features?.ownsVoice(job)===true;}
+  requestWorkspace(request:WorkspaceAuthorityRequest):Promise<WorkspaceAuthorityResult>{
+    const session=this.current;if(!session||session.phase!=='online'||this.stopping||!session.features)return Promise.resolve({ok:false,requestId:request.requestId,method:request.intent.method,error:{code:'SERVICE_UNAVAILABLE'}});
+    return session.features.requestWorkspace(request);
+  }
+  requestVoiceSettings(request:VoiceSettingsRequest):Promise<VoiceSettingsResult>{
+    const session=this.current;if(!session||session.phase!=='online'||this.stopping||!session.features)return Promise.resolve({ok:false,kind:'error',code:'UNAVAILABLE',petId:request.petId});
+    return session.features.requestVoiceSettings(request);
   }
 
   request(request: IpcRequest): Promise<IpcResult> {
@@ -193,8 +227,11 @@ export class ServiceClient {
     const bootstrapId = `service-snapshot-${randomUUID()}`;
     const session: Session = {
       child, phase: 'handshake', bootstrapId, startupTimer: undefined, shutdownTimer: undefined,
-      pending: new Map(), usedIds: new Set([bootstrapId]), lastRevision: -1,
+      pending: new Map(), usedIds: new Set([bootstrapId]), lastRevision: -1,features:undefined,
     };
+    session.features=new FeatureClient({post:message=>this.post(session,message),onChat:event=>{
+      if(this.current===session&&session.phase==='online')for(const listener of [...this.chatListeners])try{listener(event);}catch{/* isolated */}
+    },...(this.credential?{credential:this.credential}:{}),fault:()=>this.failSession(session)});
     this.current = session;
     session.startupTimer = setTimeout(() => { this.failSession(session); }, this.startupTimeoutMs);
     child.on('exit', () => { this.onExit(session); });
@@ -239,6 +276,9 @@ export class ServiceClient {
         break;
       case 'snapshot':
         this.publishSnapshot(session, message.snapshot);
+        break;
+      case 'ai-result':case 'voice-result':case 'chat-event':case 'credential-lookup':case 'workspace-authority-result':case 'voice-settings-result':
+        if(session.phase==='online')session.features?.receive(message);
         break;
       case 'fatal':
       case 'stopped':
@@ -303,6 +343,7 @@ export class ServiceClient {
     clearTimeout(session.startupTimer);
     session.startupTimer = undefined;
     this.failPending(session);
+    session.features?.close();
     session.shutdownTimer = setTimeout(() => { this.kill(session); }, this.shutdownTimeoutMs);
     try {
       this.post(session, { kind: 'shutdown' });
@@ -323,6 +364,7 @@ export class ServiceClient {
     clearTimeout(session.startupTimer);
     clearTimeout(session.shutdownTimer);
     this.failPending(session);
+    session.features?.close();
     this.current = undefined;
     if (this.stopping) this.finishStop();
     else this.scheduleRestart();

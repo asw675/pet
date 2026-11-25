@@ -191,7 +191,13 @@ export type WorkspacePage = z.infer<typeof workspacePageSchema>;
  * boolean. Main binds a native approval token to the actual selection. */
 const approvalToken = z.string().regex(/^quick-[1-9]\d{0,15}-[a-f0-9]{64}$/u);
 const targetRevision = { actionId: id, expectedRevision: uint };
-export const workspaceNativeSelectIntentSchema = z.strictObject({ kind: quickLaunchKindSchema, expectedRevision: uint });
+// User-entered HTTPS text is a candidate for normalization and a distinct
+// native confirmation, never an approved target or an arbitrary locator.
+export const workspaceNativeSelectIntentSchema = z.discriminatedUnion('kind', [
+  z.strictObject({ kind: z.literal('WIN32_EXE'), expectedRevision: uint }),
+  z.strictObject({ kind: z.literal('FOLDER'), expectedRevision: uint }),
+  z.strictObject({ kind: z.literal('HTTPS'), expectedRevision: uint, manualHttpsUrl: z.string().min(1).max(workspaceLimits.urlUnits) }),
+]);
 export const workspaceFinalizeAddIntentSchema = z.strictObject({ approvalToken, label, recommendable: z.boolean(), expectedRevision: uint });
 export const workspaceReapproveIntentSchema = z.strictObject({ actionId: id, expectedActionRevision: uint, expectedWorkspaceRevision: uint, approvalToken });
 export const workspaceActionMetadataIntentSchema = z.strictObject({ ...targetRevision, label, enabled: z.boolean(), recommendable: z.boolean() });

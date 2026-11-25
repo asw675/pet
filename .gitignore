@@ -19,3 +19,4 @@ coverage/
 *.db-shm
 playwright-report/
 test-results/
+apps/desktop/native/publish/

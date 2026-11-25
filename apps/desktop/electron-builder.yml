@@ -5,6 +5,13 @@ directories:
 files:
   - out/**/*
   - package.json
+extraResources:
+  - from: native/publish/win-x64
+    to: native
+    filter:
+      - voice/whisper-cli.exe
+      - voice/pet-desktop-sapi.exe
+      - launch-inspect/launch-inspect.exe
 asarUnpack:
   - '**/*.node'
   - '**/better-sqlite3/**'

@@ -1,11 +1,13 @@
 import { resolve } from 'node:path';
 import { defineConfig } from 'electron-vite';
 import vue from '@vitejs/plugin-vue';
+import { computeNativeArtifactPins } from './scripts/native-artifact-pins.mjs';
 
 // Each preload is a standalone CJS bundle. The runtime native addon remains
 // external and is loaded only from the separate utility-process entry.
 export default defineConfig({
   main: {
+    define:{__PET_DESKTOP_NATIVE_ARTIFACT_PINS__:JSON.stringify(computeNativeArtifactPins())},
     build: {
       externalizeDeps: false,
       rollupOptions: {

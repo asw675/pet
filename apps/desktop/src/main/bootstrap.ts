@@ -1,10 +1,12 @@
 import { mkdirSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { isAbsolute, join } from 'node:path';
 import {
-  app, BrowserWindow, ipcMain, Menu, nativeImage, powerMonitor, screen, session, Tray, utilityProcess,
+  app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, powerMonitor, safeStorage, screen, session, shell, Tray, utilityProcess,
 } from 'electron';
-import type { IpcMainInvokeEvent, Rectangle } from 'electron';
+import type { IpcMainInvokeEvent, PermissionRequest, Rectangle, WebContents } from 'electron';
 import type { AppSnapshot } from '@pet-desktop/contracts';
+import { inspectVoiceAudio } from '@pet-desktop/contracts/voice';
 import { DESKTOP_IPC, petVisualReadySchema } from '../shared/protocol';
 import type { HostActionResult, PetVisualReady, ServiceStatus } from '../shared/protocol';
 import { authorizeSender, isTrustedDocument, routeRequest } from './boundary';
@@ -16,6 +18,20 @@ import { desiredPetSurface, isCurrentVisualReport, planPetHandover, samePetSurfa
 import type { PetSurfaceIdentity, PetSurfaceInfo, PetSurfacePhase } from './pet-handover';
 import { canContinueWindowWalk, createWindowWalkPlan, walkPositionAt } from './walk-window-policy';
 import type { WindowWalkPlan } from './walk-window-policy';
+import { aiRequestSchema, aiResultSchema, aiResultMatches, credentialSaveSchema, credentialRevokeSchema } from '../shared/ai-ipc';
+import type { AiRequest, AiResult } from '../shared/ai-ipc';
+import { sameVoiceJob, voiceChatCancelSchema, voiceMicGrantSchema, voiceMouthNotificationSchema, voiceOwnedJobSchema,
+  voiceResultMatchesRequest, voiceServiceRequestSchema, voiceServiceResultSchema } from '../shared/voice-ipc';
+import type { VoiceMicGrant, VoiceMouthNotification, VoiceOwnedJob, VoiceServiceRequest, VoiceServiceResult } from '../shared/voice-ipc';
+import { CredentialVault } from './credential-vault';
+import { MicrophoneGrantPolicy } from './microphone-grant';
+import {WorkspaceHost} from './workspace-host';
+import {nativeArtifactPins} from '../shared/native-artifact-pins';
+import {workspaceRequestSchema,workspaceResultMatches} from '../shared/workspace-ipc';
+import type {WorkspaceResult} from '../shared/workspace-ipc';
+import type {QuickLaunchSender} from './quick-launch-policy';
+import { voiceSettingsRequestSchema, voiceSettingsResultSchema, voiceSettingsResultMatchesRequest } from '../shared/voice-settings-ipc';
+import type { VoiceSettingsResult } from '../shared/voice-settings-ipc';
 
 const CENTER_KEY = 'control-center';
 const PET_SIZE = { width: 260, height: 295 };
@@ -23,6 +39,10 @@ const MAX_WINDOW_FAILURES = 3;
 const WINDOW_FAILURE_INTERVAL = 60_000;
 const TEMP_INTERACTION_MS = 20_000;
 const PET_VISUAL_TIMEOUT_MS = 10_000;
+const MIC_PENDING_MS = 15_000;
+const MIC_CAPTURE_MS = 35_000;
+const MIC_STOP_GRACE_MS = 1_000;
+const MOUTH_SAMPLE_INTERVAL_MS = 25;
 const devLog = (...messages: string[]) => { if (!app.isPackaged) console.info('[desktop]', ...messages); };
 
 interface Anchor { displayId: number; offsetX: number; offsetY: number }
@@ -44,7 +64,16 @@ interface WindowRecord {
   readonly inputLease: InputLease;
   responsive: boolean;
   focusOnReady: boolean;
+  documentReady: boolean;
+  documentEpoch: number;
+  featureEpoch: number;
 }
+type FeatureStamp = { record: WindowRecord; documentEpoch: number; featureEpoch: number; serviceGeneration: number };
+interface VoiceOwner { stamp: FeatureStamp; job: VoiceOwnedJob; reserved: boolean; micUsed: boolean; durationMs?: number; mouthStarted: boolean }
+interface MicLease { stamp: FeatureStamp; grant: VoiceMicGrant; consumed: boolean; revoking: boolean; timer: ReturnType<typeof setTimeout> }
+interface MouthRun { owner: VoiceOwner; target: WindowRecord; durationMs: number; lastAtMs: number; lastHostAt: number; timer: ReturnType<typeof setTimeout> }
+type HostService = Pick<ServiceClient, 'getStatus'|'start'|'stop'|'request'|'subscribeStatus'|'subscribeSnapshot'|'subscribeChat'|'requestAi'|'requestVoice'|'requestVoiceSettings'|'ownsVoice'|'cancelVoiceChat'|'revokeFeatureDocument'|'requestWorkspace'>;
+type HostVault = Pick<CredentialVault,'save'|'resolve'|'revoke'>;
 interface NativeWalkRun {
   readonly senderId: number;
   readonly displayId: number;
@@ -88,8 +117,9 @@ function spawnService(databasePath: string): ServiceChild {
   };
 }
 
-class DesktopHost {
-  private readonly service: ServiceClient;
+export class DesktopHost {
+  private readonly service: HostService;
+  private readonly credentialVault: HostVault;
   private status: ServiceStatus;
   private snapshot: AppSnapshot | undefined;
   private pendingSnapshot: AppSnapshot | undefined;
@@ -108,18 +138,33 @@ class DesktopHost {
   private interactionTimer: ReturnType<typeof setTimeout> | undefined;
   private walkingAttempt: string | undefined;
   private walkingRun: NativeWalkRun | undefined;
+  private readonly microphone = new MicrophoneGrantPolicy(() => randomUUID(), () => performance.now(), MIC_PENDING_MS);
+  private micConsent: FeatureStamp | undefined;
+  private micLease: MicLease | undefined;
+  private voiceOwner: VoiceOwner | undefined;
+  private mouthRun: MouthRun | undefined;
+  private nativePrompt = false;
+  private workspaceHost:WorkspaceHost|undefined;
+  private voiceSettingsMutation: FeatureStamp | undefined;
   private readonly rendererDir = join(__dirname, '../renderer');
   private readonly devUrl = app.isPackaged ? undefined : process.env.ELECTRON_RENDERER_URL;
 
-  constructor(databasePath: string) {
-    this.service = new ServiceClient({ spawn: () => spawnService(databasePath) });
+  constructor(databasePath: string, dependencies: { service?: HostService; vault?: HostVault } = {}) {
+    this.credentialVault = dependencies.vault ?? new CredentialVault(join(app.getPath('userData'), 'credentials'), safeStorage);
+    this.service = dependencies.service ?? new ServiceClient({ spawn: () => spawnService(databasePath),
+      credential: (providerId, ref) => this.credentialVault.resolve(providerId, ref) });
     this.status = this.service.getStatus();
   }
 
   start(): void {
     this.registerIpc();
-    // Both roles currently need no browser permissions, including media/device access.
-    session.defaultSession.setPermissionRequestHandler((_contents, _permission, callback) => callback(false));
+    // All generic checks and devices are denied. Only an exact audio-only
+    // request from the current trusted CC document can consume one mic lease.
+    session.defaultSession.setPermissionRequestHandler((contents, permission, callback, details) => {
+      let allowed = false;
+      try { allowed = this.consumeMicrophonePermission(contents, permission, details); } catch { /* deny */ }
+      callback(allowed);
+    });
     session.defaultSession.setPermissionCheckHandler(() => false);
     session.defaultSession.setDevicePermissionHandler(() => false);
 
@@ -131,9 +176,9 @@ class DesktopHost {
     screen.on('display-added', () => this.reflowWindows());
     screen.on('display-removed', () => this.reflowWindows());
     screen.on('display-metrics-changed', () => this.reflowWindows());
-    powerMonitor.on('suspend', () => { this.suspended = true; this.reconcilePets(); });
+    powerMonitor.on('suspend', () => { this.suspended = true; this.invalidateFeatures(); this.reconcilePets(); });
     powerMonitor.on('resume', () => { this.suspended = false; this.reflowWindows(); });
-    powerMonitor.on('lock-screen', () => { this.locked = true; this.reconcilePets(); });
+    powerMonitor.on('lock-screen', () => { this.locked = true; this.invalidateFeatures(); this.reconcilePets(); });
     powerMonitor.on('unlock-screen', () => { this.locked = false; this.reflowWindows(); });
 
     this.service.subscribeSnapshot((snapshot) => {
@@ -143,6 +188,8 @@ class DesktopHost {
     });
     this.service.subscribeStatus((status) => {
       if (status.generation !== this.status.generation || status.stage !== 'READY') {
+        this.invalidateFeatures();
+        this.micConsent = undefined;
         this.snapshot = undefined;
         // A new generation cannot use an earlier generation's projection.
         this.pendingSnapshot = undefined;
@@ -157,6 +204,10 @@ class DesktopHost {
       } else {
         this.reconcilePets();
       }
+    });
+    this.service.subscribeChat(event => {
+      const record = this.windows.get(CENTER_KEY);
+      if (record && this.featureCurrent(this.featureStamp(record))) this.send(record, DESKTOP_IPC.chatEvent, event);
     });
 
     this.openControlCenter();
@@ -241,6 +292,347 @@ class DesktopHost {
       this.reconcilePets();
       return { ok: true };
     });
+    ipcMain.handle(DESKTOP_IPC.aiRequest, (event, ...args: unknown[]) => this.handleAiRequest(event, args));
+    ipcMain.handle(DESKTOP_IPC.credentialSave, (event, ...args: unknown[]) => this.handleCredential(event, args, true));
+    ipcMain.handle(DESKTOP_IPC.credentialRevoke, (event, ...args: unknown[]) => this.handleCredential(event, args, false));
+    ipcMain.handle(DESKTOP_IPC.voiceRequest, (event, ...args: unknown[]) => this.handleVoiceRequest(event, args));
+    ipcMain.handle(DESKTOP_IPC.voiceSettingsRequest, (event, ...args: unknown[]) => this.handleVoiceSettings(event, args));
+    ipcMain.handle(DESKTOP_IPC.workspaceRequest,(event,...args:unknown[])=>this.handleWorkspace(event,args));
+    ipcMain.handle(DESKTOP_IPC.micAuthorize, (event, ...args: unknown[]) => this.authorizeMicrophone(event, args));
+    ipcMain.handle(DESKTOP_IPC.micRequest, (event, ...args: unknown[]) => this.requestMicrophone(event, args));
+    ipcMain.handle(DESKTOP_IPC.micRevoke, (event, ...args: unknown[]) => this.revokeMicrophone(event, args));
+    ipcMain.handle(DESKTOP_IPC.voiceChatCancel, (event, ...args: unknown[]): boolean => {
+      const stamp = this.authorizedFeature(event), owner = this.voiceOwner, parsed = voiceChatCancelSchema.safeParse(args[0]);
+      if (args.length !== 1 || !stamp || !owner || !parsed.success || !this.sameFeature(stamp, owner.stamp)) return false;
+      const { identity, reason } = parsed.data;
+      if (identity.petId !== owner.job.petId || identity.conversationId !== owner.job.conversationId || identity.requestId !== owner.job.requestId) return false;
+      this.service.cancelVoiceChat(identity, reason);
+      return true;
+    });
+    ipcMain.handle(DESKTOP_IPC.voiceMouth, (event, ...args: unknown[]) => {
+      const stamp = this.authorizedFeature(event), parsed = voiceMouthNotificationSchema.safeParse(args[0]);
+      if (args.length === 1 && stamp && parsed.success) this.publishMouth(stamp, parsed.data);
+    });
+  }
+
+  private featureStamp(record: WindowRecord): FeatureStamp {
+    return { record, documentEpoch: record.documentEpoch, featureEpoch: record.featureEpoch, serviceGeneration: this.status.generation };
+  }
+
+  private quickSender(stamp:FeatureStamp):QuickLaunchSender{
+    return{role:'control-center',senderId:stamp.record.binding.senderId,
+      documentId:`document-${stamp.documentEpoch}:${stamp.featureEpoch}:${stamp.serviceGeneration}`};
+  }
+  private currentQuickSender(sender:QuickLaunchSender):WindowRecord|null{
+    const record=this.senders.get(sender.senderId);if(!record||record.binding.role!=='control-center')return null;
+    const stamp=this.featureStamp(record);
+    return this.featureCurrent(stamp)&&this.quickSender(stamp).documentId===sender.documentId?record:null;
+  }
+  private getWorkspaceHost():WorkspaceHost{
+    if(this.workspaceHost)return this.workspaceHost;
+    this.workspaceHost=new WorkspaceHost({resourcesDirectory:process.resourcesPath??join(app.getPath('userData'),'native-development-unavailable'),
+      expectedInspectorSha256:nativeArtifactPins.launchInspectorSha256,senderIsCurrent:sender=>this.currentQuickSender(sender)!==null,
+      parentFor:sender=>this.currentQuickSender(sender)?.window??null,
+      requestAuthority:async(request,signal)=>{if(signal.aborted)throw new Error('Cancelled');const result=await this.service.requestWorkspace(request);if(signal.aborted)throw new Error('Cancelled');return result;},
+      nativeDialog:{showOpenDialog:async(parent,options)=>{if(this.nativePrompt||this.voiceOwner||this.micLease)return{canceled:true,filePaths:[]};this.nativePrompt=true;
+        try{return await dialog.showOpenDialog(parent,options);}finally{this.nativePrompt=false;}},
+        showMessageBox:async(parent,options)=>{if(this.nativePrompt||this.voiceOwner||this.micLease)return{response:options.cancelId??0};this.nativePrompt=true;
+          try{return await dialog.showMessageBox(parent,options);}finally{this.nativePrompt=false;}}},
+      nativeShell:{openPath:path=>shell.openPath(path),openExternal:url=>shell.openExternal(url)}});
+    return this.workspaceHost;
+  }
+  private async handleWorkspace(event:IpcMainInvokeEvent,args:readonly unknown[]):Promise<WorkspaceResult|null>{
+    const parsed=workspaceRequestSchema.safeParse(args[0]);if(args.length!==1||!parsed.success)return null;
+    const request=parsed.data,stamp=this.authorizedFeature(event);
+    const fail=(code:'FORBIDDEN'|'SERVICE_UNAVAILABLE'):WorkspaceResult=>({ok:false,requestId:request.requestId,method:request.intent.method,error:{code}});
+    if(!stamp)return fail('FORBIDDEN');
+    try{const result=await this.getWorkspaceHost().handle(request,this.quickSender(stamp));
+      if(!result||!this.featureCurrent(stamp)||!workspaceResultMatches(request,result))return fail('SERVICE_UNAVAILABLE');return result;
+    }catch{return fail('SERVICE_UNAVAILABLE');}
+  }
+
+  private sameFeature(left: FeatureStamp, right: FeatureStamp): boolean {
+    return left.record === right.record && left.documentEpoch === right.documentEpoch
+      && left.featureEpoch === right.featureEpoch && left.serviceGeneration === right.serviceGeneration;
+  }
+
+  private featureCurrent(stamp: FeatureStamp, focus = false): boolean {
+    const { record } = stamp;
+    if (this.stopping || this.suspended || this.locked || this.status.stage !== 'READY' || record.binding.role !== 'control-center'
+      || !this.isCurrent(record) || !record.documentReady || !record.responsive || !this.sameFeature(stamp, this.featureStamp(record))) return false;
+    try {
+      const contents = record.window.webContents;
+      return record.window.isVisible() && (!focus || record.window.isFocused()) && !contents.isDestroyed()
+        && isTrustedDocument(record.binding, contents.getURL()) && isTrustedDocument(record.binding, contents.mainFrame.url);
+    } catch { return false; }
+  }
+
+  private authorizedFeature(event: IpcMainInvokeEvent, focus = false): FeatureStamp | null {
+    const { record, sender } = this.senderOf(event);
+    if (!record || !authorizeSender(record.binding, sender, 'control-center')) return null;
+    const stamp = this.featureStamp(record);
+    return this.featureCurrent(stamp, focus) ? stamp : null;
+  }
+
+  private recheckFeature(event: IpcMainInvokeEvent, stamp: FeatureStamp): boolean {
+    const current = this.authorizedFeature(event);
+    return current !== null && this.sameFeature(stamp, current);
+  }
+
+  private async handleAiRequest(event: IpcMainInvokeEvent, args: readonly unknown[]): Promise<AiResult> {
+    const stamp = this.authorizedFeature(event);
+    if (!stamp) throw new Error('FORBIDDEN');
+    const parsed = aiRequestSchema.safeParse(args[0]);
+    if (args.length !== 1 || !parsed.success) throw new Error('INVALID_REQUEST');
+    const original = parsed.data, request: AiRequest = { ...original, requestId: randomUUID() };
+    const failed = (): AiResult => ({ requestId: original.requestId, method: original.intent.method, ok: false,
+      error: { code: 'UNAVAILABLE', message: 'AI 请求结果尚未确认，请刷新。', retryable: true } });
+    try {
+      const result = aiResultSchema.safeParse(await this.service.requestAi(request));
+      if (!this.recheckFeature(event, stamp) || !result.success || !aiResultMatches(request, result.data)) return failed();
+      return { ...result.data, requestId: original.requestId };
+    } catch { return failed(); }
+  }
+
+  /** Native dialogs contain no credentials, prompts or transcript. A modal
+   * focus change is not permission to start a capture. */
+  private async confirmNative(stamp: FeatureStamp, title: string, message: string, accept: string): Promise<boolean> {
+    if (this.nativePrompt || !this.featureCurrent(stamp, true) || this.voiceOwner || this.micLease) return false;
+    this.nativePrompt = true;
+    try {
+      const result = await dialog.showMessageBox(stamp.record.window, { type: 'question', title, message,
+        buttons: ['取消', accept], defaultId: 0, cancelId: 0, noLink: true });
+      return result.response === 1 && this.featureCurrent(stamp);
+    } catch { return false; }
+    finally { this.nativePrompt = false; }
+  }
+
+  private async handleCredential(event: IpcMainInvokeEvent, args: readonly unknown[], save: boolean): Promise<HostActionResult> {
+    const stamp = this.authorizedFeature(event, true);
+    if (!stamp) return { ok: false, code: 'FORBIDDEN' };
+    const parsed = (save ? credentialSaveSchema : credentialRevokeSchema).safeParse(args[0]);
+    if (args.length !== 1 || !parsed.success) return { ok: false, code: 'INVALID_REQUEST' };
+    const data = parsed.data;
+    const provider = data.providerId;
+    const confirmed = await this.confirmNative(stamp, 'AI 凭据', save
+      ? `为 AI 提供方 ${provider} 保存加密凭据？` : `撤销 AI 提供方 ${provider} 的本机凭据？`, save ? '保存' : '撤销');
+    if (!confirmed || !this.recheckFeature(event, stamp)) return { ok: false, code: 'FORBIDDEN' };
+    try {
+      const ok = save && 'secret' in data ? await this.credentialVault.save(provider, data.credentialRef, data.secret)
+        : !save && await this.credentialVault.revoke(provider, data.credentialRef);
+      return ok && this.recheckFeature(event, stamp) ? { ok: true } : { ok: false, code: 'SERVICE_UNAVAILABLE' };
+    } catch { return { ok: false, code: 'SERVICE_UNAVAILABLE' }; }
+  }
+
+  private hasPet(petId: string): boolean { return this.snapshot?.pets.some(pet => pet.petId === petId) === true; }
+
+  private consentCurrent(stamp: FeatureStamp): boolean {
+    const consent = this.micConsent;
+    return consent !== undefined && consent.record === stamp.record && consent.documentEpoch === stamp.documentEpoch
+      && consent.serviceGeneration === stamp.serviceGeneration;
+  }
+
+  private async authorizeMicrophone(event: IpcMainInvokeEvent, args: readonly unknown[]): Promise<HostActionResult> {
+    const stamp = this.authorizedFeature(event, true);
+    if (!stamp) return { ok: false, code: 'FORBIDDEN' };
+    if (args.length !== 0) return { ok: false, code: 'INVALID_REQUEST' };
+    if (this.consentCurrent(stamp)) return { ok: true };
+    const confirmed = await this.confirmNative(stamp, '麦克风权限', '允许当前控制中心在你按住说话时使用本机麦克风？松开即停止，不会后台录音。', '允许');
+    if (!confirmed || !this.recheckFeature(event, stamp)) return { ok: false, code: 'FORBIDDEN' };
+    this.micConsent = stamp;
+    return { ok: true };
+  }
+
+  private async handleVoiceSettings(event: IpcMainInvokeEvent, args: readonly unknown[]): Promise<VoiceSettingsResult> {
+    const stamp = this.authorizedFeature(event), parsed = voiceSettingsRequestSchema.safeParse(args[0]);
+    if (args.length !== 1 || !parsed.success) return { ok: false, kind: 'error', code: 'INVALID_REQUEST' };
+    const request = parsed.data;
+    const failure = (code: 'UNAVAILABLE'|'NOT_FOUND'|'BUSY' = 'UNAVAILABLE'): VoiceSettingsResult => ({ ok: false, kind: 'error', code, petId: request.petId });
+    if (!stamp) return failure();
+    if (!this.hasPet(request.petId)) return failure('NOT_FOUND');
+    const mutation = request.kind === 'save' || request.kind === 'reset';
+    // Mutating the frozen settings of a reserved voice session is forbidden.
+    // No new capture may race the completion of a settings change.
+    if (mutation) {
+      if (this.voiceOwner || this.micLease || this.voiceSettingsMutation || this.nativePrompt) return failure('BUSY');
+      this.voiceSettingsMutation = stamp;
+    }
+    try {
+      const result = voiceSettingsResultSchema.safeParse(await this.service.requestVoiceSettings(request));
+      return this.recheckFeature(event, stamp) && result.success && voiceSettingsResultMatchesRequest(request, result.data) ? result.data : failure();
+    } catch { return failure(); }
+    finally { if (mutation && this.voiceSettingsMutation === stamp) this.voiceSettingsMutation = undefined; }
+  }
+
+  private async handleVoiceRequest(event: IpcMainInvokeEvent, args: readonly unknown[]): Promise<VoiceServiceResult> {
+    const stamp = this.authorizedFeature(event), parsed = voiceServiceRequestSchema.safeParse(args[0]);
+    if (!stamp) throw new Error('FORBIDDEN');
+    if (args.length !== 1 || !parsed.success) throw new Error('INVALID_REQUEST');
+    const request = parsed.data;
+    const failure = (code: 'unavailable'|'permission_denied'|'canceled' = 'unavailable'): VoiceServiceResult => ({ ok: false, kind: 'error', code,
+      ...('job' in request ? { job: request.job } : {}) });
+    if (!this.hasPet(request.kind === 'status' ? request.scope.petId : request.job.petId)) return failure();
+    let owner = this.voiceOwner;
+    if (request.kind === 'begin') {
+      if (owner || this.micLease || this.nativePrompt || this.voiceSettingsMutation || !this.featureCurrent(stamp, true) || !this.consentCurrent(stamp)) return failure('permission_denied');
+      owner = { stamp, job: request.job, reserved: false, micUsed: false, mouthStarted: false };
+      this.voiceOwner = owner;
+    } else if (request.kind !== 'status') {
+      if (!owner || !this.sameFeature(stamp, owner.stamp) || !sameVoiceJob(owner.job, request.job)
+        || (request.kind !== 'cancel' && (!owner.reserved || !this.service.ownsVoice(request.job)))) return failure('canceled');
+    }
+    try {
+      const result = voiceServiceResultSchema.safeParse(await this.service.requestVoice(request));
+      const current = this.recheckFeature(event, stamp) && (request.kind === 'status' || this.voiceOwner === owner);
+      if (!current || !result.success || !voiceResultMatchesRequest(request, result.data)) {
+        if (owner && this.voiceOwner === owner && request.kind !== 'status') this.invalidateVoice(stamp.record);
+        return failure('canceled');
+      }
+      const response = result.data;
+      if (request.kind === 'begin' && owner) {
+        if (response.kind === 'begun' && this.service.ownsVoice(owner.job)) owner.reserved = true;
+        else { this.voiceOwner = undefined; return response.kind === 'error' ? response : failure(); }
+      }
+      if (response.kind === 'synthesized' && owner) owner.durationMs = inspectVoiceAudio(response.audio).durationMs;
+      if (request.kind === 'finish' || request.kind === 'cancel') {
+        if (owner && this.voiceOwner === owner) {
+          this.voiceOwner = undefined; this.clearMouth(); this.invalidateMicLease(stamp.record);
+        }
+      }
+      return response;
+    } catch {
+      if (owner && this.voiceOwner === owner && request.kind !== 'status') this.invalidateVoice(stamp.record);
+      return failure();
+    }
+  }
+
+  private requestMicrophone(event: IpcMainInvokeEvent, args: readonly unknown[]): VoiceMicGrant | null {
+    const stamp = this.authorizedFeature(event, true), parsed = voiceOwnedJobSchema.safeParse(args[0]), owner = this.voiceOwner;
+    if (args.length !== 1 || !stamp || !parsed.success || !owner || !owner.reserved || !this.sameFeature(stamp, owner.stamp)
+      || !sameVoiceJob(parsed.data, owner.job) || owner.micUsed || !this.consentCurrent(stamp) || this.nativePrompt || this.micLease
+      || !this.hasPet(owner.job.petId) || !this.service.ownsVoice(owner.job)) return null;
+    const { sender } = this.senderOf(event);
+    const raw = this.microphone.approve({ binding: stamp.record.binding, sender, documentEpoch: stamp.documentEpoch,
+      serviceGeneration: stamp.serviceGeneration, eligible: true }, owner.job);
+    const grant = voiceMicGrantSchema.safeParse(raw);
+    if (!grant.success) return null;
+    owner.micUsed = true;
+    const lease: MicLease = { stamp, grant: grant.data, consumed: false, revoking: false,
+      timer: setTimeout(() => { if (this.micLease === lease && !lease.consumed) this.invalidateVoice(stamp.record); }, MIC_PENDING_MS) };
+    this.micLease = lease;
+    return grant.data;
+  }
+
+  private consumeMicrophonePermission(contents: WebContents, permission: string, details: PermissionRequest & { mediaTypes?: unknown }): boolean {
+    const lease = this.micLease, owner = this.voiceOwner;
+    if (!lease || lease.consumed || lease.revoking || !owner || !owner.reserved || this.nativePrompt || contents.isDestroyed()
+      || contents !== lease.stamp.record.window.webContents || !this.sameFeature(owner.stamp, lease.stamp)
+      || !sameVoiceJob(owner.job, lease.grant.job) || !this.featureCurrent(lease.stamp, true) || !this.consentCurrent(lease.stamp)
+      || !this.hasPet(owner.job.petId) || !this.service.ownsVoice(owner.job)) return false;
+    const sender: SenderContext = { senderId: contents.id, isMainFrame: details.isMainFrame === true,
+      frameUrl: details.requestingUrl, documentUrl: contents.getURL() };
+    if (!this.microphone.consumeMediaRequest({ binding: lease.stamp.record.binding, sender, documentEpoch: lease.stamp.documentEpoch,
+      serviceGeneration: lease.stamp.serviceGeneration, eligible: true }, permission, details.mediaTypes)) return false;
+    lease.consumed = true;
+    clearTimeout(lease.timer);
+    lease.timer = setTimeout(() => { if (this.micLease === lease) this.recoverCaptureOwner(lease); }, MIC_CAPTURE_MS);
+    return true;
+  }
+
+  private revokeMicrophone(event: IpcMainInvokeEvent, args: readonly unknown[]): void {
+    const lease = this.micLease, parsed = voiceMicGrantSchema.safeParse(args[0]), { record, sender } = this.senderOf(event);
+    if (args.length !== 1 || !lease || !parsed.success || record !== lease.stamp.record || !record
+      || !authorizeSender(record.binding, sender, 'control-center') || record.documentEpoch !== lease.stamp.documentEpoch
+      || parsed.data.grantId !== lease.grant.grantId || !sameVoiceJob(parsed.data.job, lease.grant.job)) return;
+    // Revoking a consumed lease is also the release acknowledgement after a
+    // lifecycle cancellation. It need not be focused or in an online epoch.
+    if (!lease.revoking && !this.microphone.revoke({ binding: record.binding, sender, documentEpoch: lease.stamp.documentEpoch,
+      serviceGeneration: lease.stamp.serviceGeneration, eligible: true }, parsed.data)) return;
+    this.clearMicLease();
+  }
+
+  private clearMicLease(): void {
+    if (this.micLease) clearTimeout(this.micLease.timer);
+    this.microphone.invalidate();
+    this.micLease = undefined;
+  }
+
+  private invalidateMicLease(record?: WindowRecord, destroyed = false): void {
+    const lease = this.micLease;
+    if (!lease || (record && lease.stamp.record !== record)) return;
+    if (destroyed || !lease.consumed) { this.clearMicLease(); return; }
+    if (lease.revoking) return;
+    this.microphone.invalidate(lease.stamp.record.binding.senderId);
+    clearTimeout(lease.timer);
+    lease.revoking = true;
+    // Never rearm permission before the old stream's owner releases it. If
+    // the renderer fails to acknowledge cleanup, destroy/recover the owner.
+    lease.timer = setTimeout(() => { if (this.micLease === lease) this.recoverCaptureOwner(lease); }, MIC_STOP_GRACE_MS);
+  }
+
+  private recoverCaptureOwner(lease: MicLease): void {
+    if (this.micLease !== lease) return;
+    const record = lease.stamp.record;
+    this.clearMicLease();
+    this.invalidateFeatures(record);
+    if (this.isCurrent(record)) {
+      if (this.stopping) this.destroyWindow(record);
+      else this.recoverWindow(record);
+    }
+  }
+
+  private invalidateVoice(record?: WindowRecord): void {
+    const owner = this.voiceOwner;
+    if (owner && (!record || owner.stamp.record === record)) {
+      this.voiceOwner = undefined;
+      this.service.cancelVoiceChat({ petId: owner.job.petId, conversationId: owner.job.conversationId, requestId: owner.job.requestId }, 'SERVICE_STOPPED');
+      void this.service.requestVoice({ kind: 'cancel', job: owner.job, reason: 'SUSPEND' }).catch(() => undefined);
+      this.clearMouth();
+      this.send(owner.stamp.record, DESKTOP_IPC.voiceSuspend, true);
+    }
+    this.invalidateMicLease(record);
+  }
+
+  private invalidateFeatures(only?: WindowRecord): void {
+    const record = only ?? this.windows.get(CENTER_KEY);
+    if (record && record.binding.role !== 'control-center') return;
+    if (record && this.windows.get(CENTER_KEY) !== record) return;
+    if (record) {this.workspaceHost?.revokeSender(record.binding.senderId);record.featureEpoch++;}
+    this.invalidateVoice(record);
+    this.service.revokeFeatureDocument();
+    if (record) this.send(record, DESKTOP_IPC.voiceSuspend, true);
+  }
+
+  private clearMouth(): void {
+    const run = this.mouthRun;
+    if (!run) return;
+    this.mouthRun = undefined;
+    clearTimeout(run.timer);
+    this.send(run.target, DESKTOP_IPC.voiceMouth, { kind: 'clear', job: run.owner.job } satisfies VoiceMouthNotification);
+  }
+
+  private publishMouth(stamp: FeatureStamp, event: VoiceMouthNotification): void {
+    const owner = this.voiceOwner;
+    if (!owner || !owner.reserved || !this.sameFeature(stamp, owner.stamp) || !sameVoiceJob(owner.job, event.job)) return;
+    if (event.kind === 'clear') { if (this.mouthRun?.owner === owner) this.clearMouth(); return; }
+    if (!this.service.ownsVoice(owner.job) || owner.durationMs === undefined || !this.hasPet(owner.job.petId)) return;
+    if (event.kind === 'begin') {
+      if (owner.mouthStarted || Math.abs(event.durationMs - owner.durationMs) > 2) return;
+      owner.mouthStarted = true;
+      const target = [...this.windows.values()].find(record => record.pet?.identity.petId === owner.job.petId && this.isActivePet(record) && record.window.isVisible());
+      if (!target) return;
+      this.clearMouth();
+      const run: MouthRun = { target, owner, durationMs: owner.durationMs, lastAtMs: -1, lastHostAt: -Infinity,
+        timer: setTimeout(() => { if (this.mouthRun === run) this.clearMouth(); }, Math.ceil(owner.durationMs) + 2_000) };
+      this.mouthRun = run;
+      this.send(target, DESKTOP_IPC.voiceMouth, event);
+      return;
+    }
+    const run = this.mouthRun, now = performance.now();
+    if (!run || run.owner !== owner || !this.isActivePet(run.target) || !run.target.window.isVisible()) { if (run?.owner === owner) this.clearMouth(); return; }
+    if (event.sample.atMs <= run.lastAtMs || event.sample.atMs > run.durationMs + 2 || now - run.lastHostAt < MOUTH_SAMPLE_INTERVAL_MS) return;
+    run.lastAtMs = event.sample.atMs; run.lastHostAt = now;
+    this.send(run.target, DESKTOP_IPC.voiceMouth, event);
   }
 
   private senderOf(event: IpcMainInvokeEvent): { record: WindowRecord | undefined; sender: SenderContext } {
@@ -265,10 +657,12 @@ class DesktopHost {
 
   private acceptSnapshot(snapshot: AppSnapshot): void {
     this.snapshot = snapshot;
+    if (this.voiceOwner && !this.hasPet(this.voiceOwner.job.petId)) this.invalidateVoice(this.voiceOwner.stamp.record);
     for (const record of this.windows.values()) this.send(record, DESKTOP_IPC.snapshot, snapshot);
     // Newly created windows fetch the current snapshot or receive it on load.
     // A window creation failure must not suppress updates to existing windows.
     this.reconcilePets();
+    if (this.mouthRun && (!this.isActivePet(this.mouthRun.target) || !this.mouthRun.target.window.isVisible())) this.clearMouth();
   }
 
   private broadcastStatus(): void {
@@ -333,6 +727,7 @@ class DesktopHost {
       }, PET_VISUAL_TIMEOUT_MS);
     }
     if (phase !== 'ACTIVE') {
+      if (this.mouthRun?.target === record) this.clearMouth();
       record.inputLease.clear();
       this.updatePetInput(record);
     }
@@ -506,6 +901,7 @@ class DesktopHost {
       : { senderId: window.webContents.id, role: 'pet', petId, trustedUrl: url };
     const record: WindowRecord = {
       key, window, binding, ready: false, responsive: true, focusOnReady: focus,
+      documentEpoch: 0, featureEpoch: 0, documentReady: false,
       pet: identity === undefined ? undefined : {
         identity, phase: 'STAGING', documentReady: false, visualResult: undefined,
         stagingTimer: undefined, retirementTimer: undefined, retirementDeadline: undefined,
@@ -524,11 +920,21 @@ class DesktopHost {
       this.unregister(record);
       if (pet && registered && !this.stopping) this.scheduleRecovery(record.key, 'pet');
     });
-    window.on('hide', () => record.inputLease.clear());
+    window.on('hide', () => {
+      record.inputLease.clear();
+      if (pet) { if (this.mouthRun?.target === record) this.clearMouth(); }
+      else if (this.isCurrent(record)) this.invalidateFeatures(record);
+    });
+    window.on('blur', () => {
+      // Opening a native permission/credential prompt can blur the owner.
+      // Cancel only an active voice session, not an idle consent or text turn.
+      if (!pet && this.isCurrent(record) && (this.voiceOwner?.stamp.record === record || this.micLease?.stamp.record === record)) this.invalidateVoice(record);
+    });
     window.on('unresponsive', () => {
       record.responsive = false;
       record.inputLease.clear();
       if (pet) this.reconcilePets();
+      else this.invalidateFeatures(record);
     });
     window.on('responsive', () => { record.responsive = true; if (pet) this.reconcilePets(); });
     window.once('ready-to-show', () => {
@@ -541,20 +947,24 @@ class DesktopHost {
     window.webContents.on('did-finish-load', () => {
       if (!this.isCurrent(record)) return;
       devLog('renderer loaded', role);
+      record.documentReady = isTrustedDocument(record.binding, window.webContents.getURL());
       if (record.pet) record.pet.documentReady = true;
       this.send(record, DESKTOP_IPC.status, this.status);
       if (this.status.stage === 'READY' && this.snapshot) this.send(record, DESKTOP_IPC.snapshot, this.snapshot);
       if (record.pet) this.reconcilePets();
     });
     window.webContents.on('did-start-loading', () => {
+      if (!this.isCurrent(record)) return;
       record.inputLease.clear();
+      record.documentReady = false;
+      record.documentEpoch++;
       if (record.pet) {
         // Reloaded renderer must report a new ready surface for the same
         // authorized identity; never re-use the old document's acknowledgement.
         record.pet.documentReady = false;
         record.pet.visualResult = undefined;
         this.reconcilePets();
-      }
+      } else { this.micConsent = undefined; this.invalidateFeatures(record); }
     });
     window.webContents.on('render-process-gone', (_event, details) => {
       devLog('renderer gone', role, details.reason);
@@ -581,6 +991,12 @@ class DesktopHost {
   }
 
   private unregister(record: WindowRecord): void {
+    if (record.binding.role === 'control-center' && this.windows.get(CENTER_KEY) === record) {
+      this.invalidateFeatures(record);
+      if (this.micConsent?.record === record) this.micConsent = undefined;
+      this.invalidateMicLease(record, true);
+    }
+    if (this.mouthRun?.target === record) this.clearMouth();
     record.inputLease.clear();
     if (this.walkingRun?.senderId === record.binding.senderId) this.stopWalkMotion();
     if (record.pet) this.clearPetTimers(record.pet);
@@ -723,6 +1139,9 @@ class DesktopHost {
   async stop(): Promise<void> {
     if (this.stopping) return;
     this.stopping = true;
+    this.workspaceHost?.close();
+    this.invalidateFeatures();
+    this.micConsent = undefined;
     this.stopWalkMotion(true);
     for (const timer of this.retryTimers.values()) clearTimeout(timer);
     this.retryTimers.clear();

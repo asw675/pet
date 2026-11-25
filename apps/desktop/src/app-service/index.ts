@@ -34,7 +34,7 @@ const transport = startUtilityTransport({
     // entry only. A missing/incompatible addon is terminal, never a fallback.
     const Database = require('better-sqlite3') as typeof BetterSqlite3;
     return openPersistentService(databasePath, (filename, readOnly) => adaptConnection(new Database(filename,
-      readOnly ? { readonly: true, fileMustExist: true } : undefined)));
+      readOnly ? { readonly: true, fileMustExist: true } : undefined)),{resourcesDirectory:process.resourcesPath});
   },
   send: (message) => parentPort.postMessage(message),
   exit: (code) => {

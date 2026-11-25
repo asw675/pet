@@ -3,6 +3,8 @@ import { resultMatchesMethod } from '@pet-desktop/contracts';
 import type { AppService } from '@pet-desktop/app-service';
 import { serviceInputSchema, serviceOutputSchema } from '../shared/protocol';
 import type { ServiceOutput } from '../shared/protocol';
+import type { FeatureOutput } from '../shared/feature-protocol';
+import type { UtilityFeatures } from './feature-router';
 
 export const SNAPSHOT_TICK_MS = 1_000;
 
@@ -12,7 +14,7 @@ type Service = Pick<AppService, 'getSnapshot' | 'handleRequest' | 'close'>;
 interface UtilityOptions {
   /** Only the trusted Main process supplies this single startup argument. */
   args: readonly string[];
-  start(databasePath: string): { service: Service; sqliteVersion: string };
+  start(databasePath: string): { service: Service; sqliteVersion: string; createFeatures?: (send:(message:FeatureOutput)=>void,fault:()=>void)=>UtilityFeatures };
   send(message: ServiceOutput): void;
   exit(code: 0 | 1): void;
 }
@@ -24,6 +26,7 @@ export function startUtilityTransport(options: UtilityOptions): {
   abort(): void;
 } {
   let service: Service | undefined;
+  let features:UtilityFeatures|undefined;
   let timer: ReturnType<typeof setInterval> | undefined;
   let terminal = false;
   let lastRevision = -1;
@@ -37,7 +40,7 @@ export function startUtilityTransport(options: UtilityOptions): {
     terminal = true;
     if (timer !== undefined) clearInterval(timer);
     try {
-      service?.close();
+      try{features?.close();}finally{service?.close();}
     } catch {
       code = 'CLOSE_FAILED';
     }
@@ -84,6 +87,10 @@ export function startUtilityTransport(options: UtilityOptions): {
         return;
       }
       if (service === undefined) throw new Error('Service not initialized');
+      if(parsed.data.kind!=='request'){
+        if(!features){finish('PROTOCOL_ERROR');return;}
+        features.receive(parsed.data);return;
+      }
       const result = service.handleRequest(parsed.data.request);
       const resultId = result.ok ? result.requestId : result.error.requestId;
       if (resultId !== parsed.data.request.requestId || !resultMatchesMethod(parsed.data.request.method, result)) {
@@ -107,6 +114,7 @@ export function startUtilityTransport(options: UtilityOptions): {
     try {
       const started = options.start(databasePath);
       service = started.service;
+      features=started.createFeatures?.(message=>{if(!terminal)send(message);},()=>finish('SERVICE_FAILED'));
       // Validate the initial projection before advertising readiness.
       const initial = serviceOutputSchema.parse({ kind: 'snapshot', snapshot: service.getSnapshot() });
       if (initial.kind !== 'snapshot') throw new Error('Invalid initial projection');

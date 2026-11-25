@@ -7,6 +7,17 @@ import type {
   IpcResult, SnapshotIpcResult, InventoryIpcResult, TravelCatalogIpcResult, TravelPreviewIpcResult, TravelReportsIpcResult, EventsIpcResult,
 } from '@pet-desktop/contracts';
 import type { EventListQuery } from '@pet-desktop/contracts/events';
+import { chatStreamEventSchema } from '@pet-desktop/contracts/ai';
+import { aiIntentSchema,aiResultMatches,aiResultSchema,credentialSaveSchema,credentialRevokeSchema } from '../shared/ai-ipc';
+import type { AiIntent,AiRequest,AiResult,CredentialSave,CredentialRevoke } from '../shared/ai-ipc';
+import { voiceServiceRequestSchema,voiceServiceResultSchema,voiceResultMatchesRequest,voiceOwnedJobSchema,voiceMicGrantSchema,sameVoiceJob,voiceChatCancelSchema,voiceMouthNotificationSchema } from '../shared/voice-ipc';
+import type { VoiceServiceRequest,VoiceServiceResult,VoiceOwnedJob,VoiceMicGrant,VoiceChatIdentity,VoiceMouthNotification } from '../shared/voice-ipc';
+import type { AiCancelReason,ChatStreamEvent } from '@pet-desktop/contracts/ai';
+import { z } from 'zod';
+import {voiceSettingsRequestSchema,voiceSettingsResultSchema,voiceSettingsResultMatchesRequest} from '../shared/voice-settings-ipc';
+import type {VoiceSettingsRequest,VoiceSettingsResult} from '../shared/voice-settings-ipc';
+import {workspaceIntentSchema,workspaceResultSchema,workspaceResultMatches} from '../shared/workspace-ipc';
+import type {WorkspaceIntent,WorkspaceRequest,WorkspaceResult} from '../shared/workspace-ipc';
 import type { TripPreparationPayload, TravelReportsQuery } from '@pet-desktop/contracts/travel';
 import {
   DESKTOP_IPC, hostActionResultSchema, petVisualReadySchema, serviceStatusSchema,
@@ -17,8 +28,10 @@ import type {
 
 type InvokeChannel = typeof DESKTOP_IPC.request | typeof DESKTOP_IPC.getStatus
   | typeof DESKTOP_IPC.openControlCenter | typeof DESKTOP_IPC.petInteractive
-  | typeof DESKTOP_IPC.petVisualReady;
-type PushChannel = typeof DESKTOP_IPC.snapshot | typeof DESKTOP_IPC.status;
+  | typeof DESKTOP_IPC.petVisualReady | typeof DESKTOP_IPC.aiRequest | typeof DESKTOP_IPC.credentialSave | typeof DESKTOP_IPC.credentialRevoke
+  | typeof DESKTOP_IPC.voiceRequest | typeof DESKTOP_IPC.micAuthorize | typeof DESKTOP_IPC.micRequest | typeof DESKTOP_IPC.micRevoke
+  | typeof DESKTOP_IPC.voiceChatCancel | typeof DESKTOP_IPC.voiceMouth | typeof DESKTOP_IPC.voiceSettingsRequest | typeof DESKTOP_IPC.workspaceRequest;
+type PushChannel = typeof DESKTOP_IPC.snapshot | typeof DESKTOP_IPC.status | typeof DESKTOP_IPC.chatEvent | typeof DESKTOP_IPC.voiceMouth | typeof DESKTOP_IPC.voiceSuspend;
 type PushListener = (event: unknown, ...args: unknown[]) => void;
 
 /** Internal transport seam; only the explicit bridge below crosses contextBridge. */
@@ -185,7 +198,10 @@ function baseBridge(ipc: DesktopIpcPort, requestId: () => string): DesktopBridge
 type HostActionInvoke =
   | [channel: typeof DESKTOP_IPC.openControlCenter]
   | [channel: typeof DESKTOP_IPC.petInteractive, interactive: boolean]
-  | [channel: typeof DESKTOP_IPC.petVisualReady, report: PetVisualReady];
+  | [channel: typeof DESKTOP_IPC.petVisualReady, report: PetVisualReady]
+  | [channel:typeof DESKTOP_IPC.micAuthorize]
+  | [channel:typeof DESKTOP_IPC.credentialSave,payload:CredentialSave]
+  | [channel:typeof DESKTOP_IPC.credentialRevoke,payload:CredentialRevoke];
 
 async function hostAction(ipc: DesktopIpcPort, ...call: HostActionInvoke): Promise<HostActionResult> {
   const [channel, ...args] = call;
@@ -200,6 +216,7 @@ export function createPetBridge(ipc: DesktopIpcPort, requestId = newRequestId): 
   return Object.freeze({
     role: 'pet',
     ...baseBridge(ipc, requestId),
+    subscribeVoiceMouth:(listener:(event:VoiceMouthNotification)=>void)=>subscribe(ipc,DESKTOP_IPC.voiceMouth,voiceMouthNotificationSchema,listener),
     async setInteractive(interactive: boolean): Promise<HostActionResult> {
       if (typeof interactive !== 'boolean') return { ok: false, code: 'INVALID_REQUEST' };
       return hostAction(ipc, DESKTOP_IPC.petInteractive, interactive);
@@ -234,5 +251,48 @@ export function createControlCenterBridge(ipc: DesktopIpcPort, requestId = newRe
     previewTravel: (input: TripPreparationPayload) => sendRequest(ipc, requestId, 'travel/preview', input),
     listTravelReports: (query: TravelReportsQuery) => sendRequest(ipc, requestId, 'travel/reports', query),
     listEvents: (query: EventListQuery) => sendRequest(ipc, requestId, 'events/list', query),
+    async aiRequest(raw:AiIntent):Promise<AiResult>{
+      const id=requestId(),intent=parse(aiIntentSchema,raw);
+      const fail=(code:'UNSUPPORTED'|'UNAVAILABLE'|'INTERNAL_ERROR',method:AiIntent['method']='settings/list'):AiResult=>({ok:false,requestId:id,method,error:{code,message:'AI 请求未能完成，请刷新后重试。',retryable:code!=='UNSUPPORTED'}});
+      if(!intent)return fail('UNSUPPORTED');
+      const request:AiRequest={requestId:id,intent};
+      try{
+        const result=parse(aiResultSchema,await ipc.invoke(DESKTOP_IPC.aiRequest,request));
+        if(!result||!aiResultMatches(request,result))return fail('INTERNAL_ERROR',intent.method);
+        return result.ok?result:{...result,error:{...result.error,message:'AI 操作未完成，请检查当前设置或对话。'}};
+      }catch{return fail('UNAVAILABLE',intent.method);}
+    },
+    subscribeChatEvents:(listener:(event:ChatStreamEvent)=>void)=>subscribe(ipc,DESKTOP_IPC.chatEvent,chatStreamEventSchema,listener),
+    async saveProviderCredential(payload:CredentialSave):Promise<HostActionResult>{const value=parse(credentialSaveSchema,payload);return value?hostAction(ipc,DESKTOP_IPC.credentialSave,value):{ok:false,code:'INVALID_REQUEST'};},
+    async revokeProviderCredential(payload:CredentialRevoke):Promise<HostActionResult>{const value=parse(credentialRevokeSchema,payload);return value?hostAction(ipc,DESKTOP_IPC.credentialRevoke,value):{ok:false,code:'INVALID_REQUEST'};},
+    async voiceRequest(raw:VoiceServiceRequest):Promise<VoiceServiceResult>{
+      const request=parse(voiceServiceRequestSchema,raw);if(!request)return{ok:false,kind:'error',code:'invalid_audio'};
+      const fail:VoiceServiceResult={ok:false,kind:'error',code:'unavailable',...('job'in request?{job:request.job}:{})};
+      try{const result=parse(voiceServiceResultSchema,await ipc.invoke(DESKTOP_IPC.voiceRequest,request));return result&&voiceResultMatchesRequest(request,result)?result:fail;}catch{return fail;}
+    },
+    async voiceSettingsRequest(raw:VoiceSettingsRequest):Promise<VoiceSettingsResult>{
+      const request=parse(voiceSettingsRequestSchema,raw);if(!request)return{ok:false,kind:'error',code:'INVALID_REQUEST'};
+      const fail:VoiceSettingsResult={ok:false,kind:'error',code:'UNAVAILABLE',petId:request.petId};
+      try{const result=parse(voiceSettingsResultSchema,await ipc.invoke(DESKTOP_IPC.voiceSettingsRequest,request));return result&&voiceSettingsResultMatchesRequest(request,result)?result:fail;}catch{return fail;}
+    },
+    async workspaceRequest(raw:WorkspaceIntent):Promise<WorkspaceResult>{
+      const id=requestId(),intent=parse(workspaceIntentSchema,raw);
+      if(!intent)return{ok:false,requestId:id,method:'workspace/list',error:{code:'INVALID_REQUEST'}};
+      const request:WorkspaceRequest={requestId:id,intent};
+      const fail:WorkspaceResult={ok:false,requestId:id,method:intent.method,error:{code:'SERVICE_UNAVAILABLE'}};
+      try{const result=parse(workspaceResultSchema,await ipc.invoke(DESKTOP_IPC.workspaceRequest,request));return result&&workspaceResultMatches(request,result)?result:fail;}catch{return fail;}
+    },
+    authorizeMicrophone:(...args:unknown[])=>args.length===0?hostAction(ipc,DESKTOP_IPC.micAuthorize):Promise.resolve({ok:false,code:'INVALID_REQUEST'} as const),
+    async requestMic(raw:VoiceOwnedJob):Promise<VoiceMicGrant|null>{
+      const job=parse(voiceOwnedJobSchema,raw);if(!job)return null;
+      try{const grant=parse(voiceMicGrantSchema,await ipc.invoke(DESKTOP_IPC.micRequest,job));return grant&&sameVoiceJob(grant.job,job)?grant:null;}catch{return null;}
+    },
+    async revokeMic(raw:VoiceMicGrant):Promise<void>{const grant=parse(voiceMicGrantSchema,raw);if(grant)try{await ipc.invoke(DESKTOP_IPC.micRevoke,grant);}catch{/* unavailable */}},
+    async cancelVoiceChat(identity:VoiceChatIdentity,reason:AiCancelReason):Promise<boolean>{
+      const request=parse(voiceChatCancelSchema,{identity,reason});if(!request)return false;
+      try{return await ipc.invoke(DESKTOP_IPC.voiceChatCancel,request)===true;}catch{return false;}
+    },
+    async publishMouth(raw:VoiceMouthNotification):Promise<void>{const report=parse(voiceMouthNotificationSchema,raw);if(report)try{await ipc.invoke(DESKTOP_IPC.voiceMouth,report);}catch{/* unavailable */}},
+    subscribeSuspend:(listener:()=>void)=>subscribe(ipc,DESKTOP_IPC.voiceSuspend,z.literal(true),()=>listener()),
   });
 }

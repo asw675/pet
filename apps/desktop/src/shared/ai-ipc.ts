@@ -4,7 +4,7 @@ import { aiErrorSchema, aiLimits, aiCancelReasonSchema, actionProposalSchema, ch
   conversationSchema, credentialRefSchema, memoryRecordSchema, pendingMemoryCandidateSchema, providerConfigSchema } from '@pet-desktop/contracts/ai';
 
 const id = idSchema, integer = nonnegativeIntegerSchema;
-const page = { offset: integer.max(1_000_000), limit: integer.min(1).max(50) };
+const page = { offset: integer.max(10_000), limit: integer.min(1).max(50) };
 const pet = { petId: id };
 const scope = { ...pet, conversationId: id };
 export const chatIdentitySchema = z.strictObject({ ...scope, requestId: id });
@@ -38,7 +38,7 @@ export const aiIntentSchema = z.discriminatedUnion('method', [
   z.strictObject({ method: z.literal('chat/cancel'), payload: chatIdentitySchema.extend({ reason: z.literal('USER') }) }),
   z.strictObject({ method: z.literal('proposals/list'), payload: z.strictObject(pet) }),
   z.strictObject({ method: z.literal('proposal/dismiss'), payload: z.strictObject({ ...pet, proposalId: id }) }),
-  z.strictObject({ method: z.literal('memory/list'), payload: z.strictObject({ ...pet, ...page, candidateOffset: integer.max(1_000_000) }) }),
+  z.strictObject({ method: z.literal('memory/list'), payload: z.strictObject({ ...pet, ...page, candidateOffset: integer.max(10_000) }) }),
   z.strictObject({ method: z.literal('memory/confirm'), payload: z.strictObject({ ...pet, candidateId: id, decision: memoryConfirmation }) }),
   z.strictObject({ method: z.literal('memory/reject'), payload: z.strictObject({ ...pet, candidateId: id }) }),
   z.strictObject({ method: z.literal('memory/edit'), payload: z.strictObject({ ...pet, memoryId: id, decision: memoryEdit }) }),
@@ -103,8 +103,15 @@ export function aiResultMatches(request: AiRequest, result: AiResult): boolean {
     if(key in payload && key in data && (payload as unknown as Record<string,unknown>)[key] !== (data as unknown as Record<string,unknown>)[key]) return false;
   }
   if(result.method==='chat/start' && request.intent.method==='chat/start') return result.data.requestId===request.intent.payload.requestId;
-  if(result.method==='provider/save' && request.intent.method==='provider/save') return result.data.config.providerId===request.intent.payload.config.providerId;
-  if(result.method==='provider/assign' && request.intent.method==='provider/assign') return result.data.providerId===request.intent.payload.providerId && result.data.providerRevision===request.intent.payload.providerRevision;
+  if(result.method==='provider/save' && request.intent.method==='provider/save') return JSON.stringify(result.data.config)===JSON.stringify(request.intent.payload.config);
+  if(result.method==='provider/assign' && request.intent.method==='provider/assign') return result.data.providerId===request.intent.payload.providerId && result.data.providerRevision===request.intent.payload.providerRevision
+    && result.data.cloudConsent===request.intent.payload.allowCloudContext;
+  if(result.method==='memory/confirm'&&request.intent.method==='memory/confirm')return result.data.ownerPetId===request.intent.payload.petId;
+  if(result.method==='memory/edit'&&request.intent.method==='memory/edit')return result.data.ownerPetId===request.intent.payload.petId&&result.data.memoryId===request.intent.payload.memoryId;
+  if(result.method==='conversations/list'&&request.intent.method==='conversations/list')return result.data.rows.length<=request.intent.payload.limit;
+  if(result.method==='messages/list'&&request.intent.method==='messages/list')return result.data.rows.length<=request.intent.payload.limit;
+  if(result.method==='memory/list'&&request.intent.method==='memory/list')return result.data.memories.length<=request.intent.payload.limit&&result.data.candidates.length<=request.intent.payload.limit
+    &&new Set(result.data.memories.map(row=>row.memoryId)).size===result.data.memories.length&&new Set(result.data.candidates.map(row=>row.candidateId)).size===result.data.candidates.length;
   return true;
 }
 

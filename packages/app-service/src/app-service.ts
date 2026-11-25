@@ -702,6 +702,16 @@ export class AppService {
     });
   }
 
+  /** Trusted utility-only extension seam: features share the same writer and
+   * transaction, never a second connection or renderer-provided game state. */
+  withFeatureTransaction<T>(action:(tx:AppTransaction,snapshot:()=>AppSnapshot)=>T):T {
+    if(this.closed)throw new Error('Service is closed');
+    return this.repository.transaction(tx=>{
+      const state=this.state(tx);this.advanceAll(state);
+      return action(tx,()=>this.snapshot(state));
+    });
+  }
+
   /** Gallery and its revisioned snapshot share one authoritative transaction. */
   private getGallery(query: GalleryQuery): GalleryOutcome {
     return this.repository.transaction((tx) => {

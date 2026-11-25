@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { chatStreamEventSchema, providerOutputSchema } from '@pet-desktop/contracts/ai';
 import type { ActionProposalDraft, ChatMessage, ChatReply, ChatStreamEvent, ProviderConfig, ProviderOutput, ProviderRequest, TurnRequest } from '@pet-desktop/contracts/ai';
 import { ChatCoordinator } from '../src/app-service/ai/chat-coordinator';
-import type { ChatAuthorityPort, ChatBeginResult, ChatTerminal, ChatTurnIntent, UserChatTurnIntent } from '../src/app-service/ai/chat-coordinator';
+import type { ChatAuthorityPort, ChatBeginResult, ChatTerminal, ChatTurnIntent, ResolvedChatProvider, UserChatTurnIntent } from '../src/app-service/ai/chat-coordinator';
 import type { ModelProvider, TurnIdentity } from '../src/app-service/ai/model-provider';
 
 const NOW = 1000;
@@ -55,7 +55,7 @@ class MemoryAuthority implements ChatAuthorityPort {
     }
     this.pending.set(intent.requestId, turn);
     this.transform?.(turn);
-    return { kind: 'STARTED', turn, providerId: this.providerId };
+    return { kind: 'STARTED', turn, providerId: this.providerId, providerRevision: 1 };
   }
   finishTurn(terminal: ChatTerminal): boolean {
     this.attemptedTerminals.push(terminal);
@@ -84,8 +84,8 @@ function fixture(config: ProviderConfig = baseConfig, maxActiveJobs = 3) {
   const provider = new DeferredProvider();
   let now = NOW;
   let serial = 0;
-  const broker = { resolveCredential: vi.fn(async (_provider: string, _ref: string, _signal: AbortSignal) => 'fixture-credential') };
-  const registry = { resolve: vi.fn((_providerId: string) => ({ config, provider })) };
+  const broker = { resolveCredential: vi.fn(async (_provider: string, _ref: string, _signal: AbortSignal, _identity:TurnIdentity) => 'fixture-credential') };
+  const registry = { resolve: vi.fn((_providerId: string,_providerRevision:number,_identity:TurnIdentity,_at:number):ResolvedChatProvider|undefined => ({ config, provider, providerRevision:1 })) };
   const coordinator = new ChatCoordinator({ authority, registry, credentialBroker: broker,
     maxActiveJobs, now: () => now, createId: kind => `${kind}-${++serial}` });
   const events: ChatStreamEvent[] = [];
@@ -218,8 +218,9 @@ describe('provider selection, credentials and cancellation generations', () => {
     const cfg: ProviderConfig = { ...baseConfig, endpointKind: 'OPENAI_COMPATIBLE', privacyBoundary: 'CLOUD',
       baseUrl: 'https://provider.example/v1', credentialRef: 'credential:chosen' };
     const f = fixture(cfg); f.coordinator.start(input(), f.receive); await started(f);
-    expect(f.registry.resolve).toHaveBeenCalledExactlyOnceWith(cfg.providerId);
-    expect(f.broker.resolveCredential).toHaveBeenCalledExactlyOnceWith(cfg.providerId, 'credential:chosen', expect.any(AbortSignal));
+    expect(f.registry.resolve).toHaveBeenCalledTimes(2);
+    for(const index of [1,2]) expect(f.registry.resolve).toHaveBeenNthCalledWith(index,cfg.providerId,1,identityOf(input()),NOW);
+    expect(f.broker.resolveCredential).toHaveBeenCalledExactlyOnceWith(cfg.providerId, 'credential:chosen', expect.any(AbortSignal),identityOf(input()));
     expect(f.provider.calls[0]?.credential).toBe('fixture-credential');
     f.provider.calls[0]!.resolve(textResult(input())); await terminal(f);
     expect(JSON.stringify([f.authority.begins, [...f.authority.terminals.values()], f.events])).not.toContain('fixture-credential');
@@ -240,6 +241,43 @@ describe('provider selection, credentials and cancellation generations', () => {
     expect(await terminal(failProvider)).toMatchObject({ kind: 'FAILED', error: { code: 'INTERNAL_ERROR' } });
     expect(failProvider.provider.calls).toHaveLength(1);
     expect(JSON.stringify(failProvider.events)).not.toContain('provider exception');
+  });
+
+  it('requires the exact persisted provider revision before even asking for a credential', async () => {
+    const cfg: ProviderConfig = { ...baseConfig, endpointKind:'OPENAI_COMPATIBLE', privacyBoundary:'CLOUD',
+      baseUrl:'https://provider.example/v1',credentialRef:'credential:selected' };
+    const f=fixture(cfg);
+    f.registry.resolve.mockReturnValue({config:cfg,provider:f.provider,providerRevision:2});
+    f.coordinator.start(input(),f.receive);
+    expect(await terminal(f)).toMatchObject({kind:'FAILED',error:{code:'UNSUPPORTED'}});
+    expect(f.broker.resolveCredential).not.toHaveBeenCalled();
+    expect(f.provider.calls).toEqual([]);
+  });
+
+  it('revalidates exact pending consent/config after asynchronous credential lookup; revoked context never reaches a provider', async () => {
+    const cfg:ProviderConfig={...baseConfig,endpointKind:'OPENAI_COMPATIBLE',privacyBoundary:'CLOUD',
+      baseUrl:'https://provider.example/v1',credentialRef:'credential:selected'};
+    const f=fixture(cfg);
+    let permit=true, ready:(key:string)=>void=()=>{throw new Error('missing resolver')};
+    f.registry.resolve.mockImplementation(()=>permit?{config:cfg,provider:f.provider,providerRevision:1}:undefined);
+    f.broker.resolveCredential.mockImplementation(()=>new Promise<string>(done=>{ready=done;}));
+    expect(f.coordinator.start(input(),f.receive).accepted).toBe(true);
+    await vi.waitFor(()=>expect(f.broker.resolveCredential).toHaveBeenCalledOnce());
+    permit=false;ready('fixture-credential');
+    expect(await terminal(f)).toMatchObject({kind:'FAILED',error:{code:'UNAVAILABLE'}});
+    expect(f.registry.resolve).toHaveBeenCalledTimes(2);
+    expect(f.provider.calls).toEqual([]);expect(f.events.map(event=>event.kind)).toEqual(['error']);
+  });
+
+  it('does not send to a different endpoint if the fresh registry lies about matching revision', async () => {
+    const cfg:ProviderConfig={...baseConfig,endpointKind:'OPENAI_COMPATIBLE',privacyBoundary:'CLOUD',
+      baseUrl:'https://provider.example/v1',credentialRef:'credential:selected'};
+    const f=fixture(cfg);
+    f.registry.resolve.mockReturnValueOnce({config:cfg,provider:f.provider,providerRevision:1})
+      .mockReturnValueOnce({config:{...cfg,baseUrl:'https://changed.example/v1'},provider:f.provider,providerRevision:1});
+    expect(f.coordinator.start(input(),f.receive).accepted).toBe(true);
+    expect(await terminal(f)).toMatchObject({kind:'FAILED',error:{code:'UNAVAILABLE'}});
+    expect(f.provider.calls).toEqual([]);
   });
 
   it('cancels exactly matching identity, releases the pet, and ignores late old deltas and replies', async () => {

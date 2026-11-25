@@ -3,11 +3,15 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "exports": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./memory-policy": "./src/memory-policy.ts"
+  },
   "imports": {
     "#gallery-service": "./src/gallery-service.ts",
     "#character-service": "./src/character-service.ts",
     "#home-state-service": "./src/home-state-service.ts",
+    "#economy-service": "./src/economy-service.ts",
     "#ports": "./src/ports.ts",
     "#app-service": "./src/app-service.ts",
     "#sqlite-repository": "./src/sqlite-repository.ts",

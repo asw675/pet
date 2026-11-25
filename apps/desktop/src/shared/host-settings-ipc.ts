@@ -1,18 +1,19 @@
 import { z } from 'zod';
 import { idSchema } from '@pet-desktop/contracts';
+import { defaultHostShortcutBindings, hostShortcutAcceleratorSchema, hostShortcutBindingsSchema, hostShortcutIds } from '@pet-desktop/contracts/host-shortcuts';
+import type { HostShortcutId } from '@pet-desktop/contracts/host-shortcuts';
 
-/** Fixed host-only keyboard actions. No arbitrary accelerator, process,
- * login command, registry key, filename or executable arguments cross IPC. */
+/** Fixed host-only actions and their initial combinations. */
 export const hostShortcuts = Object.freeze([
-  Object.freeze({ id: 'OPEN_CONTROL_CENTER', accelerator: 'CommandOrControl+Shift+P' }),
-  Object.freeze({ id: 'TOGGLE_PET_VISIBILITY', accelerator: 'CommandOrControl+Shift+H' }),
-  Object.freeze({ id: 'RESCUE_INTERACTION', accelerator: 'CommandOrControl+Shift+I' }),
+  Object.freeze({ id: hostShortcutIds[0], accelerator: defaultHostShortcutBindings.OPEN_CONTROL_CENTER }),
+  Object.freeze({ id: hostShortcutIds[1], accelerator: defaultHostShortcutBindings.TOGGLE_PET_VISIBILITY }),
+  Object.freeze({ id: hostShortcutIds[2], accelerator: defaultHostShortcutBindings.RESCUE_INTERACTION }),
 ] as const);
-export type HostShortcutId = typeof hostShortcuts[number]['id'];
+export type { HostShortcutId };
 export const hostShortcutStatusSchema = z.enum(['REGISTERED', 'CONFLICT', 'DISABLED', 'UNSUPPORTED', 'UNAVAILABLE', 'ERROR']);
 export type HostShortcutStatus = z.infer<typeof hostShortcutStatusSchema>;
-const shortcut = <I extends HostShortcutId, A extends typeof hostShortcuts[number]['accelerator']>(id: I, accelerator: A) =>
-  z.strictObject({ id: z.literal(id), accelerator: z.literal(accelerator), status: hostShortcutStatusSchema });
+const shortcut = <I extends HostShortcutId>(id: I) =>
+  z.strictObject({ id: z.literal(id), accelerator: hostShortcutAcceleratorSchema, status: hostShortcutStatusSchema });
 const shortcutAvailabilitySchema = z.enum(['READY', 'NON_WINDOWS', 'NOT_READY', 'STOPPED']);
 export const hostShortcutSettingsSchema = z.strictObject({
   availability: shortcutAvailabilitySchema,
@@ -21,16 +22,17 @@ export const hostShortcutSettingsSchema = z.strictObject({
   enabled: z.boolean(),
   preferenceScope: z.enum(['PERSISTED', 'SESSION']),
   entries: z.tuple([
-    shortcut(hostShortcuts[0].id, hostShortcuts[0].accelerator),
-    shortcut(hostShortcuts[1].id, hostShortcuts[1].accelerator),
-    shortcut(hostShortcuts[2].id, hostShortcuts[2].accelerator),
+    shortcut(hostShortcuts[0].id),
+    shortcut(hostShortcuts[1].id),
+    shortcut(hostShortcuts[2].id),
   ]),
 }).refine(value => value.entries.every(entry => {
   if (value.availability === 'NON_WINDOWS') return entry.status === 'UNSUPPORTED';
   if (value.availability !== 'READY') return entry.status === 'UNAVAILABLE';
   return value.enabled ? entry.status === 'REGISTERED' || entry.status === 'CONFLICT' || entry.status === 'ERROR'
     : entry.status === 'DISABLED' || entry.status === 'ERROR';
-}), 'Shortcut status must agree with availability and requested preference');
+}), 'Shortcut status must agree with availability and requested preference')
+  .refine(value => new Set(value.entries.map(entry => entry.accelerator)).size === hostShortcutIds.length, 'Shortcut combinations must be distinct');
 export type HostShortcutSettings = z.infer<typeof hostShortcutSettingsSchema>;
 
 /** Electron Windows provides two different booleans. openAtLogin identifies
@@ -59,6 +61,18 @@ const hostScaleSchema = z.union([z.literal(50), z.literal(75), z.literal(100), z
 export type HostScale = z.infer<typeof hostScaleSchema>;
 const revision = z.number().int().min(0).max(Number.MAX_SAFE_INTEGER);
 const errorCode = z.string().regex(/^[A-Z][A-Z0-9_]{0,63}$/u);
+export const hostShortcutBindingsViewSchema = z.strictObject({ revision, bindings: hostShortcutBindingsSchema });
+export type HostShortcutBindingsView = z.infer<typeof hostShortcutBindingsViewSchema>;
+export const hostShortcutBindingsEditSchema = z.strictObject({ expectedRevision: revision, bindings: hostShortcutBindingsSchema });
+export type HostShortcutBindingsEdit = z.infer<typeof hostShortcutBindingsEditSchema>;
+export const hostShortcutBindingsResultSchema = z.union([
+  z.strictObject({ ok: z.literal(true), preferences: hostShortcutBindingsViewSchema }),
+  z.strictObject({ ok: z.literal(false), code: z.enum(['CONFLICT', 'OS_ERROR']), id: z.enum(hostShortcutIds) }),
+  z.strictObject({ ok: z.literal(false), code: z.enum(['INVALID_REQUEST', 'SERVICE_UNAVAILABLE', 'UNSUPPORTED', 'BUSY', 'REVISION_CONFLICT']) }),
+]);
+export type HostShortcutBindingsResult = z.infer<typeof hostShortcutBindingsResultSchema>;
+const shortcutBindingsRead = z.strictObject({ kind: z.literal('shortcut-bindings') });
+const shortcutBindingsSave = z.strictObject({ kind: z.literal('save-shortcut-bindings'), edit: hostShortcutBindingsEditSchema });
 export const hostPreferencesViewSchema = z.strictObject({
   values: z.strictObject({ hotkeysEnabled: z.boolean(), scalePercent: hostScaleSchema, reducedMotion: z.boolean() }),
   revision, updatedAt: z.iso.datetime({ offset: true }).nullable(),
@@ -109,6 +123,8 @@ export const hostWindowAnchorSchema = z.discriminatedUnion('role', [
 export type HostWindowAnchor = z.infer<typeof hostWindowAnchorSchema>;
 
 export const hostRendererRequestSchema = z.discriminatedUnion('kind', [
+  shortcutBindingsRead,
+  shortcutBindingsSave,
   z.strictObject({ kind: z.literal('settings') }),
   z.strictObject({ kind: z.literal('shortcuts'), enabled: hostSettingsToggleSchema }),
   z.strictObject({ kind: z.literal('login'), enabled: hostSettingsToggleSchema }),
@@ -121,6 +137,8 @@ export const hostRendererRequestSchema = z.discriminatedUnion('kind', [
 ]);
 
 export const hostAuthorityRequestSchema = z.discriminatedUnion('kind', [
+  shortcutBindingsRead,
+  shortcutBindingsSave,
   z.strictObject({ kind: z.literal('window-anchors') }),
   z.strictObject({ kind: z.literal('save-window-anchor'), anchor: hostWindowAnchorSchema }),
   z.strictObject({ kind: z.literal('preferences') }),
@@ -133,6 +151,7 @@ export const hostAuthorityRequestSchema = z.discriminatedUnion('kind', [
 ]);
 export type HostAuthorityRequest = z.infer<typeof hostAuthorityRequestSchema>;
 export const hostAuthorityResultSchema = z.discriminatedUnion('kind', [
+  z.strictObject({ kind: z.literal('shortcut-bindings'), result: hostShortcutBindingsResultSchema }),
   z.strictObject({ kind: z.literal('window-anchors'), result: z.discriminatedUnion('ok', [
     z.strictObject({ ok: z.literal(true), anchors: z.array(hostWindowAnchorSchema).max(101) }), restoreFailureSchema,
   ]) }),
@@ -146,6 +165,7 @@ export const hostAuthorityResultSchema = z.discriminatedUnion('kind', [
 export type HostAuthorityResult = z.infer<typeof hostAuthorityResultSchema>;
 
 export function hostAuthorityResultKind(request: HostAuthorityRequest): HostAuthorityResult['kind'] {
+  if (request.kind === 'save-shortcut-bindings') return 'shortcut-bindings';
   return request.kind === 'save' || request.kind === 'shortcuts' ? 'preferences' : request.kind;
 }
 

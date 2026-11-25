@@ -25,6 +25,7 @@
 | 004E-3 | 实际 CG 图鉴界面及精确资源回看 | 代码、专项测试与构建通过 | [004e3-gallery-ui](004e3-gallery-ui.md) |
 | 004F | Pixi WebGL 与 Canvas2D 降级接入桌宠窗口 | 专项测试与生产构建通过，Windows GPU 待验收 | [004f-pixi-desktop](004f-pixi-desktop.md) |
 | 004G | 本地角色资源包导入、版本切换与星咏新立绘预览 | 文件、权限和版本回退测试通过，Windows 图形验收待测 | [004g-character-pack-management](004g-character-pack-management.md) |
+| 004H | Cubism 本地预览适配、导出资源打包和星咏表情分层 | 软件接入及降级专项通过，真实模型导出和渲染待验 | [004h-cubism-local-preview](004h-cubism-local-preview.md) |
 | 004-Q | V1.1 功能及代码规模复核 | 产品覆盖约34.0% | [004-progress-audit](004-progress-audit.md) |
 | 005 | Windows 安装包与真机 P0 验收 | 按用户要求推迟至约90%开发覆盖 | — |
 | 006A-1 | 角色模板与获得规则、诺瓦内置资源 | 代码与专项测试通过 | [006a1-character-catalog](006a1-character-catalog.md) |
@@ -42,6 +43,7 @@
 | 006E-4 | 新版回合战斗纯规则和敌人目录 | 4 项专项通过，旅行接入待开发 | [006e4-battle-rules](006e4-battle-rules.md) |
 | 006E-5 | 新旅程接入回合战斗、详细战报和战败恢复 | 集成、兼容及确定性测试通过 | [006e5-battle-integration](006e5-battle-integration.md) |
 | 006E-6 | 职业技能、遗迹首领和版本化回合表现 | 三版兼容及 SQLite 重启测试通过 | [006e6-battle-skills-and-boss](006e6-battle-skills-and-boss.md) |
+| 006E-7 | 遗迹首领首次胜利称号 | 真实 SQLite 结算与重启测试通过 | [006e7-ruins-title](006e7-ruins-title.md) |
 | 006F-1 | 随机剧情、分支冻结及六项原创事件 | 领域64项通过 | [006f1-event-engine](006f1-event-engine.md) |
 | 006F-2A | 事件待选、已提交效果与历史查询契约 | 5项专项通过，持久业务待接入 | [006f2a-event-projection](006f2a-event-projection.md) |
 | 006F-2B | 新增2个剧情CG、事件源图鉴、精确版本读取 | 实际PNG与专项测试通过，解锁事务待接入 | [006f2b-narrative-cg-assets](006f2b-narrative-cg-assets.md) |
@@ -64,6 +66,7 @@
 | 009B-1 | 本地频次/时段/共现推荐纯策略 | 9项专项，历史与界面待接入 | [009b1-recommendation-rules](009b1-recommendation-rules.md) |
 | 007E-2/008C/009D | AI、语音、工作台同一写入者及闭合真实业务传输、原生发行门禁 | 296项专项、生产构建通过；真实 Windows 待验收 | [007e2-feature-transport](007e2-feature-transport.md) |
 | 007E-3/008D/009F | 聊天、记忆、语音口型及工作台实际页面 | 专项及生产构建通过，实机待验收 | [007e3-user-interfaces](007e3-user-interfaces.md) |
+| 009G | 工作、娱乐和学习快捷场景模板 | 工作台专项通过，Windows 界面待验 | [009g-workspace-routine-templates](009g-workspace-routine-templates.md) |
 | 007F-1 | 主动陪伴存储与内部本地会话权限 | SQLite、契约和控制服务专项通过，调度与界面待接入 | [007f1-proactive-foundation](007f1-proactive-foundation.md) |
 | 007F-2 | 主动陪伴调度、角色配置和桌面文字问候 | SQLite、Mock 及进程路由测试通过，Windows 实机待验 | [007f2-proactive-integration](007f2-proactive-integration.md) |
 | 007G | AI 快捷建议、原生确认和一次性执行授权 | 权限、目标变化、重放和 SQLite 专项通过 | [007g-ai-quick-suggestions](007g-ai-quick-suggestions.md) |
@@ -81,5 +84,10 @@
 | 010J | 保留最近三份周期备份及失败重试 | 真实 SQLite、轮换边界及直接恢复测试通过 | [010j-periodic-snapshots](010j-periodic-snapshots.md) |
 | 010K | 跨会话恢复窗口位置 | 宿主和 SQLite 联合测试通过，混合 DPI 待验 | [010k-window-anchors](010k-window-anchors.md) |
 | 010L | 本地 Windows x64 测试包及隔离运行验证 | 安装包结构、原生 SQLite、双窗口及星咏预览首帧通过 | [010l-windows-preview](010l-windows-preview.md) |
+| 010M | 本地诊断日志、轮换和用户导出 | 专项通过，原生保存对话框待验 | [010m-local-diagnostics](010m-local-diagnostics.md) |
+| 010N | Windows 前台全屏免打扰 | 原生助手编译与普通桌面管道实测通过，混合 DPI 与真实全屏待验 | [010n-windows-fullscreen-dnd](010n-windows-fullscreen-dnd.md) |
+| 010O | 全局热键改键、冲突回滚和恢复默认 | 桌面和 SQLite 专项通过，真实第三方热键冲突待验 | [010o-editable-hotkeys](010o-editable-hotkeys.md) |
+| 010P | 免打扰期间旅行结算汇总 | 宿主和投影专项通过，Windows 外壳通知待验 | [010p-travel-return-summary](010p-travel-return-summary.md) |
+| 010Q | 修复页内导航撤销 IPC 权限及 Windows x64 测试包复验 | 设置页、实际热键注册、双窗口、日志及 SAPI 中文合成通过 | [010q-windows-host-preview](010q-windows-host-preview.md) |
 
 每份记录包含：日期、范围、设计依据、具体变更、测试命令与真实结果、已知限制、下一步。完整验收状态见 [POC 矩阵](../qa/poc-matrix.md)。

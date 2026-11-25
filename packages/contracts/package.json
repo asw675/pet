@@ -11,7 +11,8 @@
     "./travel": "./src/travel.ts",
     "./workspace": "./src/workspace.ts",
     "./events": "./src/events.ts",
-    "./proactive": "./src/proactive.ts"
+    "./proactive": "./src/proactive.ts",
+    "./host-shortcuts": "./src/host-shortcuts.ts"
   },
   "imports": {
     "#character-pack": "./src/character-pack.ts",

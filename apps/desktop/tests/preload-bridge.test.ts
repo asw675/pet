@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
+import { defaultHostShortcutBindings } from '@pet-desktop/contracts/host-shortcuts';
 import { charactersIpcResultSchema, galleryIpcResultSchema, ipcRequestSchema, ipcResultSchema } from '@pet-desktop/contracts';
 import type { AppSnapshot, CharacterCatalogRow, CharactersIpcResult, DomainCommand, GalleryIpcResult, GalleryQuery, InventoryIpcResult, IpcRequest, IpcResult } from '@pet-desktop/contracts';
 import { createControlCenterBridge, createPetBridge } from '../src/preload/bridge.js';
@@ -108,7 +109,7 @@ describe('role-specific preload bridges', () => {
     expect(Object.keys(pet).sort()).toEqual([...commonKeys, 'setInteractive', 'reportVisualReady','subscribeVoiceMouth','subscribeHostRenderPreferences','subscribeProactiveBubble',
       'readCharacterPack', 'subscribeCharacterPackChanged'].sort());
     expect(Object.keys(center).sort()).toEqual([...commonKeys, 'listGallery', 'listCharacters', 'listInventory', 'listActiveTravel', 'listTravelCatalog', 'previewTravel', 'listTravelReports', 'listEvents',
-      'getHostSettings','setHostShortcutEnabled','setLoginStart','getHostPreferences','saveHostPreferences','exportBackup','restoreBackup','getRestoreBackupStatus','getPeriodicBackupStatus',
+      'getHostSettings','setHostShortcutEnabled','getHostShortcutBindings','saveHostShortcutBindings','setLoginStart','getHostPreferences','saveHostPreferences','exportBackup','exportDiagnostics','restoreBackup','getRestoreBackupStatus','getPeriodicBackupStatus',
       'aiRequest','subscribeChatEvents','saveProviderCredential','revokeProviderCredential','voiceRequest','voiceSettingsRequest','workspaceRequest','authorizeMicrophone','requestMic','revokeMic','cancelVoiceChat','publishMouth','subscribeSuspend',
       'proactiveRequest','subscribeProactiveNotices','listCharacterPacks','importCharacterPack','activateCharacterPack'].sort());
     expect('reportVisualReady' in center).toBe(false);
@@ -139,6 +140,36 @@ describe('role-specific preload bridges', () => {
     expect(await bridge.saveHostPreferences({ scalePercent: 101, reducedMotion: true, expectedRevision: 0 } as never))
       .toEqual({ ok: false, code: 'INVALID_REQUEST' });
     expect(spy).toHaveBeenCalledTimes(1);
+  });
+
+  it('exports diagnostics without sharing paths or records with either renderer', async () => {
+    const ipc = new FakeIpc();
+    const bridge = createControlCenterBridge(ipc);
+    const invoke = vi.spyOn(ipc, 'invoke').mockResolvedValueOnce({ ok: true, entries: 7, path: '/private/log.json' })
+      .mockResolvedValueOnce({ ok: true, entries: 7 });
+    expect('exportDiagnostics' in createPetBridge(ipc)).toBe(false);
+    const invalidCall = bridge.exportDiagnostics as (...args: unknown[]) => ReturnType<typeof bridge.exportDiagnostics>;
+    expect(await invalidCall('/private/misuse.json')).toEqual({ ok: false, code: 'INVALID_REQUEST' });
+    expect(invoke).not.toHaveBeenCalled();
+    expect(await bridge.exportDiagnostics()).toEqual({ ok: false, code: 'UNAVAILABLE' });
+    expect(await bridge.exportDiagnostics()).toEqual({ ok: true, entries: 7 });
+    expect(invoke.mock.calls).toEqual([[DESKTOP_IPC.exportDiagnostics], [DESKTOP_IPC.exportDiagnostics]]);
+  });
+
+  it('limits editable combinations to the approved actions and rejects destination or command-shaped payloads', async () => {
+    const ipc = new FakeIpc();
+    const bridge = createControlCenterBridge(ipc);
+    const preferences = { revision: 0, bindings: defaultHostShortcutBindings };
+    const invoke = vi.spyOn(ipc, 'invoke').mockResolvedValue({ ok: true, preferences });
+    expect('getHostShortcutBindings' in createPetBridge(ipc)).toBe(false);
+    expect(await bridge.getHostShortcutBindings()).toEqual({ ok: true, preferences });
+    expect(await bridge.saveHostShortcutBindings({ expectedRevision: 0, bindings: { ...defaultHostShortcutBindings, OPEN_CONTROL_CENTER: 'Ctrl+C' } }))
+      .toEqual({ ok: false, code: 'INVALID_REQUEST' });
+    expect(await bridge.saveHostShortcutBindings({ expectedRevision: 0, bindings: defaultHostShortcutBindings })).toEqual({ ok: true, preferences });
+    expect(invoke.mock.calls).toEqual([
+      [DESKTOP_IPC.hostRequest, { kind: 'shortcut-bindings' }],
+      [DESKTOP_IPC.hostRequest, { kind: 'save-shortcut-bindings', edit: { expectedRevision: 0, bindings: defaultHostShortcutBindings } }],
+    ]);
   });
 
   it('uses pathless restore requests and rejects restore statuses containing host details', async () => {

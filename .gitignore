@@ -20,6 +20,7 @@ coverage/
 .pet-backup-*/
 .pet-restore/
 .pet-snapshots/
+.pet-diagnostics/
 *.db
 *.db-wal
 *.db-shm

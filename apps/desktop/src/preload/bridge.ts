@@ -34,15 +34,19 @@ import type {
 
 import {
   backupViewResultSchema, hostPreferencesViewResultSchema, hostRendererRequestSchema, hostRenderPreferencesSchema, hostSettingsResultSchema,
+  hostShortcutBindingsResultSchema,
   periodicBackupStatusSchema, restoreBackupResultSchema, restoreBackupStatusSchema,
 } from '../shared/host-settings-ipc';
-import type { HostPreferenceSave, HostRenderPreferences } from '../shared/host-settings-ipc';
+import type { HostPreferenceSave, HostRenderPreferences, HostShortcutBindingsEdit } from '../shared/host-settings-ipc';
+import { diagnosticsExportResultSchema } from '../shared/diagnostics-ipc';
+import type { DiagnosticsExportResult } from '../shared/diagnostics-ipc';
 
 type InvokeChannel = typeof DESKTOP_IPC.characterPackRequest | typeof DESKTOP_IPC.hostRequest | typeof DESKTOP_IPC.request | typeof DESKTOP_IPC.getStatus
   | typeof DESKTOP_IPC.openControlCenter | typeof DESKTOP_IPC.petInteractive
   | typeof DESKTOP_IPC.petVisualReady | typeof DESKTOP_IPC.aiRequest | typeof DESKTOP_IPC.credentialSave | typeof DESKTOP_IPC.credentialRevoke
   | typeof DESKTOP_IPC.voiceRequest | typeof DESKTOP_IPC.micAuthorize | typeof DESKTOP_IPC.micRequest | typeof DESKTOP_IPC.micRevoke
   | typeof DESKTOP_IPC.proactiveRequest
+  | typeof DESKTOP_IPC.exportDiagnostics
   | typeof DESKTOP_IPC.voiceChatCancel | typeof DESKTOP_IPC.voiceMouth | typeof DESKTOP_IPC.voiceSettingsRequest | typeof DESKTOP_IPC.workspaceRequest;
 type PushChannel = typeof DESKTOP_IPC.hostRenderPreferences | typeof DESKTOP_IPC.snapshot | typeof DESKTOP_IPC.status | typeof DESKTOP_IPC.chatEvent | typeof DESKTOP_IPC.voiceMouth | typeof DESKTOP_IPC.voiceSuspend
   | typeof DESKTOP_IPC.proactiveNotice | typeof DESKTOP_IPC.proactiveBubble;
@@ -285,10 +289,18 @@ export function createControlCenterBridge(ipc: DesktopIpcPort, requestId = newRe
     },
     getHostSettings: () => hostRequest(ipc, { kind: 'settings' }, hostSettingsResultSchema, invalidSetting, unavailableSetting),
     setHostShortcutEnabled: (enabled: boolean) => hostRequest(ipc, { kind: 'shortcuts', enabled }, hostSettingsResultSchema, invalidSetting, unavailableSetting),
+    getHostShortcutBindings: () => hostRequest(ipc, { kind: 'shortcut-bindings' }, hostShortcutBindingsResultSchema, invalidPreference, unavailablePreference),
+    saveHostShortcutBindings: (edit: HostShortcutBindingsEdit) => hostRequest(ipc, { kind: 'save-shortcut-bindings', edit }, hostShortcutBindingsResultSchema, invalidPreference, unavailablePreference),
     setLoginStart: (enabled: boolean) => hostRequest(ipc, { kind: 'login', enabled }, hostSettingsResultSchema, invalidSetting, unavailableSetting),
     getHostPreferences: () => hostRequest(ipc, { kind: 'preferences' }, hostPreferencesViewResultSchema, invalidPreference, unavailablePreference),
     saveHostPreferences: (payload: HostPreferenceSave) => hostRequest(ipc, { kind: 'save', edit: payload }, hostPreferencesViewResultSchema, invalidPreference, unavailablePreference),
     exportBackup: () => hostRequest(ipc, { kind: 'backup' }, backupViewResultSchema, invalidPreference, unavailablePreference),
+    async exportDiagnostics(...args: unknown[]): Promise<DiagnosticsExportResult> {
+      if (args.length !== 0) return { ok: false, code: 'INVALID_REQUEST' };
+      try {
+        return parse(diagnosticsExportResultSchema, await ipc.invoke(DESKTOP_IPC.exportDiagnostics)) ?? { ok: false, code: 'UNAVAILABLE' };
+      } catch { return { ok: false, code: 'UNAVAILABLE' }; }
+    },
     restoreBackup: () => hostRequest(ipc, { kind: 'restore-backup' }, restoreBackupResultSchema, invalidPreference, unavailablePreference),
     getRestoreBackupStatus: () => hostRequest(ipc, { kind: 'restore-status' }, restoreBackupStatusSchema, invalidPreference, unavailablePreference),
     getPeriodicBackupStatus: () => hostRequest(ipc, { kind: 'periodic-backup-status' }, periodicBackupStatusSchema, invalidPreference, unavailablePreference),

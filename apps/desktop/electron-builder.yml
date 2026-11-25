@@ -18,6 +18,10 @@ extraResources:
     to: native/launch-inspect
     filter:
       - launch-inspect.exe
+  - from: native/publish/win-x64/fullscreen
+    to: native/fullscreen
+    filter:
+      - fullscreen-probe.exe
 asarUnpack:
   - '**/*.node'
   - '**/better-sqlite3/**'

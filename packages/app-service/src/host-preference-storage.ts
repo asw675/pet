@@ -1,4 +1,6 @@
 import type { SqliteConnection } from './ports.js';
+import { defaultHostShortcutBindings, hostShortcutBindingsSchema, hostShortcutIds } from '@pet-desktop/contracts/host-shortcuts';
+import type { HostShortcutBindings } from '@pet-desktop/contracts/host-shortcuts';
 
 const MAX_SAFE = Number.MAX_SAFE_INTEGER;
 const COORDINATE_LIMIT = 1_000_000;
@@ -7,6 +9,7 @@ export const HOST_SCALE_CHOICES = Object.freeze([50,75,100,125,150,200] as const
 export type HostScalePercent = typeof HOST_SCALE_CHOICES[number];
 export interface HostPreferenceValues { hotkeysEnabled: boolean; scalePercent: HostScalePercent; reducedMotion: boolean }
 export interface HostPreferences extends HostPreferenceValues { revision: number; updatedAt: number | null }
+export interface HostShortcutBindingPreferences { bindings: HostShortcutBindings; revision: number; updatedAt: number | null }
 export const DEFAULT_HOST_PREFERENCES: Readonly<HostPreferenceValues> = Object.freeze({ hotkeysEnabled:true,scalePercent:100,reducedMotion:false });
 export type HostWindowRole = 'control-center'|'pet';
 /** Only a real Main-observed DIP rectangle/display. Coordinates are never
@@ -63,6 +66,33 @@ BEGIN SELECT RAISE(ABORT,'Host anchor identity is not replaceable'); END;
 CREATE TRIGGER host_window_anchor_monotonic BEFORE UPDATE ON host_window_anchors
 WHEN OLD.owner_key IS NOT NEW.owner_key OR OLD.role IS NOT NEW.role OR OLD.pet_id IS NOT NEW.pet_id OR NEW.observed_at<OLD.observed_at
 BEGIN SELECT RAISE(ABORT,'Host anchor identity and observation time are monotonic'); END;
+`;
+
+/** V14 is separate from display settings so independent changes do not
+ * conflict. Initial values remain fixed for migration checksum compatibility. */
+export const HOST_SHORTCUT_BINDINGS_MIGRATION_SQL = `
+CREATE TABLE host_shortcut_bindings (
+  singleton INTEGER PRIMARY KEY NOT NULL CHECK(singleton=1),
+  revision INTEGER NOT NULL CHECK(revision BETWEEN 0 AND 9007199254740991),
+  open_center TEXT NOT NULL CHECK(length(open_center) BETWEEN 1 AND 42),
+  toggle_visibility TEXT NOT NULL CHECK(length(toggle_visibility) BETWEEN 1 AND 42),
+  rescue_interaction TEXT NOT NULL CHECK(length(rescue_interaction) BETWEEN 1 AND 42),
+  updated_at INTEGER CHECK(updated_at BETWEEN 0 AND 9007199254740991),
+  CHECK(open_center<>toggle_visibility AND open_center<>rescue_interaction AND toggle_visibility<>rescue_interaction),
+  CHECK((revision=0 AND updated_at IS NULL AND open_center='CommandOrControl+Shift+P'
+    AND toggle_visibility='CommandOrControl+Shift+H' AND rescue_interaction='CommandOrControl+Shift+I')
+    OR (revision>0 AND updated_at IS NOT NULL))
+) STRICT;
+INSERT INTO host_shortcut_bindings VALUES(1,0,'CommandOrControl+Shift+P','CommandOrControl+Shift+H','CommandOrControl+Shift+I',NULL);
+CREATE TRIGGER host_shortcut_bindings_no_replace BEFORE INSERT ON host_shortcut_bindings
+WHEN EXISTS(SELECT 1 FROM host_shortcut_bindings) BEGIN SELECT RAISE(ABORT,'Host shortcut binding record is not replaceable'); END;
+CREATE TRIGGER host_shortcut_bindings_monotonic BEFORE UPDATE ON host_shortcut_bindings
+WHEN OLD.singleton IS NOT NEW.singleton OR NEW.revision<>OLD.revision+1 OR NEW.updated_at IS NULL
+  OR (OLD.updated_at IS NOT NULL AND NEW.updated_at<OLD.updated_at)
+  OR (NEW.open_center=OLD.open_center AND NEW.toggle_visibility=OLD.toggle_visibility AND NEW.rescue_interaction=OLD.rescue_interaction)
+BEGIN SELECT RAISE(ABORT,'Host shortcut bindings require a monotonic change'); END;
+CREATE TRIGGER host_shortcut_bindings_no_delete BEFORE DELETE ON host_shortcut_bindings
+BEGIN SELECT RAISE(ABORT,'Host shortcut binding record cannot be deleted'); END;
 `;
 
 export type HostPreferenceErrorCode = 'INACTIVE'|'INVALID_RECORD'|'REVISION_CONFLICT'|'NOT_FOUND'|'OBSERVATION_REGRESSION';
@@ -147,6 +177,36 @@ export class HostPreferenceStorage {
       .run(revision,Number(values.hotkeysEnabled),values.scalePercent,Number(values.reducedMotion),now,expected).changes;
     if(sqlInteger(changed)!==1)return fail('REVISION_CONFLICT');
     return {...values,revision,updatedAt:now};
+  }
+
+  getShortcutBindings(): HostShortcutBindingPreferences {
+    const stored = row(this.db.prepare('SELECT * FROM host_shortcut_bindings WHERE singleton=1').get());
+    const revision = sqlInteger(stored.revision);
+    const updatedAt = stored.updated_at === null ? null : sqlInteger(stored.updated_at);
+    const parsed = hostShortcutBindingsSchema.safeParse({
+      OPEN_CONTROL_CENTER: stored.open_center,
+      TOGGLE_PET_VISIBILITY: stored.toggle_visibility,
+      RESCUE_INTERACTION: stored.rescue_interaction,
+    });
+    if (!parsed.success || (revision === 0) !== (updatedAt === null)) return fail('INVALID_RECORD');
+    if (revision === 0 && hostShortcutIds.some(id => parsed.data[id] !== defaultHostShortcutBindings[id])) return fail('INVALID_RECORD');
+    return { revision, updatedAt, bindings: parsed.data };
+  }
+
+  saveShortcutBindings(raw: HostShortcutBindings, expectedRevision: number, at: number): HostShortcutBindingPreferences {
+    const db = this.db;
+    const parsed = hostShortcutBindingsSchema.safeParse(raw);
+    if (!parsed.success) return fail('INVALID_RECORD');
+    const bindings = parsed.data, expected = integer(expectedRevision), now = integer(at), before = this.getShortcutBindings();
+    if (before.revision !== expected || (before.updatedAt !== null && now < before.updatedAt)) return fail('REVISION_CONFLICT');
+    if (hostShortcutIds.every(id => bindings[id] === before.bindings[id])) return before;
+    if (expected === MAX_SAFE) return fail('REVISION_CONFLICT');
+    const revision = expected + 1;
+    const changed = db.prepare(`UPDATE host_shortcut_bindings SET revision=?,open_center=?,toggle_visibility=?,rescue_interaction=?,updated_at=?
+      WHERE singleton=1 AND revision=?`)
+      .run(revision, bindings.OPEN_CONTROL_CENTER, bindings.TOGGLE_PET_VISIBILITY, bindings.RESCUE_INTERACTION, now, expected).changes;
+    if (sqlInteger(changed) !== 1) return fail('REVISION_CONFLICT');
+    return { revision, bindings, updatedAt: now };
   }
 
   getAnchor(role:HostWindowRole,petId:string|null):HostWindowAnchor|null{

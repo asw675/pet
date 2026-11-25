@@ -5,7 +5,8 @@ import {
   app, BrowserWindow, dialog, globalShortcut, ipcMain, Menu, nativeImage, powerMonitor, safeStorage, screen, session, shell, Tray, utilityProcess,
 } from 'electron';
 import type { IpcMainInvokeEvent, PermissionRequest, Rectangle, WebContents } from 'electron';
-import type { AppSnapshot } from '@pet-desktop/contracts';
+import type { AppSnapshot, IpcErrorCode } from '@pet-desktop/contracts';
+import { hostShortcutIds } from '@pet-desktop/contracts/host-shortcuts';
 import { inspectVoiceAudio } from '@pet-desktop/contracts/voice';
 import { version as appVersion } from '../../package.json';
 import { characterPackRequestSchema } from '../shared/character-pack-ipc';
@@ -29,6 +30,10 @@ import { sameVoiceJob, voiceChatCancelSchema, voiceMicGrantSchema, voiceMouthNot
 import type { VoiceMicGrant, VoiceMouthNotification, VoiceOwnedJob, VoiceServiceRequest, VoiceServiceResult } from '../shared/voice-ipc';
 import { CredentialVault } from './credential-vault';
 import { MicrophoneGrantPolicy } from './microphone-grant';
+import { ForegroundFullscreenMonitor, fullscreenHides, fullscreenQuiets } from './fullscreen-policy';
+import type { FullscreenState } from './fullscreen-policy';
+import { WindowsFullscreenProbe } from './windows-fullscreen-probe';
+import { TravelReturnNotices } from './travel-return-notices';
 import {WorkspaceHost} from './workspace-host';
 import {nativeArtifactPins} from '../shared/native-artifact-pins';
 import {workspaceRequestSchema,workspaceResultMatches} from '../shared/workspace-ipc';
@@ -42,7 +47,9 @@ import type { VoiceSettingsResult } from '../shared/voice-settings-ipc';
 import { HostShortcutController } from './host-shortcuts';
 import { hostRendererRequestSchema, hostWindowAnchorSchema, managedBackupDirectory } from '../shared/host-settings-ipc';
 import type { BackupViewResult, HostPreferencesView, HostPreferencesViewResult, HostSettingsResult, PeriodicBackupStatus, RestoreBackupResult, RestoreBackupStatus } from '../shared/host-settings-ipc';
-import type { HostWindowAnchor } from '../shared/host-settings-ipc';
+import type { HostShortcutBindingsResult, HostShortcutBindingsView, HostWindowAnchor } from '../shared/host-settings-ipc';
+import type { DiagnosticsExportResult } from '../shared/diagnostics-ipc';
+import { DesktopDiagnostics, diagnosticExitReason, recordRequestDiagnostic } from './desktop-diagnostics';
 
 const CENTER_KEY = 'control-center';
 const PET_SIZE = { width: 260, height: 295 };
@@ -85,6 +92,7 @@ interface MouthRun { owner: VoiceOwner; target: WindowRecord; durationMs: number
 type HostService = Pick<ServiceClient, 'getStatus'|'start'|'stop'|'restart'|'recover'|'request'|'subscribeStatus'|'subscribeSnapshot'|'subscribeChat'|'requestAi'|'requestVoice'|'requestVoiceSettings'|'ownsVoice'|'cancelVoiceChat'|'revokeFeatureDocument'|'requestWorkspace'|'requestHost'>;
 type ProactiveHostService = Pick<ServiceClient, 'setProactiveHost' | 'subscribeProactive' | 'requestProactive'>;
 type HostVault = Pick<CredentialVault,'save'|'resolve'|'revoke'>;
+type HostDiagnostics = Pick<DesktopDiagnostics, 'record' | 'publish' | 'stop'>;
 interface NativeWalkRun {
   readonly senderId: number;
   readonly displayId: number;
@@ -135,6 +143,8 @@ export class DesktopHost {
   private changingCharacterPack = false;
   private readonly service: HostService & ProactiveHostService;
   private readonly credentialVault: HostVault;
+  private readonly diagnostics: HostDiagnostics | undefined;
+  private exportingDiagnostics = false;
   private status: ServiceStatus;
   private snapshot: AppSnapshot | undefined;
   private pendingSnapshot: AppSnapshot | undefined;
@@ -150,6 +160,11 @@ export class DesktopHost {
   private manuallyHidden = false;
   private suspended = false;
   private locked = false;
+  private readonly fullscreenMonitor: ForegroundFullscreenMonitor | undefined;
+  private fullscreenEveryDisplay = false;
+  private readonly travelReturnNotices = new TravelReturnNotices();
+  private travelNoticeTimer: ReturnType<typeof setTimeout> | undefined;
+  private travelBalloon = false;
   private inputMode: 'auto' | 'through' | 'temporary-interactive' = 'auto';
   private interactionTimer: ReturnType<typeof setTimeout> | undefined;
   private walkingAttempt: string | undefined;
@@ -163,6 +178,8 @@ export class DesktopHost {
   private voiceOwner: VoiceOwner | undefined;
   private mouthRun: MouthRun | undefined;
   private hostPreferences: HostPreferencesView | undefined;
+  private shortcutBindings: HostShortcutBindingsView | undefined;
+  private changingShortcutBindings = false;
   private shortcuts: HostShortcutController | undefined;
   private backupInProgress = false;
   private nativePrompt = false;
@@ -171,11 +188,31 @@ export class DesktopHost {
   private readonly rendererDir = join(__dirname, '../renderer');
   private readonly devUrl = app.isPackaged ? undefined : process.env.ELECTRON_RENDERER_URL;
 
-  constructor(databasePath: string, dependencies: { service?: HostService & ProactiveHostService; vault?: HostVault } = {}) {
+  constructor(databasePath: string, dependencies: {
+    service?: HostService & ProactiveHostService; vault?: HostVault; diagnostics?: HostDiagnostics;
+    fullscreenProbe?: Pick<WindowsFullscreenProbe, 'available' | 'sample' | 'stop'>;
+  } = {}) {
+    this.diagnostics = dependencies.diagnostics;
     this.credentialVault = dependencies.vault ?? new CredentialVault(join(app.getPath('userData'), 'credentials'), safeStorage);
     this.service = dependencies.service ?? new ServiceClient({ spawn: source => spawnService(databasePath, source),
       credential: (providerId, ref) => this.credentialVault.resolve(providerId, ref) });
     this.status = this.service.getStatus();
+    const probe = dependencies.fullscreenProbe ?? new WindowsFullscreenProbe({
+      resourcesDirectory: process.resourcesPath ?? '', expectedSha256: nativeArtifactPins.fullscreenProbeSha256,
+    });
+    if (probe.available) {
+      this.fullscreenMonitor = new ForegroundFullscreenMonitor({
+        sample: signal => probe.sample(signal), stopProbe: () => probe.stop(),
+        displayForPoint: point => {
+          try {
+            const dip = screen.screenToDipPoint({ x: point.x, y: point.y });
+            return screen.getAllDisplays().find(({ bounds }) => dip.x >= bounds.x && dip.y >= bounds.y
+              && dip.x < bounds.x + bounds.width && dip.y < bounds.y + bounds.height)?.id;
+          } catch { return undefined; }
+        },
+        onChange: () => this.applyFullscreenState(),
+      });
+    }
   }
 
   start(): void {
@@ -193,15 +230,18 @@ export class DesktopHost {
     this.tray = new Tray(makeTrayIcon());
     this.tray.setToolTip('Pet Desktop');
     this.tray.on('click', () => { this.openControlCenter(); });
+    this.tray.on('balloon-click', () => this.openTravelReturnSummary());
+    this.tray.on('balloon-closed', () => { this.travelBalloon = false; });
     this.updateTray();
 
     screen.on('display-added', () => this.reflowWindows());
     screen.on('display-removed', () => this.reflowWindows());
     screen.on('display-metrics-changed', () => this.reflowWindows());
-    powerMonitor.on('suspend', () => { this.suspended = true; this.invalidateFeatures(); this.reconcilePets(); });
-    powerMonitor.on('resume', () => { this.suspended = false; this.reflowWindows(); });
-    powerMonitor.on('lock-screen', () => { this.locked = true; this.invalidateFeatures(); this.reconcilePets(); });
-    powerMonitor.on('unlock-screen', () => { this.locked = false; this.reflowWindows(); });
+    powerMonitor.on('suspend', () => { this.suspended = true; this.syncFullscreenMonitor(); this.invalidateFeatures(); this.reconcilePets(); });
+    powerMonitor.on('resume', () => { this.suspended = false; this.syncFullscreenMonitor(); this.reflowWindows(); });
+    powerMonitor.on('lock-screen', () => { this.locked = true; this.syncFullscreenMonitor(); this.invalidateFeatures(); this.reconcilePets(); });
+    powerMonitor.on('unlock-screen', () => { this.locked = false; this.syncFullscreenMonitor(); this.reflowWindows(); });
+    this.syncFullscreenMonitor();
 
     this.service.subscribeSnapshot((snapshot) => {
       if (this.stopping) return;
@@ -211,10 +251,11 @@ export class DesktopHost {
     this.service.subscribeStatus((status) => {
       const refreshPreferences = status.stage === 'READY'
         && (this.status.stage !== 'READY' || this.status.generation !== status.generation);
-      if (status.stage !== 'READY') {
+      if (status.stage !== 'READY' || this.status.generation !== status.generation) {
         this.shortcuts?.close();
         this.shortcuts = undefined;
         this.hostPreferences = undefined;
+        this.shortcutBindings = undefined;
       }
       if (status.generation !== this.status.generation || status.stage !== 'READY') {
         this.proactivePetId = undefined;
@@ -231,6 +272,7 @@ export class DesktopHost {
         void this.refreshHostPreferences(status.generation);
       }
       devLog('service', status.stage, `generation=${status.generation}`);
+      this.diagnostics?.record({ event: 'service-stage', stage: status.stage, generation: status.generation });
       if (status.stage === 'READY' && this.pendingSnapshot) {
         const snapshot = this.pendingSnapshot;
         this.pendingSnapshot = undefined;
@@ -272,7 +314,17 @@ export class DesktopHost {
       const { record, sender } = this.senderOf(event);
       const activePetRevision = record !== undefined && this.isActivePet(record) && record.window.isVisible()
         ? this.snapshot?.revision : undefined;
-      return routeRequest(record?.binding, sender, args, (request) => this.service.request(request), activePetRevision);
+      return routeRequest(record?.binding, sender, args, async request => {
+        const started = performance.now();
+        let outcome: IpcErrorCode | 'OK' = 'SERVICE_UNAVAILABLE';
+        try {
+          const result = await this.service.request(request);
+          outcome = result.ok ? 'OK' : result.error.code;
+          return result;
+        } finally {
+          if (record) recordRequestDiagnostic(this.diagnostics, 'game', record.binding.role, request.requestId, outcome, started);
+        }
+      }, activePetRevision);
     });
     ipcMain.handle(DESKTOP_IPC.getStatus, (event, ...args: unknown[]) => {
       const { record, sender } = this.senderOf(event);
@@ -331,6 +383,7 @@ export class DesktopHost {
       return { ok: true };
     });
     ipcMain.handle(DESKTOP_IPC.hostRequest, (event, ...args: unknown[]) => this.handleHostRequest(event, args));
+    ipcMain.handle(DESKTOP_IPC.exportDiagnostics, (event, ...args: unknown[]) => this.exportDiagnostics(event, args));
     ipcMain.handle(DESKTOP_IPC.aiRequest, (event, ...args: unknown[]) => this.handleAiRequest(event, args));
     ipcMain.handle(DESKTOP_IPC.proactiveRequest, (event, ...args: unknown[]) => this.handleProactiveRequest(event, args));
     ipcMain.handle(DESKTOP_IPC.credentialSave, (event, ...args: unknown[]) => this.handleCredential(event, args, true));
@@ -487,10 +540,21 @@ export class DesktopHost {
 
   private async refreshHostPreferences(generation: number): Promise<void> {
     try {
-      const response = await this.service.requestHost({ kind: 'preferences' });
-      if (!this.stopping && this.status.stage === 'READY' && this.status.generation === generation
-        && response.kind === 'preferences' && response.result.ok) this.applyHostPreferences(response.result.preferences);
+      const [response, shortcuts] = await Promise.all([
+        this.service.requestHost({ kind: 'preferences' }), this.service.requestHost({ kind: 'shortcut-bindings' }),
+      ]);
+      if (this.stopping || this.status.stage !== 'READY' || this.status.generation !== generation) return;
+      if (shortcuts.kind === 'shortcut-bindings' && shortcuts.result.ok) this.cacheShortcutBindings(shortcuts.result.preferences);
+      if (response.kind === 'preferences' && response.result.ok) this.applyHostPreferences(response.result.preferences);
     } catch { /* a later explicit settings read may retry */ }
+  }
+
+  private cacheShortcutBindings(preferences: HostShortcutBindingsView, applied = false): void {
+    if (preferences.revision <= (this.shortcutBindings?.revision ?? -1)
+      || (this.shortcuts && this.changingShortcutBindings && !applied)) return;
+    this.shortcutBindings = preferences;
+    if (!applied) this.shortcuts?.applyStoredBindings(preferences.bindings);
+    if (this.hostPreferences && !this.shortcuts) this.applyHostPreferences(this.hostPreferences);
   }
 
   private petSize(): { width: number; height: number } {
@@ -500,11 +564,12 @@ export class DesktopHost {
 
   private applyHostPreferences(preferences: HostPreferencesView): void {
     const previous = this.hostPreferences;
-    if (previous && preferences.revision <= previous.revision) return;
+    if (previous && preferences.revision < previous.revision) return;
     this.hostPreferences = preferences;
-    if (!this.shortcuts) {
+    if (!this.shortcuts && this.shortcutBindings) {
       this.shortcuts = new HostShortcutController({
         globalShortcut, loginApp: app, initialShortcutEnabled: preferences.values.hotkeysEnabled, shortcutPreferenceScope: 'PERSISTED',
+        initialShortcutBindings: this.shortcutBindings.bindings,
         actions: {
           openControlCenter: () => this.openControlCenter(),
           togglePetVisibility: () => this.togglePetVisibility(),
@@ -513,8 +578,9 @@ export class DesktopHost {
       });
       this.shortcuts.start();
     } else if (previous?.values.hotkeysEnabled !== preferences.values.hotkeysEnabled) {
-      this.shortcuts.setHostShortcutEnabled(preferences.values.hotkeysEnabled);
+      this.shortcuts?.setHostShortcutEnabled(preferences.values.hotkeysEnabled);
     }
+    if (previous?.revision === preferences.revision) return;
     if (previous?.values.scalePercent !== preferences.values.scalePercent) this.stopWalkMotion();
     for (const record of this.windows.values()) {
       if (!record.pet || !this.isCurrent(record)) continue;
@@ -528,17 +594,60 @@ export class DesktopHost {
   }
 
   private async handleHostRequest(event: IpcMainInvokeEvent, args: readonly unknown[]):
-    Promise<HostSettingsResult | HostPreferencesViewResult | BackupViewResult | RestoreBackupResult | RestoreBackupStatus | PeriodicBackupStatus> {
+    Promise<HostSettingsResult | HostPreferencesViewResult | HostShortcutBindingsResult | BackupViewResult | RestoreBackupResult | RestoreBackupStatus | PeriodicBackupStatus> {
     const parsed = hostRendererRequestSchema.safeParse(args[0]);
     if (args.length !== 1 || !parsed.success) throw new Error('INVALID_REQUEST');
     const request = parsed.data;
     const restore = request.kind === 'restore-backup';
-    const stamp = this.authorizedFeature(event, request.kind === 'backup' || restore || request.kind === 'login', restore);
+    const stamp = this.authorizedFeature(event, request.kind === 'backup' || restore || request.kind === 'login'
+      || request.kind === 'save-shortcut-bindings', restore);
     if (!stamp) throw new Error('FORBIDDEN');
     const unavailable = { ok: false, code: 'SERVICE_UNAVAILABLE' } as const;
     const settingsUnavailable = { ...unavailable, settings: null };
     if (request.kind === 'backup') return this.exportBackup(event, stamp);
     if (request.kind === 'restore-backup') return this.prepareRestore(event, stamp);
+    if (request.kind === 'shortcut-bindings') {
+      const reply = await this.service.requestHost(request);
+      if (!this.recheckFeature(event, stamp) || reply.kind !== request.kind) return unavailable;
+      if (reply.result.ok) this.cacheShortcutBindings(reply.result.preferences);
+      return reply.result;
+    }
+    if (request.kind === 'save-shortcut-bindings') {
+      const controller = this.shortcuts;
+      if (process.platform !== 'win32') return { ok: false, code: 'UNSUPPORTED' };
+      if (!controller || !this.shortcutBindings) return unavailable;
+      if (this.changingShortcutBindings) return { ok: false, code: 'BUSY' };
+      if (request.edit.expectedRevision !== this.shortcutBindings.revision) return { ok: false, code: 'REVISION_CONFLICT' };
+      const prepared = controller.prepareBindings(request.edit.bindings);
+      if (!prepared.ok) return prepared;
+      this.changingShortcutBindings = true;
+      let refresh = false;
+      try {
+        const reply = await this.service.requestHost(request);
+        if (this.stopping || this.status.generation !== stamp.serviceGeneration || this.shortcuts !== controller
+          || reply.kind !== 'shortcut-bindings') return unavailable;
+        if (reply.result.ok) {
+          const authoritative = reply.result.preferences;
+          if (authoritative.revision < request.edit.expectedRevision
+            || hostShortcutIds.some(id => authoritative.bindings[id] !== request.edit.bindings[id])) {
+            refresh = true;
+            return unavailable;
+          }
+          prepared.apply();
+          this.cacheShortcutBindings(authoritative, true);
+        } else refresh = reply.result.code === 'SERVICE_UNAVAILABLE' || reply.result.code === 'REVISION_CONFLICT';
+        return this.recheckFeature(event, stamp) ? reply.result : unavailable;
+      } catch {
+        refresh = true;
+        return unavailable;
+      } finally {
+        prepared.discard();
+        this.changingShortcutBindings = false;
+        if (refresh && this.status.stage === 'READY' && this.status.generation === stamp.serviceGeneration) {
+          void this.refreshHostPreferences(stamp.serviceGeneration);
+        }
+      }
+    }
     if (request.kind === 'restore-status' || request.kind === 'periodic-backup-status') {
       const reply = await this.service.requestHost(request);
       return this.recheckFeature(event, stamp) && reply.kind === request.kind ? reply.result : unavailable;
@@ -551,26 +660,73 @@ export class DesktopHost {
       return confirmed && this.recheckFeature(event, stamp) ? this.shortcuts?.setLoginStart(request.enabled) ?? settingsUnavailable : settingsUnavailable;
     }
     const previous = this.hostPreferences;
-    if (request.kind === 'shortcuts' && (process.platform !== 'win32' || !previous || !this.shortcuts)) {
-      return { ok: false, code: process.platform === 'win32' ? 'SERVICE_UNAVAILABLE' : 'UNSUPPORTED', settings: null };
+    if (request.kind === 'shortcuts') {
+      const controller = this.shortcuts;
+      if (process.platform !== 'win32') return { ok: false, code: 'UNSUPPORTED', settings: null };
+      if (!previous || !controller || this.changingShortcutBindings) return settingsUnavailable;
+      this.changingShortcutBindings = true;
+      try {
+        const reply = await this.service.requestHost({ ...request, expectedRevision: previous.revision });
+        if (this.stopping || this.status.stage !== 'READY' || this.status.generation !== stamp.serviceGeneration
+          || this.shortcuts !== controller || reply.kind !== 'preferences' || !reply.result.ok) return settingsUnavailable;
+        this.applyHostPreferences(reply.result.preferences);
+        if (!this.recheckFeature(event, stamp)) return settingsUnavailable;
+        return previous.values.hotkeysEnabled === request.enabled ? controller.setHostShortcutEnabled(request.enabled) : controller.getHostSettings();
+      } catch {
+        return settingsUnavailable;
+      } finally { this.changingShortcutBindings = false; }
     }
-    if (request.kind === 'settings' && this.shortcuts) return this.shortcuts.getHostSettings();
-    const result = await this.service.requestHost(request.kind === 'shortcuts'
-      ? { ...request, expectedRevision: previous!.revision }
-      : request.kind === 'settings' ? { kind: 'preferences' } : request);
+    if (request.kind === 'settings') {
+      if (!this.shortcuts) await this.refreshHostPreferences(stamp.serviceGeneration);
+      return this.recheckFeature(event, stamp) ? this.shortcuts?.getHostSettings() ?? settingsUnavailable : settingsUnavailable;
+    }
+    const result = await this.service.requestHost(request);
     if (result.kind !== 'preferences') return unavailable;
     const response = result.result;
     if (response.ok && !this.stopping && this.status.stage === 'READY' && this.status.generation === stamp.serviceGeneration) {
       this.applyHostPreferences(response.preferences);
     }
     if (!this.recheckFeature(event, stamp)) return unavailable;
-    if (request.kind === 'settings') return this.shortcuts?.getHostSettings() ?? settingsUnavailable;
-    if (request.kind === 'shortcuts') {
-      if (!response.ok) return settingsUnavailable;
-      if (previous?.values.hotkeysEnabled === request.enabled) return this.shortcuts?.setHostShortcutEnabled(request.enabled) ?? settingsUnavailable;
-      return this.shortcuts?.getHostSettings() ?? settingsUnavailable;
-    }
     return response;
+  }
+
+  private async exportDiagnostics(event: IpcMainInvokeEvent, args: readonly unknown[]): Promise<DiagnosticsExportResult> {
+    if (args.length !== 0) return { ok: false, code: 'INVALID_REQUEST' };
+    const { record, sender } = this.senderOf(event);
+    if (!record || !authorizeSender(record.binding, sender, 'control-center') || !record.window.isFocused()) return { ok: false, code: 'FORBIDDEN' };
+    const epoch = record.documentEpoch;
+    const isCurrent = (): boolean => {
+      if (this.stopping || this.suspended || this.locked || !this.isCurrent(record) || !record.responsive
+        || !record.documentReady || record.documentEpoch !== epoch || !record.window.isVisible()) return false;
+      const fresh = this.senderOf(event);
+      return fresh.record === record && authorizeSender(record.binding, fresh.sender, 'control-center');
+    };
+    if (!isCurrent()) return { ok: false, code: 'FORBIDDEN' };
+    if (!this.diagnostics) return { ok: false, code: 'UNAVAILABLE' };
+    if (this.nativePrompt || this.exportingDiagnostics || this.backupInProgress || this.voiceOwner || this.micLease) {
+      return { ok: false, code: 'BUSY' };
+    }
+    this.exportingDiagnostics = true;
+    try {
+      this.nativePrompt = true;
+      let selected;
+      try {
+        const timestamp = new Date().toISOString().slice(0, 19).replace(/:/g, '-');
+        selected = await dialog.showSaveDialog(record.window, {
+          title: '导出 Pet Desktop 诊断报告',
+          defaultPath: `pet-desktop-diagnostics-${timestamp}.json`,
+          filters: [{ name: '诊断报告', extensions: ['json'] }],
+        });
+      } finally { this.nativePrompt = false; }
+      if (selected.canceled || !selected.filePath) return { ok: false, code: 'CANCELLED' };
+      if (!isCurrent()) return { ok: false, code: 'FORBIDDEN' };
+      const published = await this.diagnostics.publish(selected.filePath, isCurrent);
+      if (published === 'destination-exists') return { ok: false, code: 'DESTINATION_EXISTS' };
+      if (published === 'cancelled') return { ok: false, code: 'FORBIDDEN' };
+      return { ok: true, entries: published.entries };
+    } catch {
+      return { ok: false, code: 'EXPORT_FAILED' };
+    } finally { this.exportingDiagnostics = false; }
   }
 
   private async exportBackup(event: IpcMainInvokeEvent, stamp: FeatureStamp): Promise<BackupViewResult> {
@@ -635,11 +791,15 @@ export class DesktopHost {
     const original = parsed.data, request: AiRequest = { ...original, requestId: randomUUID() };
     const failed = (): AiResult => ({ requestId: original.requestId, method: original.intent.method, ok: false,
       error: { code: 'UNAVAILABLE', message: 'AI 请求结果尚未确认，请刷新。', retryable: true } });
+    const started = performance.now();
+    let outcome: 'OK' | 'AI_ERROR' | 'AI_UNAVAILABLE' = 'AI_UNAVAILABLE';
     try {
       const result = aiResultSchema.safeParse(await this.service.requestAi(request));
       if (!this.recheckFeature(event, stamp) || !result.success || !aiResultMatches(request, result.data)) return failed();
+      outcome = result.data.ok ? 'OK' : result.data.error.code === 'UNAVAILABLE' ? 'AI_UNAVAILABLE' : 'AI_ERROR';
       return { ...result.data, requestId: original.requestId };
     } catch { return failed(); }
+    finally { recordRequestDiagnostic(this.diagnostics, 'ai', 'control-center', request.requestId, outcome, started); }
   }
 
   private async handleProactiveRequest(event: IpcMainInvokeEvent, args: readonly unknown[]): Promise<ProactiveResult | null> {
@@ -738,7 +898,8 @@ export class DesktopHost {
     if (!this.hasPet(request.kind === 'status' ? request.scope.petId : request.job.petId)) return failure();
     let owner = this.voiceOwner;
     if (request.kind === 'begin') {
-      if (owner || this.micLease || this.nativePrompt || this.voiceSettingsMutation || !this.featureCurrent(stamp, true) || !this.consentCurrent(stamp)) return failure('permission_denied');
+      if (owner || this.micLease || this.nativePrompt || this.voiceSettingsMutation || this.windowQuietsInFullscreen(stamp.record)
+        || !this.featureCurrent(stamp, true) || !this.consentCurrent(stamp)) return failure('permission_denied');
       owner = { stamp, job: request.job, reserved: false, micUsed: false, mouthStarted: false };
       this.voiceOwner = owner;
       this.syncProactive();
@@ -921,6 +1082,7 @@ export class DesktopHost {
   }
 
   private acceptSnapshot(snapshot: AppSnapshot): void {
+    this.travelReturnNotices.observe(this.snapshot, snapshot);
     this.snapshot = snapshot;
     if (this.voiceOwner && !this.hasPet(this.voiceOwner.job.petId)) this.invalidateVoice(this.voiceOwner.stamp.record);
     for (const record of this.windows.values()) this.send(record, DESKTOP_IPC.snapshot, snapshot);
@@ -948,7 +1110,7 @@ export class DesktopHost {
     const petId = this.snapshot?.primaryPetId;
     if (!petId || !this.snapshot?.pets.some(pet => pet.petId === petId && pet.activity === 'IDLE')) return undefined;
     const record = this.windows.get(`pet:${petId}`);
-    return record && this.isActivePet(record) && record.window.isVisible() ? record : undefined;
+    return record && this.isActivePet(record) && record.window.isVisible() && !this.windowQuietsInFullscreen(record) ? record : undefined;
   }
 
   private clearProactiveBubble(): void {
@@ -980,6 +1142,39 @@ export class DesktopHost {
       || this.manuallyHidden || this.suspended || this.locked;
   }
 
+  private syncFullscreenMonitor(): void {
+    if (this.stopping || this.suspended || this.locked) this.fullscreenMonitor?.stop();
+    else this.fullscreenMonitor?.start();
+  }
+
+  private fullscreenState(): FullscreenState {
+    const state = this.fullscreenMonitor?.state ?? { kind: 'clear' };
+    return this.fullscreenEveryDisplay && state.kind === 'display' ? { kind: 'global' } : state;
+  }
+
+  private windowDisplayId(record: WindowRecord): number | undefined {
+    try { return screen.getDisplayMatching(record.window.getBounds()).id; }
+    catch { return undefined; }
+  }
+
+  private windowHidesInFullscreen(record: WindowRecord): boolean {
+    const state = this.fullscreenState();
+    return state.kind === 'global' || (state.kind === 'display' && fullscreenHides(state, this.windowDisplayId(record) ?? -Infinity));
+  }
+
+  private windowQuietsInFullscreen(record: WindowRecord): boolean {
+    const state = this.fullscreenState();
+    return fullscreenQuiets(state, state.kind === 'display' ? this.windowDisplayId(record) ?? -Infinity : -Infinity);
+  }
+
+  private applyFullscreenState(): void {
+    if (this.stopping || this.locked || this.suspended) return;
+    const owner = this.voiceOwner;
+    if (owner && this.windowQuietsInFullscreen(owner.stamp.record)) this.invalidateVoice(owner.stamp.record);
+    this.reconcilePets();
+    this.updateTray();
+  }
+
   private getDesiredPet(): PetSurfaceIdentity | undefined {
     return desiredPetSurface(this.snapshot, this.status, this.petSuppressed());
   }
@@ -989,7 +1184,8 @@ export class DesktopHost {
     const pet = record.pet;
     return this.isCurrent(record) && pet !== undefined && desired !== undefined
       && pet.phase === 'ACTIVE' && samePetSurface(pet.identity, desired)
-      && pet.documentReady && pet.visualResult !== undefined && record.ready && record.responsive;
+      && pet.documentReady && pet.visualResult !== undefined && record.ready && record.responsive
+      && !this.windowHidesInFullscreen(record);
   }
 
   private clearPetTimers(pet: PetWindowState): void {
@@ -1011,6 +1207,7 @@ export class DesktopHost {
       pet.stagingTimer = setTimeout(() => {
         if (!this.isCurrent(record) || pet.phase !== 'STAGING') return;
         devLog('pet visual staging timed out');
+        this.diagnostics?.record({ event: 'window-staging-timeout', role: 'pet' });
         this.recoverWindow(record);
       }, PET_VISUAL_TIMEOUT_MS);
     } else if (phase === 'RETIRING' && pet.retirementTimer === undefined) {
@@ -1033,6 +1230,7 @@ export class DesktopHost {
   /** Keep at most one displayed surface and one hidden staging window. Native
    * visibility follows the plan, but only authority selects/owns the pet. */
   private reconcilePets(): void {
+    this.syncTravelReturnSummary();
     const surfaces: PetSurfaceInfo[] = [];
     for (const record of this.windows.values()) {
       const pet = record.pet;
@@ -1048,7 +1246,10 @@ export class DesktopHost {
     // Disable input before any old surface is retired. Unexpected native close
     // and late callbacks cannot re-authorize a non-desired window.
     const retiring = plan.retiring === undefined ? undefined : this.senders.get(plan.retiring);
-    if (retiring) this.setPetPhase(retiring, 'RETIRING');
+    if (retiring) {
+      this.setPetPhase(retiring, 'RETIRING');
+      if (this.windowHidesInFullscreen(retiring)) retiring.window.hide();
+    }
     const staging = plan.staging === undefined ? undefined : this.senders.get(plan.staging);
     if (staging) {
       this.setPetPhase(staging, 'STAGING');
@@ -1064,11 +1265,12 @@ export class DesktopHost {
     if (active && this.isCurrent(active)) {
       this.setPetPhase(active, 'ACTIVE');
       try {
-        if (!this.updatePetInput(active)) {
+        if (!this.updatePetInput(active) || this.windowHidesInFullscreen(active)) {
           if (active.window.isVisible()) active.window.hide();
         } else if (!active.window.isVisible()) active.window.showInactive();
       } catch {
         devLog('pet surface could not be presented');
+        this.diagnostics?.record({ event: 'window-presentation-failed', role: 'pet' });
         this.recoverWindow(active);
       }
     }
@@ -1078,6 +1280,7 @@ export class DesktopHost {
         try { this.createWindow(key, plan.create, false); }
         catch {
           devLog('pet staging window could not be created');
+          this.diagnostics?.record({ event: 'window-create-failed', role: 'pet' });
           const record = this.windows.get(key);
           if (record) this.recoverWindow(record);
           else this.scheduleRecovery(key, 'pet');
@@ -1211,7 +1414,11 @@ export class DesktopHost {
     this.storeAnchor(record, false);
     this.protectContents(record);
     if (pet) this.setPetPhase(record, 'STAGING');
-    window.on('move', () => this.storeAnchor(record));
+    window.on('move', () => {
+      this.storeAnchor(record);
+      if (record.pet?.phase === 'ACTIVE' && this.fullscreenState().kind === 'display'
+        && record.window.isVisible() === this.windowHidesInFullscreen(record)) this.reconcilePets();
+    });
     window.on('resize', () => this.storeAnchor(record));
     window.on('closed', () => {
       const registered = this.windows.get(record.key) === record;
@@ -1245,6 +1452,7 @@ export class DesktopHost {
     window.webContents.on('did-finish-load', () => {
       if (!this.isCurrent(record)) return;
       devLog('renderer loaded', role);
+      this.diagnostics?.record({ event: 'window-loaded', role });
       record.documentReady = isTrustedDocument(record.binding, window.webContents.getURL());
       if (record.pet) record.pet.documentReady = true;
       this.send(record, DESKTOP_IPC.status, this.status);
@@ -1254,8 +1462,10 @@ export class DesktopHost {
       if (this.status.stage === 'READY' && this.snapshot) this.send(record, DESKTOP_IPC.snapshot, this.snapshot);
       if (record.pet) this.reconcilePets();
     });
-    window.webContents.on('did-start-loading', () => {
-      if (!this.isCurrent(record)) return;
+    window.webContents.on('did-start-navigation', (details) => {
+      // Chromium can emit loading events while Vue changes only the hash.
+      // Revoke document capabilities only when the main document is replaced.
+      if (!details.isMainFrame || details.isSameDocument || !this.isCurrent(record)) return;
       record.inputLease.clear();
       record.documentReady = false;
       record.documentEpoch++;
@@ -1269,10 +1479,12 @@ export class DesktopHost {
     });
     window.webContents.on('render-process-gone', (_event, details) => {
       devLog('renderer gone', role, details.reason);
+      this.diagnostics?.record({ event: 'window-exited', role, reason: diagnosticExitReason(details.reason) });
       this.recoverWindow(record);
     });
     void window.loadURL(url).catch(() => {
       devLog('renderer load failed', role);
+      this.diagnostics?.record({ event: 'window-load-failed', role });
       this.recoverWindow(record);
     });
   }
@@ -1459,12 +1671,56 @@ export class DesktopHost {
     this.updateTray();
   }
 
+  private travelNoticesQuiet(): boolean {
+    return this.stopping || this.status.stage !== 'READY' || !this.snapshot || this.snapshot.doNotDisturb
+      || this.suspended || this.locked || this.fullscreenState().kind !== 'clear';
+  }
+
+  private syncTravelReturnSummary(): void {
+    if (this.travelNoticesQuiet()) {
+      clearTimeout(this.travelNoticeTimer);
+      this.travelNoticeTimer = undefined;
+      if (this.travelBalloon) {
+        this.travelBalloon = false;
+        try { this.tray?.removeBalloon(); } catch { /* Explorer can be restarting. */ }
+      }
+      return;
+    }
+    if (!this.travelReturnNotices.pendingCount || this.travelNoticeTimer) return;
+    this.travelNoticeTimer = setTimeout(() => {
+      this.travelNoticeTimer = undefined;
+      const tray = this.tray, count = this.travelReturnNotices.pendingCount;
+      if (!tray || tray.isDestroyed() || !count || this.travelNoticesQuiet()) return;
+      this.travelReturnNotices.markPresented();
+      try { this.updateTray(); } catch { /* Explorer can be restarting. */ }
+      if (process.platform === 'win32') {
+        try {
+          tray.displayBalloon({ title: '旅行已结算', content: `${count} 次旅行已结算，可在旅行页查看战报。`,
+            iconType: 'info', noSound: true, respectQuietTime: true });
+          this.travelBalloon = true;
+        } catch { /* The tray menu remains available if Windows suppresses the balloon. */ }
+      }
+    }, 1_000);
+    this.travelNoticeTimer.unref();
+  }
+
+  private openTravelReturnSummary(): void {
+    if (!this.travelReturnNotices.presentedCount) return;
+    this.openControlCenter();
+    this.travelReturnNotices.acknowledgePresented();
+    this.updateTray();
+  }
+
   private updateTray(): void {
     if (!this.tray || this.tray.isDestroyed()) return;
+    const returns = this.travelReturnNotices.presentedCount;
     this.tray.setContextMenu(Menu.buildFromTemplate([
       { label: '打开控制中心', click: () => this.openControlCenter() },
+      ...(returns ? [{ label: `打开控制中心查看旅行汇总（${returns} 次）`, click: () => this.openTravelReturnSummary() }] : []),
       ...(this.stopping ? [{ label: '等待本地服务确认退出…', enabled: false }] : []),
       { label: this.manuallyHidden ? '恢复桌面宠物' : '暂时隐藏桌面宠物', click: () => this.togglePetVisibility() },
+      ...(this.fullscreenMonitor ? [{ label: '全屏时隐藏所有桌宠', type: 'checkbox' as const, checked: this.fullscreenEveryDisplay,
+        click: () => { this.fullscreenEveryDisplay = !this.fullscreenEveryDisplay; this.applyFullscreenState(); } }] : []),
       { label: '自动命中（实验）', type: 'radio', checked: this.inputMode === 'auto', click: () => this.setInputMode('auto') },
       { label: '整窗鼠标穿透', type: 'radio', checked: this.inputMode === 'through', click: () => this.setInputMode('through') },
       { label: '临时矩形交互（20秒）', type: 'radio', checked: this.inputMode === 'temporary-interactive', click: () => this.setInputMode('temporary-interactive') },
@@ -1484,6 +1740,7 @@ export class DesktopHost {
   async stop(): Promise<void> {
     if (this.stopping) return;
     this.stopping = true;
+    this.syncFullscreenMonitor();
     if (this.proactiveTimer !== undefined) clearInterval(this.proactiveTimer);
     this.clearProactiveBubble();
     this.shortcuts?.close();
@@ -1501,6 +1758,7 @@ export class DesktopHost {
     // The control center and tray remain available to explain STOPPING until
     // the client confirms the child process's real exit event.
     await this.service.stop();
+    await this.diagnostics?.stop();
     for (const record of [...this.windows.values()]) this.destroyWindow(record);
     this.tray?.destroy();
   }
@@ -1520,6 +1778,7 @@ if (!app.requestSingleInstanceLock()) {
   app.quit();
 } else {
   let host: DesktopHost | undefined;
+  let diagnostics: DesktopDiagnostics | undefined;
   let finishing = false;
   let serviceStopped = false;
   app.on('second-instance', () => host?.openControlCenter());
@@ -1536,16 +1795,26 @@ if (!app.requestSingleInstanceLock()) {
     }).catch(() => {
       // If shutdown cannot establish service exit, remain alive rather than starting a second writer.
       devLog('service shutdown failed');
+      diagnostics?.record({ event: 'service-shutdown-failed' });
     });
   });
-  app.on('child-process-gone', (_event, details) => devLog('child process gone', details.type, details.reason));
+  app.on('child-process-gone', (_event, details) => {
+    devLog('child process gone', details.type, details.reason);
+    const type = details.type.toLowerCase();
+    diagnostics?.record({ event: 'child-exited', role: type === 'utility' || type === 'gpu' ? type : 'other',
+      reason: diagnosticExitReason(details.reason) });
+  });
   void app.whenReady().then(() => {
     const directory = app.getPath('userData');
     mkdirSync(directory, { recursive: true });
-    host = new DesktopHost(join(directory, 'pet-desktop.sqlite3'));
+    diagnostics = new DesktopDiagnostics({ userDataDirectory: directory, appVersion });
+    diagnostics.start();
+    host = new DesktopHost(join(directory, 'pet-desktop.sqlite3'), { diagnostics });
     host.start();
-  }).catch(() => {
+  }).catch(async () => {
     devLog('host startup failed');
+    diagnostics?.record({ event: 'host-startup-failed' });
+    await diagnostics?.stop();
     app.quit();
   });
 }

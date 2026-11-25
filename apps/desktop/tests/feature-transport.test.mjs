@@ -9,6 +9,7 @@ import { startUtilityTransport } from '../src/app-service/transport.ts';
 import { openPersistentService } from '../src/app-service/database.ts';
 import { UtilityCredentialBroker } from '../src/app-service/feature-router.ts';
 import { SCHEMA_VERSION } from '@pet-desktop/app-service';
+import { defaultHostShortcutBindings } from '@pet-desktop/contracts/host-shortcuts';
 
 const config={providerId:'mock-one',endpointKind:'MOCK',privacyBoundary:'MOCK',baseUrl:null,modelId:'mock',credentialRef:null,
   capabilities:{streamText:true,nativeStructured:false,jsonMode:false,usage:false,embeddings:false},maxContextTokens:8000,maxOutputTokens:400,timeoutMs:30000};
@@ -131,6 +132,19 @@ describe('feature transport over the single durable utility writer',()=>{
         values: { scalePercent: 125, reducedMotion: true, hotkeysEnabled: true } } } });
       expect(await client.requestHost({ kind: 'save', edit: { expectedRevision: 0, scalePercent: 150, reducedMotion: false } }))
         .toEqual({ kind: 'preferences', result: { ok: false, code: 'REVISION_CONFLICT' } });
+      const customBindings = { ...defaultHostShortcutBindings, OPEN_CONTROL_CENTER: 'CommandOrControl+Alt+F9' };
+      expect(await client.requestHost({ kind: 'shortcut-bindings' })).toEqual({ kind: 'shortcut-bindings', result: {
+        ok: true, preferences: { revision: 0, bindings: defaultHostShortcutBindings },
+      } });
+      const savedBindings = await client.requestHost({ kind: 'save-shortcut-bindings', edit: {
+        expectedRevision: 0, bindings: customBindings,
+      } });
+      expect(savedBindings).toEqual({ kind: 'shortcut-bindings', result: {
+        ok: true, preferences: { revision: 1, bindings: customBindings },
+      } });
+      expect(await client.requestHost({ kind: 'save-shortcut-bindings', edit: {
+        expectedRevision: 0, bindings: defaultHostShortcutBindings,
+      } })).toEqual({ kind: 'shortcut-bindings', result: { ok: false, code: 'REVISION_CONFLICT' } });
       const anchor = { role: 'pet', petId, displayId: -8, offsetX: 170, offsetY: 490,
         x: -1430, y: 490, width: 325, height: 369, displayScale1000: 1500, observedAt: 10 };
       expect(await client.requestHost({ kind: 'save-window-anchor', anchor })).toEqual({
@@ -145,6 +159,7 @@ describe('feature transport over the single durable utility writer',()=>{
       expect(await client.requestAi(request('read-new-gen','messages/list',{petId,conversationId,offset:0,limit:10}))).toEqual({...messages,requestId:'read-new-gen'});
       expect(await client.requestVoiceSettings({kind:'get',petId})).toEqual(muted);
       expect(await client.requestHost({ kind: 'preferences' })).toEqual(preferences);
+      expect(await client.requestHost({ kind: 'shortcut-bindings' })).toEqual(savedBindings);
       expect(await client.requestHost({ kind: 'window-anchors' })).toEqual({ kind: 'window-anchors', result: { ok: true, anchors: [anchor] } });
       expect(await client.requestWorkspace(request('workspace-new-gen','workspace/manage',{intent:{method:'workspace/list',payload:{}}}))).toEqual({...optedIn,requestId:'workspace-new-gen'});
     }finally{await client?.stop();rmSync(dir,{recursive:true,force:true});}

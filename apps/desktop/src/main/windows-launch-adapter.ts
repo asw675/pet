@@ -1,13 +1,11 @@
-import { createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import type { ChildProcess, SpawnOptions } from 'node:child_process';
-import { lstat, open, realpath } from 'node:fs/promises';
-import type { BigIntStats } from 'node:fs';
-import { dirname, isAbsolute, join, normalize, win32 } from 'node:path';
+import { dirname, win32 } from 'node:path';
 import type { BrowserWindow, OpenDialogOptions, MessageBoxOptions } from 'electron';
 import { z } from 'zod';
 import { launchAuthorityActionSchema } from '@pet-desktop/contracts/workspace';
 import { normalizeHttpsTarget, normalizeLocalWin32Path, quickLaunchLimits } from './quick-launch-policy';
+import { verifyPackagedWindowsHelper, windowsHelperEnvironment } from './trusted-windows-helper';
 import type {
   AdapterLaunchOutcome, ExecutableObservation, LocalDriveType, LocalPathObservation, QuickLaunchAdapterPort,
   QuickLaunchDialogPort, QuickLaunchFsPort, QuickLaunchKind, QuickLaunchSender, QuickTargetPreview, SavedQuickAction,
@@ -93,66 +91,9 @@ function allowedExe(path: unknown): path is string {
   return name.length > 0 && !deniedExecutables.has(name) && !/^(?:python|ruby|perl|php|lua|node|java|pwsh)(?:\d+(?:\.\d+)*)?w?$/u.test(name);
 }
 function exactHttps(value: unknown): value is string { return typeof value === 'string' && normalizeHttpsTarget(value) === value; }
-function sameHostPath(left: string, right: string): boolean {
-  // Only canonicalize the drive letter, not case-sensitive directory/file
-  // components. This also permits the real local test host's absolute paths.
-  const drive = (p: string) => p.replace(/^[a-z]:\\/u, part => part.toUpperCase());
-  return drive(left) === drive(right);
-}
-function exactFile(a: BigIntStats, b: BigIntStats): boolean {
-  return a.isFile() && b.isFile() && a.dev === b.dev && a.ino === b.ino && a.size === b.size && a.mtimeNs === b.mtimeNs && a.ctimeNs === b.ctimeNs;
-}
-
-/** Hash the fixed binary, not a user-selected target path. The helper itself
- * subsequently performs Windows handle/reparse/full-content checks for user
- * targets. Packaged installation paths are the trusted application boundary. */
-async function verifiedHelper(options: WindowsLaunchAdaptersOptions, platform: NodeJS.Platform, signal: AbortSignal): Promise<string | null> {
-  const expected = options.expectedInspectorSha256;
-  const root = options.resourcesDirectory;
-  if (platform !== 'win32' || signal.aborted || typeof expected !== 'string' || !digestPattern.test(expected) || /^0+$/u.test(expected)
-    || !isAbsolute(root) || normalize(root) !== root) return null;
-  try {
-    if (process.platform === 'win32' && normalizeLocalWin32Path(root) === null) return null;
-    let current = root;
-    for (const part of ['', ...windowsLaunchAdapterLimits.helperRelativePath.slice(0, -1)]) {
-      if (signal.aborted) return null;
-      if (part !== '') current = join(current, part);
-      const inspected = await lstat(current, { bigint: true });
-      if (!inspected.isDirectory() || inspected.isSymbolicLink() || !sameHostPath(await realpath(current), current)) return null;
-    }
-    const helper = join(root, ...windowsLaunchAdapterLimits.helperRelativePath);
-    const before = await lstat(helper, { bigint: true });
-    if (signal.aborted || !before.isFile() || before.isSymbolicLink() || before.size < 1n || before.size > BigInt(windowsLaunchAdapterLimits.helperBytes)
-      || !sameHostPath(await realpath(helper), helper)) return null;
-    const handle = await open(helper, 'r');
-    try {
-      const initial = await handle.stat({ bigint: true });
-      if (!exactFile(initial, before)) return null;
-      const hash = createHash('sha256'), block = Buffer.allocUnsafe(64 * 1024);
-      let offset = 0;
-      const size = Number(initial.size);
-      while (offset < size) {
-        if (signal.aborted) return null;
-        const { bytesRead } = await handle.read(block, 0, Math.min(block.length, size - offset), offset);
-        if (bytesRead < 1) return null;
-        hash.update(block.subarray(0, bytesRead));
-        offset += bytesRead;
-      }
-      const after = await handle.stat({ bigint: true });
-      const currentPath = await lstat(helper, { bigint: true });
-      if (signal.aborted || !exactFile(initial, after) || !exactFile(initial, currentPath) || currentPath.isSymbolicLink()
-        || !sameHostPath(await realpath(helper), helper) || hash.digest('hex') !== expected) return null;
-      return helper;
-    } finally { await handle.close(); }
-  } catch { return null; }
-}
-
-function helperEnvironment(): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = {};
-  const systemRoot = process.env.SystemRoot ?? process.env.SYSTEMROOT ?? process.env.WINDIR;
-  if (systemRoot) { env.SystemRoot = systemRoot; env.WINDIR = systemRoot; }
-  // No inherited PATH loader variables, credentials or proxy configuration.
-  return env;
+function verifiedHelper(options: WindowsLaunchAdaptersOptions, platform: NodeJS.Platform, signal: AbortSignal): Promise<string | null> {
+  return verifyPackagedWindowsHelper({ root: options.resourcesDirectory, parts: windowsLaunchAdapterLimits.helperRelativePath,
+    maxBytes: windowsLaunchAdapterLimits.helperBytes, digest: options.expectedInspectorSha256, platform, signal });
 }
 function launchEnvironment(): NodeJS.ProcessEnv {
   // Fixed normal Windows app variables only; no model API credentials or
@@ -223,7 +164,7 @@ class Inspector {
     this.busy = true;
     return new Promise(resolve => {
       let child: ChildProcess;
-      try { child = this.spawnProcess(helper, [], { shell: false, windowsHide: true, cwd: dirname(helper), env: helperEnvironment(), stdio: ['pipe', 'pipe', 'ignore'] }); }
+      try { child = this.spawnProcess(helper, [], { shell: false, windowsHide: true, cwd: dirname(helper), env: windowsHelperEnvironment(), stdio: ['pipe', 'pipe', 'ignore'] }); }
       catch { this.busy = false; resolve(null); return; }
       let settled = false, received = 0, stopped = false;
       const chunks: Buffer[] = [];

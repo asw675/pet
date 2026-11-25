@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { existsSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -84,12 +85,13 @@ describe('verified periodic SQLite snapshots', () => {
       repo.transaction(tx => tx.setWalletCoins(coins));
       backup.tick(); advance(PERIODIC_BACKUP_INTERVAL_MS);
     }
-    const before = new Map(snapshots(directory).map(path => [path, readFileSync(path)]));
+    const digests = () => snapshots(directory).map(path => [path, createHash('sha256').update(readFileSync(path)).digest('hex')]);
+    const before = digests();
     exportVerified.mockImplementationOnce(() => { throw new Error('synthetic disk full'); });
     repo.transaction(tx => tx.setWalletCoins(40));
     backup.tick();
     expect(backup.status()).toEqual({ ok: true, status: 'FAILED', lastCompletedAt: new Date(START + 2 * PERIODIC_BACKUP_INTERVAL_MS).toISOString() });
-    expect(new Map(snapshots(directory).map(path => [path, readFileSync(path)]))).toEqual(before);
+    expect(digests()).toEqual(before);
     advance(HOUR / 2); backup.tick();
     expect(exportVerified).toHaveBeenCalledTimes(4);
     advance(HOUR / 2); backup.tick();

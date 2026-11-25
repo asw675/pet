@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import type { EventEmitter } from 'node:events';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AppSnapshot } from '@pet-desktop/contracts';
+import { defaultHostShortcutBindings, type HostShortcutBindings } from '@pet-desktop/contracts/host-shortcuts';
 import { DEFAULT_LOCAL_VOICE_CONFIG } from '@pet-desktop/contracts/voice';
 import type { AiRequest, AiResult } from '../src/shared/ai-ipc';
 import type { ServiceStatus } from '../src/shared/protocol';
@@ -11,6 +12,8 @@ import type { VoiceMicGrant, VoiceOwnedJob, VoiceServiceRequest, VoiceServiceRes
 import { DESKTOP_IPC } from '../src/shared/protocol';
 import { sameVoiceJob } from '../src/shared/voice-ipc';
 import type { VoiceSettingsRequest, VoiceSettingsResult } from '../src/shared/voice-settings-ipc';
+import type { DesktopDiagnostics } from '../src/main/desktop-diagnostics';
+import type { FullscreenSample } from '../src/main/fullscreen-policy';
 
 // No Electron process, window, OS permission, audio device, keychain or
 // real provider is created. These mocks exercise the registered Main IPC
@@ -18,11 +21,14 @@ import type { VoiceSettingsRequest, VoiceSettingsResult } from '../src/shared/vo
 const electronMock = vi.hoisted(() => ({ handlers: new Map<string, (...args: any[]) => any>(), windows: [] as any[],
   permission: undefined as ((...args: any[]) => void) | undefined, check: undefined as (() => boolean) | undefined,
   device: undefined as (() => boolean) | undefined, prompt: vi.fn(), savePrompt: vi.fn(), openPrompt: vi.fn(), power: undefined as EventEmitter | undefined,
-  screen: undefined as EventEmitter | undefined }));
+  screen: undefined as EventEmitter | undefined,
+  balloon: vi.fn(), menu: vi.fn(),
+  registeredShortcuts: new Map<string, () => void>(), blockedShortcuts: new Set<string>() }));
 
 vi.mock('electron', async () => {
   const { EventEmitter } = await import('node:events');
-  const app = Object.assign(new EventEmitter(), { isPackaged: true, requestSingleInstanceLock: () => false, quit: vi.fn(), getPath: () => '/non-real-pet-desktop-data' });
+  const app = Object.assign(new EventEmitter(), { isPackaged: true, isReady: () => true, requestSingleInstanceLock: () => false,
+    quit: vi.fn(), getPath: () => '/non-real-pet-desktop-data' });
   let id = 0;
   class Contents extends EventEmitter {
     id = ++id;
@@ -35,7 +41,10 @@ vi.mock('electron', async () => {
     send(channel: string, value: unknown) { this.sent.push({ channel, value }); }
     setWindowOpenHandler() {}
   }
-  const display = { id: 1, scaleFactor: 1.5, workArea: { x: 0, y: 0, width: 1920, height: 1080 } };
+  const display = { id: 1, scaleFactor: 1.5, workArea: { x: 0, y: 0, width: 1920, height: 1080 },
+    bounds: { x: 0, y: 0, width: 1920, height: 1080 } };
+  const secondary = { id: 2, scaleFactor: 1, workArea: { x: -1920, y: 0, width: 1920, height: 1080 },
+    bounds: { x: -1920, y: 0, width: 1920, height: 1080 } };
   class Window extends EventEmitter {
     webContents = new Contents();
     visible = false;
@@ -63,21 +72,39 @@ vi.mock('electron', async () => {
     setPosition(x: number, y: number) { this.bounds = { ...this.bounds, x, y }; }
     setIgnoreMouseEvents() {}
     async loadURL(url: string) {
+      this.webContents.emit('did-start-navigation', { isMainFrame: true, isSameDocument: false });
       this.webContents.url = url; this.webContents.mainFrame = { url };
-      this.webContents.emit('did-start-loading'); this.webContents.emit('did-finish-load'); this.emit('ready-to-show');
+      this.webContents.emit('did-finish-load'); this.emit('ready-to-show');
     }
     reload() {
-      this.webContents.emit('did-start-loading');
+      this.webContents.emit('did-start-navigation', { isMainFrame: true, isSameDocument: false });
       this.webContents.mainFrame = { url: this.webContents.url };
       this.webContents.emit('did-finish-load');
     }
   }
   electronMock.power = new EventEmitter();
-  electronMock.screen = Object.assign(new EventEmitter(), { getAllDisplays: () => [display], getPrimaryDisplay: () => display,
-    getDisplayMatching: () => display, getCursorScreenPoint: () => ({ x: 0, y: 0 }) });
-  class Tray extends EventEmitter { setToolTip() {} setContextMenu() {} isDestroyed() { return false; } destroy() {} }
+  electronMock.screen = Object.assign(new EventEmitter(), { getAllDisplays: () => [display, secondary], getPrimaryDisplay: () => display,
+    getDisplayMatching: ({ x }: { x: number }) => x < 0 ? secondary : display, getCursorScreenPoint: () => ({ x: 0, y: 0 }),
+    screenToDipPoint: ({ x, y }: { x: number; y: number }) => x < 0 ? { x, y } : { x: Math.round(x / 1.5), y: Math.round(y / 1.5) } });
+  class Tray extends EventEmitter {
+    setToolTip() {}
+    setContextMenu(value: unknown) { electronMock.menu(value); }
+    displayBalloon(value: unknown) { electronMock.balloon(value); }
+    removeBalloon() {}
+    isDestroyed() { return false; }
+    destroy() {}
+  }
   return { app, BrowserWindow: Window, dialog: { showMessageBox: electronMock.prompt, showSaveDialog: electronMock.savePrompt, showOpenDialog: electronMock.openPrompt }, ipcMain: { handle: (channel: string, handler: any) => electronMock.handlers.set(channel, handler) },
-    Menu: { buildFromTemplate: () => ({}) }, nativeImage: { createFromBitmap: () => ({ setTemplateImage() {} }) }, powerMonitor: electronMock.power,
+    globalShortcut: {
+      register: (key: string, callback: () => void) => {
+        if (electronMock.blockedShortcuts.has(key) || electronMock.registeredShortcuts.has(key)) return false;
+        electronMock.registeredShortcuts.set(key, callback);
+        return true;
+      },
+      isRegistered: (key: string) => electronMock.registeredShortcuts.has(key),
+      unregister: (key: string) => { electronMock.registeredShortcuts.delete(key); },
+    },
+    Menu: { buildFromTemplate: (value: unknown) => value }, nativeImage: { createFromBitmap: () => ({ setTemplateImage() {} }) }, powerMonitor: electronMock.power,
     safeStorage: {}, screen: electronMock.screen, session: { defaultSession: {
       setPermissionRequestHandler: (handler: any) => { electronMock.permission = handler; },
       setPermissionCheckHandler: (handler: any) => { electronMock.check = handler; },
@@ -136,7 +163,11 @@ function fixture() {
     }),
   };
   const vault = { save: vi.fn(async () => true), revoke: vi.fn(async () => true), resolve: vi.fn(async () => null) };
-  const host = new DesktopHost('/non-real.sqlite3', { service, vault });
+  const diagnostics = { record: vi.fn<DesktopDiagnostics['record']>(),
+    publish: vi.fn<DesktopDiagnostics['publish']>(async (_destination, isCurrent) => isCurrent() ? { entries: 3 } : 'cancelled'),
+    stop: vi.fn<DesktopDiagnostics['stop']>(async () => {}) };
+  const fullscreenProbe = { available: true, sample: vi.fn<(_: AbortSignal) => Promise<FullscreenSample>>().mockResolvedValue({ kind: 'clear' }), stop: vi.fn() };
+  const host = new DesktopHost('/non-real.sqlite3', { service, vault, diagnostics, fullscreenProbe });
   host.start();
   const cc = electronMock.windows[0],pet = electronMock.windows[1];
   function event(window = cc, frame = window.webContents.mainFrame) { return { sender: window.webContents, senderFrame: frame }; }
@@ -157,7 +188,7 @@ function fixture() {
   expect(callFrom(pet, DESKTOP_IPC.petVisualReady, { characterId: 'star-singer', generation: 1, result: 'READY' })).toEqual({ ok: true });
   expect(pet.visible).toBe(true);
   service.revokeFeatureDocument.mockClear();
-  return { host, service, vault, cc, pet, call, event, callFrom, permission, authorize, reserve, grant,
+  return { host, service, vault, diagnostics, fullscreenProbe, cc, pet, call, event, callFrom, permission, authorize, reserve, grant,
     status: (status: ServiceStatus) => { current = status; statusListener(status); }, snapshot: (next: AppSnapshot) => snapshotListener(next),
     proactive: (event: ProactiveNoticeReady) => proactiveListener(event) };
 }
@@ -167,12 +198,110 @@ describe('actual Main feature IPC and lifecycle (mocked Electron)', () => {
   beforeEach(() => {
     vi.useFakeTimers({ toFake: ['setTimeout','clearTimeout','setInterval','clearInterval','performance'] });
     electronMock.handlers.clear(); electronMock.windows.length = 0; electronMock.power?.removeAllListeners(); electronMock.screen?.removeAllListeners();
+    electronMock.registeredShortcuts.clear(); electronMock.blockedShortcuts.clear();
+    electronMock.balloon.mockClear(); electronMock.menu.mockClear();
     electronMock.savePrompt.mockReset();
     electronMock.openPrompt.mockReset();
     electronMock.prompt.mockReset(); electronMock.prompt.mockResolvedValue({ response: 1 });
     f = fixture();
   });
   afterEach(async () => { await f?.host.stop(); vi.useRealTimers(); });
+
+  it('quiets only the fullscreen display, cancels active voice and restores the same pet surface without focus', async () => {
+    await vi.advanceTimersByTimeAsync(0);
+    f.fullscreenProbe.sample.mockResolvedValue({ kind: 'display', x: -900, y: 300 });
+    await vi.advanceTimersByTimeAsync(800);
+    expect(f.pet.isVisible()).toBe(true);
+    await f.authorize();
+    await f.reserve();
+
+    f.fullscreenProbe.sample.mockResolvedValue({ kind: 'display', x: 900, y: 300 });
+    await vi.advanceTimersByTimeAsync(400);
+    expect(f.pet.isVisible()).toBe(true);
+    await vi.advanceTimersByTimeAsync(400);
+    expect(f.pet.isVisible()).toBe(false);
+    expect(f.pet.isDestroyed()).toBe(false);
+    expect(f.cc.isVisible()).toBe(true);
+    expect(f.service.setProactiveHost).toHaveBeenLastCalledWith(null);
+    expect(f.service.cancelVoiceChat).toHaveBeenCalledOnce();
+    expect(await f.call(DESKTOP_IPC.voiceRequest, { kind: 'begin', job: job('pet-a', 2), expectedConfigRevision: 0 }))
+      .toMatchObject({ ok: false, code: 'permission_denied' });
+
+    f.fullscreenProbe.sample.mockResolvedValue({ kind: 'clear' });
+    await vi.advanceTimersByTimeAsync(800);
+    expect(f.pet.isVisible()).toBe(true);
+    expect(f.pet.isFocused()).toBe(false);
+    f.snapshot({ ...snapshot(), revision: 1, doNotDisturb: true });
+    expect(f.pet.isVisible()).toBe(false);
+  });
+
+  it('holds committed returns through fullscreen and manual quiet mode, then offers one summary', async () => {
+    await vi.advanceTimersByTimeAsync(0);
+    f.fullscreenProbe.sample.mockResolvedValue({ kind: 'global' });
+    await vi.advanceTimersByTimeAsync(800);
+    const tripRevision = (revision: number, settled: boolean, doNotDisturb = true): AppSnapshot => ({
+      ...snapshot(), revision, doNotDisturb,
+      pets: snapshot().pets.map(pet => ({
+        ...pet, presence: settled ? 'HOME' : 'AWAY', activity: settled ? 'IDLE' : null,
+        trip: { tripId: `trip-${pet.petId}`, routeId: 'meadow', status: settled ? 'SETTLED' : 'TRAVELING', expectedReturnAt: 2_000 },
+      })),
+    });
+    f.snapshot(tripRevision(1, false));
+    f.snapshot(tripRevision(2, true));
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(electronMock.balloon).not.toHaveBeenCalled();
+    f.fullscreenProbe.sample.mockResolvedValue({ kind: 'clear' });
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(electronMock.balloon).not.toHaveBeenCalled();
+    f.snapshot(tripRevision(3, true, false));
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(electronMock.menu).toHaveBeenLastCalledWith(expect.arrayContaining([
+      expect.objectContaining({ label: '打开控制中心查看旅行汇总（2 次）' }),
+    ]));
+    if (process.platform === 'win32') {
+      expect(electronMock.balloon).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+        content: '2 次旅行已结算，可在旅行页查看战报。', noSound: true, respectQuietTime: true,
+      }));
+    }
+  });
+
+  it('keeps control-center privileges across same-document routing and unrelated subframe loads', async () => {
+    const contents = f.cc.webContents;
+    contents.emit('did-start-navigation', { isMainFrame: true, isSameDocument: true });
+    contents.emit('did-start-loading');
+    contents.url = contents.mainFrame.url = `${contents.url}#/settings`;
+    contents.emit('did-start-navigation', { isMainFrame: false, isSameDocument: false });
+    expect(await f.call(DESKTOP_IPC.hostRequest, { kind: 'preferences' })).toMatchObject({ ok: true });
+    expect(f.service.revokeFeatureDocument).not.toHaveBeenCalled();
+  });
+
+  it('exports diagnostics only from the focused main control-center frame and while service is unavailable', async () => {
+    const channel = DESKTOP_IPC.exportDiagnostics;
+    f.status({ stage: 'UNAVAILABLE', generation: 2 });
+    expect(await f.callFrom(f.pet, channel)).toEqual({ ok: false, code: 'FORBIDDEN' });
+    expect(await f.call(channel, 'renderer-path.json')).toEqual({ ok: false, code: 'INVALID_REQUEST' });
+    const subframe = f.event(f.cc, { url: f.cc.webContents.url });
+    expect(await electronMock.handlers.get(channel)!(subframe)).toEqual({ ok: false, code: 'FORBIDDEN' });
+    f.cc.blur();
+    expect(await f.call(channel)).toEqual({ ok: false, code: 'FORBIDDEN' });
+    expect(electronMock.savePrompt).not.toHaveBeenCalled();
+    f.cc.focus();
+    const selected = join(tmpdir(), 'native-selected-diagnostic.json');
+    electronMock.savePrompt.mockResolvedValueOnce({ canceled: false, filePath: selected });
+    expect(await f.call(channel)).toEqual({ ok: true, entries: 3 });
+    expect(f.diagnostics.publish).toHaveBeenCalledExactlyOnceWith(selected, expect.any(Function));
+  });
+
+  it('invalidates diagnostics publication when its window reloads during the native prompt', async () => {
+    let finish!: (value: { canceled: boolean; filePath: string }) => void;
+    electronMock.savePrompt.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+    const pending = f.call(DESKTOP_IPC.exportDiagnostics);
+    expect(await f.call(DESKTOP_IPC.exportDiagnostics)).toEqual({ ok: false, code: 'BUSY' });
+    f.cc.reload();
+    finish({ canceled: false, filePath: join(tmpdir(), 'stale-diagnostic.json') });
+    expect(await pending).toEqual({ ok: false, code: 'FORBIDDEN' });
+    expect(f.diagnostics.publish).not.toHaveBeenCalled();
+  });
 
   it('restores a saved display anchor and coalesces window move events into one authoritative write', async () => {
     const stored = { role: 'control-center' as const, petId: null, displayId: 1, offsetX: 150, offsetY: 100,
@@ -234,6 +363,55 @@ describe('actual Main feature IPC and lifecycle (mocked Electron)', () => {
     expect(f.service.requestHost).not.toHaveBeenCalled();
     expect(await f.call(DESKTOP_IPC.hostRequest, { kind: 'backup' })).toEqual({ ok: true, schemaVersion: 11 });
     expect(f.service.requestHost).toHaveBeenCalledExactlyOnceWith({ kind: 'backup', destination });
+  });
+
+  it.runIf(process.platform === 'win32')('activates only the authoritative edit and keeps prior shortcuts on conflict or save failure', async () => {
+    const channel = DESKTOP_IPC.hostRequest;
+    const previousKey = defaultHostShortcutBindings.OPEN_CONTROL_CENTER;
+    const newKey = 'CommandOrControl+Alt+F9';
+    let stored: { revision: number; bindings: HostShortcutBindings } = { revision: 0, bindings: { ...defaultHostShortcutBindings } };
+    const requestHost = f.service.requestHost.getMockImplementation()!;
+    const save = vi.fn(async (): Promise<HostAuthorityResult> => ({ kind: 'shortcut-bindings', result: { ok: false, code: 'SERVICE_UNAVAILABLE' } }));
+    f.service.requestHost.mockImplementation(async request => {
+      if (request.kind === 'shortcut-bindings') return { kind: 'shortcut-bindings', result: { ok: true, preferences: stored } };
+      if (request.kind === 'save-shortcut-bindings') return save();
+      return requestHost(request);
+    });
+    expect(await f.call(channel, { kind: 'settings' })).toMatchObject({ ok: true });
+    expect(electronMock.registeredShortcuts.has(previousKey)).toBe(true);
+
+    const request = { kind: 'save-shortcut-bindings', edit: {
+      expectedRevision: 0, bindings: { ...defaultHostShortcutBindings, OPEN_CONTROL_CENTER: newKey },
+    } };
+    await expect(f.callFrom(f.pet, channel, request)).rejects.toThrow('FORBIDDEN');
+    electronMock.blockedShortcuts.add(newKey);
+    expect(await f.call(channel, request)).toEqual({ ok: false, code: 'CONFLICT', id: 'OPEN_CONTROL_CENTER' });
+    expect(save).not.toHaveBeenCalled();
+    expect(electronMock.registeredShortcuts.has(previousKey)).toBe(true);
+
+    electronMock.blockedShortcuts.delete(newKey);
+    expect(await f.call(channel, request)).toEqual({ ok: false, code: 'SERVICE_UNAVAILABLE' });
+    expect(electronMock.registeredShortcuts.has(newKey)).toBe(false);
+    expect(electronMock.registeredShortcuts.has(previousKey)).toBe(true);
+
+    let acknowledge!: (reply: HostAuthorityResult) => void;
+    save.mockImplementationOnce(() => new Promise(resolve => { acknowledge = resolve; }));
+    const pending = f.call(channel, request);
+    expect(electronMock.registeredShortcuts.has(newKey)).toBe(true);
+    f.cc.blur();
+    electronMock.registeredShortcuts.get(newKey)!();
+    expect(f.cc.isFocused()).toBe(false);
+    f.cc.focus();
+    stored = { revision: 1, bindings: request.edit.bindings };
+    acknowledge({ kind: 'shortcut-bindings', result: { ok: true, preferences: stored } });
+    expect(await pending).toEqual({ ok: true, preferences: stored });
+    expect(electronMock.registeredShortcuts.has(previousKey)).toBe(false);
+    expect(electronMock.registeredShortcuts.has(newKey)).toBe(true);
+
+    f.status({ stage: 'READY', generation: 2 });
+    expect(await f.call(channel, { kind: 'settings' })).toMatchObject({ ok: true, settings: { shortcuts: {
+      entries: expect.arrayContaining([{ id: 'OPEN_CONTROL_CENTER', accelerator: newKey, status: 'REGISTERED' }]),
+    } } });
   });
 
   it('requires the focused control center, native selection and affirmative restore confirmation before triggering maintenance', async () => {

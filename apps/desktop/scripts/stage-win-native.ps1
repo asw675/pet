@@ -9,10 +9,11 @@ $desktop = Split-Path -Parent $PSScriptRoot
 $publish = Join-Path $desktop 'native/publish/win-x64'
 $voice = Join-Path $publish 'voice'
 $inspect = Join-Path $publish 'launch-inspect'
+$fullscreen = Join-Path $publish 'fullscreen'
 $work = Join-Path ([System.IO.Path]::GetTempPath()) ('pet-native-' + [guid]::NewGuid())
 $whisperCommit = '306c88f4d1286aec1bf96e544632897886af5501'
 
-New-Item -ItemType Directory -Path $work, $voice, $inspect -Force | Out-Null
+New-Item -ItemType Directory -Path $work, $voice, $inspect, $fullscreen -Force | Out-Null
 try {
     $whisperSource = Join-Path $work 'whisper-source'
     $whisperBuild = Join-Path $work 'whisper-build'
@@ -32,6 +33,12 @@ try {
     cmake -S (Join-Path $desktop 'native/launch-inspect') -B $inspectBuild -G 'Visual Studio 17 2022' -A x64
     cmake --build $inspectBuild --config Release --parallel 2
 
+    $fullscreenBuild = Join-Path $work 'fullscreen'
+    cmake -S (Join-Path $desktop 'native/fullscreen-probe') -B $fullscreenBuild -G 'Visual Studio 17 2022' -A x64
+    cmake --build $fullscreenBuild --config Release --parallel 2
+    $fullscreenExe = Join-Path $fullscreenBuild 'Release/fullscreen-probe.exe'
+    node -e 'const r = require("node:child_process").spawnSync(process.argv[1], [], { input: "?", encoding: "utf8", timeout: 2000, windowsHide: true }); if (r.status !== 0 || !/^1 (?:CLEAR|UNKNOWN|GLOBAL|DISPLAY -?\d+ -?\d+)\r?\n$/.test(r.stdout ?? "")) process.exitCode = 1;' $fullscreenExe
+
     $sapiOut = Join-Path $work 'sapi'
     $dotnetArtifacts = Join-Path $work 'dotnet'
     dotnet publish (Join-Path $desktop 'native/sapi-helper/PetDesktopSapi.csproj') -c Release -r win-x64 --self-contained true `
@@ -41,6 +48,7 @@ try {
     Copy-Item -LiteralPath (Join-Path $whisperSource 'LICENSE') -Destination (Join-Path $voice 'whisper-LICENSE.txt') -Force
     Copy-Item -LiteralPath (Join-Path $sapiOut 'pet-desktop-sapi.exe') -Destination (Join-Path $voice 'pet-desktop-sapi.exe') -Force
     Copy-Item -LiteralPath (Join-Path $inspectBuild 'Release/launch-inspect.exe') -Destination (Join-Path $inspect 'launch-inspect.exe') -Force
+    Copy-Item -LiteralPath $fullscreenExe -Destination (Join-Path $fullscreen 'fullscreen-probe.exe') -Force
     node (Join-Path $PSScriptRoot 'native-artifact-pins.mjs') --require-all
 } finally {
     Remove-Item -LiteralPath $work -Recurse -Force

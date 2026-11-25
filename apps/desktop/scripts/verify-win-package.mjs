@@ -32,6 +32,7 @@ const packaged = {
   whisperCliSha256: 'native/voice/win-x64/whisper-cli.exe',
   sapiHelperSha256: 'native/voice/win-x64/pet-desktop-sapi.exe',
   launchInspectorSha256: 'native/launch-inspect/launch-inspect.exe',
+  fullscreenProbeSha256: 'native/fullscreen/fullscreen-probe.exe',
 };
 for (const [key, relative] of Object.entries(packaged)) {
   const filename = join(resources, relative);

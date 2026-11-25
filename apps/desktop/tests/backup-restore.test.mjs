@@ -71,6 +71,7 @@ describe('verified native backup restore', () => {
     const earlier = open(source);
     try {
       earlier.exec('PRAGMA foreign_keys = OFF');
+      earlier.exec('DROP TABLE host_shortcut_bindings;');
       earlier.exec('DROP TRIGGER ai_memory_search_insert; DROP TRIGGER ai_memory_search_edit; DROP TRIGGER ai_memory_search_delete; DROP TABLE ai_memory_fts; DROP TABLE ai_memory_search_keys;');
       earlier.exec('DROP TABLE IF EXISTS proactive_notices; DROP TABLE IF EXISTS proactive_observations; DROP TABLE IF EXISTS proactive_settings;');
       earlier.exec('DROP TABLE host_window_anchors; DROP TABLE host_preferences; DELETE FROM schema_migrations WHERE version > 10; PRAGMA user_version = 10');

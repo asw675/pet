@@ -15,7 +15,7 @@ import { AI_MEMORY_FTS_MIGRATION_SQL, AI_STATE_MIGRATION_SQL, AiStateStorage, ve
 import { AI_PROACTIVE_MIGRATION_SQL, AiProactiveStorage } from '#ai-proactive-storage';
 import { WORKSPACE_MIGRATION_SQL, WorkspaceStorage } from '#workspace-storage';
 import { VOICE_PROFILE_MIGRATION_SQL, VoiceProfileStorage } from '#voice-profile-storage';
-import { HOST_PREFERENCES_MIGRATION_SQL, HostPreferenceStorage } from '#host-preference-storage';
+import { HOST_PREFERENCES_MIGRATION_SQL, HOST_SHORTCUT_BINDINGS_MIGRATION_SQL, HostPreferenceStorage } from '#host-preference-storage';
 import { advanceTrip, MAX_TRIP_DRAWS, MAX_TRIP_FACTS, MAX_TRIP_NODES, TRIP_ROUND_RULES_VERSION, TRIP_RULES_VERSION,
   TRIP_SKILL_RULES_VERSION } from '@pet-desktop/domain';
 import type { RewardDraft, TripCheckpoint, TripFact, TripSnapshot } from '@pet-desktop/domain';
@@ -28,7 +28,7 @@ import type {
 const MAX_SAFE = Number.MAX_SAFE_INTEGER;
 const UINT32_MAX = 0xffff_ffff;
 const BUSY_TIMEOUT_MS = 5_000;
-export const SCHEMA_VERSION = 13;
+export const SCHEMA_VERSION = 14;
 const JSON_SCHEMA_VERSION = 1;
 const MIGRATION_001_JSON_SCHEMA_VERSION = 1;
 const MIGRATION_001_MAX_TRIP_FACTS = 14;
@@ -938,6 +938,7 @@ const MIGRATIONS = Object.freeze([
   { version: 11, sql: HOST_PREFERENCES_MIGRATION_SQL },
   { version: 12, sql: AI_PROACTIVE_MIGRATION_SQL },
   { version: 13, sql: AI_MEMORY_FTS_MIGRATION_SQL },
+  { version: 14, sql: HOST_SHORTCUT_BINDINGS_MIGRATION_SQL },
 ]);
 
 /** FNV-1a is a migration-change detector, not a security signature. */

@@ -4,6 +4,7 @@ import type { ActiveTravelIpcResult, AppBridge, AppSnapshot, CharactersIpcResult
   TravelCatalogIpcResult, TravelPreviewIpcResult, TravelReportsIpcResult, EventsIpcResult } from '@pet-desktop/contracts';
 import type { EventListQuery } from '@pet-desktop/contracts/events';
 import type { CharacterPackChanged, CharacterPackResult } from './character-pack-ipc';
+import type { DiagnosticsExportResult } from './diagnostics-ipc';
 import type { TripPreparationPayload, TravelReportsQuery } from '@pet-desktop/contracts/travel';
 import { featureInputSchema, featureOutputSchema } from './feature-protocol';
 import type { AiIntent, AiResult, CredentialSave, CredentialRevoke } from './ai-ipc';
@@ -14,8 +15,10 @@ import type {WorkspaceIntent,WorkspaceResult} from './workspace-ipc';
 import type { ProactiveDesktopBubble, ProactiveIntent, ProactiveNoticeReady, ProactiveResult } from './proactive-ipc';
 
 import type { BackupViewResult, HostPreferenceSave, HostPreferencesViewResult, HostRenderPreferences, HostSettingsResult, PeriodicBackupStatus, RestoreBackupResult, RestoreBackupStatus } from './host-settings-ipc';
+import type { HostShortcutBindingsEdit, HostShortcutBindingsResult } from './host-settings-ipc';
 
 export const DESKTOP_IPC = Object.freeze({
+  exportDiagnostics: 'pet-desktop:export-diagnostics:v1',
   characterPackRequest: 'pet-desktop:character-pack-request:v1',
   characterPackChanged: 'pet-desktop:character-pack-changed:v1',
   hostRequest: 'pet-desktop:host-settings:v1',
@@ -81,10 +84,13 @@ export interface ControlCenterBridge extends DesktopBridgeBase {
   activateCharacterPack(change: CharacterPackChanged): Promise<CharacterPackResult>;
   getHostSettings(): Promise<HostSettingsResult>;
   setHostShortcutEnabled(enabled: boolean): Promise<HostSettingsResult>;
+  getHostShortcutBindings(): Promise<HostShortcutBindingsResult>;
+  saveHostShortcutBindings(edit: HostShortcutBindingsEdit): Promise<HostShortcutBindingsResult>;
   setLoginStart(enabled: boolean): Promise<HostSettingsResult>;
   getHostPreferences(): Promise<HostPreferencesViewResult>;
   saveHostPreferences(edit: HostPreferenceSave): Promise<HostPreferencesViewResult>;
   exportBackup(): Promise<BackupViewResult>;
+  exportDiagnostics(): Promise<DiagnosticsExportResult>;
   restoreBackup(): Promise<RestoreBackupResult>;
   getRestoreBackupStatus(): Promise<RestoreBackupStatus>;
   getPeriodicBackupStatus(): Promise<PeriodicBackupStatus>;

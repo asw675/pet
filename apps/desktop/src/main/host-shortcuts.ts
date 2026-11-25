@@ -1,7 +1,9 @@
-import { hostSettingsSchema, hostSettingsToggleSchema, hostShortcuts } from '../shared/host-settings-ipc';
+import { defaultHostShortcutBindings, hostShortcutBindingsSchema, hostShortcutIds } from '@pet-desktop/contracts/host-shortcuts';
+import type { HostShortcutBindings } from '@pet-desktop/contracts/host-shortcuts';
+import { hostSettingsSchema, hostSettingsToggleSchema } from '../shared/host-settings-ipc';
 import type {
   HostLoginSettings, HostSettings, HostSettingsErrorCode, HostSettingsResult,
-  HostShortcutId, HostShortcutSettings, HostShortcutStatus,
+  HostShortcutBindingsResult, HostShortcutId, HostShortcutSettings, HostShortcutStatus,
 } from '../shared/host-settings-ipc';
 
 /** Main owns this port. Test code injects mocks; no Electron import or
@@ -33,12 +35,14 @@ export interface HostShortcutOptions {
   actions: HostShortcutActions;
   platform?: NodeJS.Platform;
   initialShortcutEnabled?: boolean;
+  initialShortcutBindings?: HostShortcutBindings;
   /** Root may set PERSISTED only when authoritative storage saves this value
    * before calling setHostShortcutEnabled, otherwise runtime session only. */
   shortcutPreferenceScope?: HostShortcutSettings['preferenceScope'];
 }
-type Shortcut = typeof hostShortcuts[number];
-interface Registration { readonly nonce: number; active: boolean }
+type Shortcut = { id: HostShortcutId; accelerator: string };
+interface Registration { readonly accelerator: string; id: HostShortcutId; active: boolean }
+type PreparedBindings = { ok: true; apply(): void; discard(): void } | Extract<HostShortcutBindingsResult, { ok: false }>;
 const ok = (settings: HostSettings): HostSettingsResult => ({ ok: true, settings });
 const fail = (code: HostSettingsErrorCode, settings: HostSettings | null = null): HostSettingsResult => ({ ok: false, code, settings });
 
@@ -48,17 +52,19 @@ const fail = (code: HostSettingsErrorCode, settings: HostSettings | null = null)
 export class HostShortcutController {
   private readonly platform: NodeJS.Platform;
   private readonly preferenceScope: HostShortcutSettings['preferenceScope'];
-  private readonly owned = new Map<HostShortcutId, Registration>();
+  private readonly owned = new Map<string, Registration>();
   private readonly states = new Map<HostShortcutId, HostShortcutStatus>();
   private desired: boolean;
+  private bindings: HostShortcutBindings;
+  private pendingBindingChange: symbol | undefined;
   private started = false;
   private closed = false;
-  private nonce = 0;
 
   constructor(private readonly options: HostShortcutOptions) {
     this.platform = options.platform ?? process.platform;
     this.preferenceScope = options.shortcutPreferenceScope ?? 'SESSION';
     this.desired = options.initialShortcutEnabled !== false;
+    this.bindings = hostShortcutBindingsSchema.parse(options.initialShortcutBindings ?? defaultHostShortcutBindings);
   }
   private appReady(): boolean {
     try { return this.options.loginApp.isReady() === true; } catch { return false; }
@@ -68,78 +74,80 @@ export class HostShortcutController {
     if (this.platform !== 'win32') return 'NON_WINDOWS';
     return this.started && this.appReady() ? 'READY' : 'NOT_READY';
   }
-  private getRegistered(shortcut: Shortcut): boolean | null {
+  private getRegistered(accelerator: string): boolean | null {
     try {
-      const result = this.options.globalShortcut.isRegistered(shortcut.accelerator);
+      const result = this.options.globalShortcut.isRegistered(accelerator);
       return typeof result === 'boolean' ? result : null;
     } catch { return null; }
   }
-  private setState(shortcut: Shortcut, state: HostShortcutStatus): void { this.states.set(shortcut.id, state); }
-  private fire(shortcut: Shortcut, registration: Registration): void {
+  private fire(registration: Registration): void {
     // Even a late Electron callback after failed OS unregister/shutdown must
     // be inert. Check the registration instance, host lifecycle and intent.
-    if (this.closed || !this.started || !this.desired || !registration.active || this.owned.get(shortcut.id) !== registration
-      || this.shortcutAvailability() !== 'READY' || this.getRegistered(shortcut) !== true) return;
+    if (this.closed || !this.started || !this.desired || !registration.active
+      || this.owned.get(registration.accelerator) !== registration || this.bindings[registration.id] !== registration.accelerator
+      || this.shortcutAvailability() !== 'READY' || this.getRegistered(registration.accelerator) !== true) return;
     try {
       const actions = this.options.actions;
-      const pending = shortcut.id === 'OPEN_CONTROL_CENTER' ? actions.openControlCenter()
-        : shortcut.id === 'TOGGLE_PET_VISIBILITY' ? actions.togglePetVisibility() : actions.rescueInteraction();
+      const pending = registration.id === 'OPEN_CONTROL_CENTER' ? actions.openControlCenter()
+        : registration.id === 'TOGGLE_PET_VISIBILITY' ? actions.togglePetVisibility() : actions.rescueInteraction();
       void Promise.resolve(pending).catch(() => undefined); // tray remains independent
     } catch { /* one failed callback cannot disrupt the other shortcuts/tray */ }
   }
-  private release(shortcut: Shortcut): boolean {
-    const registration = this.owned.get(shortcut.id);
+  private release(accelerator: string): boolean {
+    const registration = this.owned.get(accelerator);
     if (!registration) return true;
     registration.active = false; // disable callback before touching OS
-    const present = this.getRegistered(shortcut);
-    if (present === false) { this.owned.delete(shortcut.id); return true; }
+    const present = this.getRegistered(accelerator);
+    if (present === false) { this.owned.delete(accelerator); return true; }
     try {
       // Only registrations successfully acquired by this controller. Do not
       // unregisterAll, which may revoke another subsystem's shortcut.
-      this.options.globalShortcut.unregister(shortcut.accelerator);
+      this.options.globalShortcut.unregister(accelerator);
     } catch { return false; }
-    if (this.getRegistered(shortcut) !== false) return false;
-    this.owned.delete(shortcut.id);
+    if (this.getRegistered(accelerator) !== false) return false;
+    this.owned.delete(accelerator);
     return true;
   }
-  private tryRegister(shortcut: Shortcut): void {
-    const previous = this.owned.get(shortcut.id);
-    if (previous?.active && this.getRegistered(shortcut) === true) { this.setState(shortcut, 'REGISTERED'); return; }
-    if (previous && !this.release(shortcut)) { this.setState(shortcut, 'ERROR'); return; }
-    const already = this.getRegistered(shortcut);
+  private tryRegister(shortcut: Shortcut, active: boolean): HostShortcutStatus {
+    const { accelerator, id } = shortcut;
+    const previous = this.owned.get(accelerator);
+    if (previous && this.getRegistered(accelerator) === true) {
+      if (active) { previous.id = id; previous.active = true; }
+      return 'REGISTERED';
+    }
+    if (previous && !this.release(accelerator)) return 'ERROR';
+    const already = this.getRegistered(accelerator);
     if (already !== false) {
       // Same accelerator may already belong to a different in-process
       // component. Never replace/unregister someone else's registration.
-      this.setState(shortcut, already === true ? 'CONFLICT' : 'ERROR');
-      return;
+      return already === true ? 'CONFLICT' : 'ERROR';
     }
-    if (this.nonce >= Number.MAX_SAFE_INTEGER) { this.setState(shortcut, 'ERROR'); return; }
-    const registration: Registration = { nonce: ++this.nonce, active: false };
+    const registration: Registration = { accelerator, id, active: false };
     try {
-      const accepted = this.options.globalShortcut.register(shortcut.accelerator, () => this.fire(shortcut, registration));
-      if (accepted !== true) {
-        this.setState(shortcut, accepted === false ? 'CONFLICT' : 'ERROR');
-        return;
+      const accepted = this.options.globalShortcut.register(accelerator, () => this.fire(registration));
+      if (accepted !== true) return accepted === false ? 'CONFLICT' : 'ERROR';
+      this.owned.set(accelerator, registration);
+      if (this.getRegistered(accelerator) !== true) {
+        this.release(accelerator);
+        return 'ERROR';
       }
-      this.owned.set(shortcut.id, registration);
-      if (this.getRegistered(shortcut) !== true) {
-        this.release(shortcut);
-        this.setState(shortcut, 'ERROR');
-        return;
-      }
-      registration.active = true;
-      this.setState(shortcut, 'REGISTERED');
+      registration.active = active;
+      return 'REGISTERED';
     } catch {
       // Registration only counted when the OS returned true. A throwing or
       // conflicting registration is never reported as success.
-      this.setState(shortcut, 'ERROR');
+      return 'ERROR';
     }
   }
   private applyShortcuts(): void {
     if (this.shortcutAvailability() !== 'READY') return;
-    for (const shortcut of hostShortcuts) {
-      if (this.desired) this.tryRegister(shortcut);
-      else this.setState(shortcut, this.release(shortcut) ? 'DISABLED' : 'ERROR');
+    const configured = new Set(Object.values(this.bindings));
+    for (const accelerator of this.owned.keys()) {
+      if (!this.desired || !configured.has(accelerator)) this.release(accelerator);
+    }
+    for (const id of hostShortcutIds) {
+      const accelerator = this.bindings[id];
+      this.states.set(id, this.desired ? this.tryRegister({ id, accelerator }, true) : this.owned.has(accelerator) ? 'ERROR' : 'DISABLED');
     }
   }
   /** Call after app.whenReady and after native tray action callbacks exist.
@@ -152,31 +160,32 @@ export class HostShortcutController {
   }
   private readShortcuts(): HostShortcutSettings {
     const availability = this.shortcutAvailability();
-    const stateFor = (shortcut: Shortcut): HostShortcutStatus => {
+    const stateFor = (id: HostShortcutId): HostShortcutStatus => {
       if (availability === 'NON_WINDOWS') return 'UNSUPPORTED';
       if (availability !== 'READY') return 'UNAVAILABLE';
-      const owned = this.owned.get(shortcut.id);
+      const accelerator = this.bindings[id];
+      const owned = this.owned.get(accelerator);
       if (!this.desired) {
         if (!owned) return 'DISABLED';
-        const present = this.getRegistered(shortcut);
-        if (present === false) { this.owned.delete(shortcut.id); return 'DISABLED'; }
+        const present = this.getRegistered(accelerator);
+        if (present === false) { this.owned.delete(accelerator); return 'DISABLED'; }
         return 'ERROR';
       }
-      if (owned?.active) {
-        const present = this.getRegistered(shortcut);
+      if (owned?.active && owned.id === id) {
+        const present = this.getRegistered(accelerator);
         if (present === true) return 'REGISTERED';
         // Lost OS registration or unverifiable state. Callback becomes inert;
         // an explicit enable/retry can reacquire, never steal automatically.
         owned.active = false;
-        if (present === false) this.owned.delete(shortcut.id);
-        this.setState(shortcut, 'ERROR');
+        if (present === false) this.owned.delete(accelerator);
+        this.states.set(id, 'ERROR');
         return 'ERROR';
       }
-      return this.states.get(shortcut.id) === 'CONFLICT' ? 'CONFLICT' : 'ERROR';
+      return this.states.get(id) === 'CONFLICT' ? 'CONFLICT' : 'ERROR';
     };
-    const [p, h, i] = hostShortcuts;
+    const entry = <Id extends HostShortcutId>(id: Id) => ({ id, accelerator: this.bindings[id], status: stateFor(id) });
     return { availability, enabled: this.desired, preferenceScope: this.preferenceScope,
-      entries: [{ ...p, status: stateFor(p) }, { ...h, status: stateFor(h) }, { ...i, status: stateFor(i) }] };
+      entries: [entry(hostShortcutIds[0]), entry(hostShortcutIds[1]), entry(hostShortcutIds[2])] };
   }
   private unavailableLogin(availability: Exclude<HostLoginSettings['availability'], 'READY'>): HostLoginSettings {
     return { availability, openAtLogin: null, executableWillLaunchAtLogin: null };
@@ -210,9 +219,62 @@ export class HostShortcutController {
     if (!parsed.success) return fail('INVALID_REQUEST');
     const availability = this.shortcutAvailability();
     if (availability !== 'READY') return fail(availability === 'NON_WINDOWS' ? 'UNSUPPORTED' : 'SERVICE_UNAVAILABLE', this.snapshot());
+    if (this.pendingBindingChange) return fail('SERVICE_UNAVAILABLE', this.snapshot());
     this.desired = parsed.data;
     this.applyShortcuts();
     return ok(this.snapshot());
+  }
+
+  /** Probe new keys with inert callbacks while the old keys still work.
+   * Activation follows the caller's authoritative save. Conflicts and a
+   * failed save clean up only registrations made by this particular edit. */
+  prepareBindings(raw: unknown): PreparedBindings {
+    const parsed = hostShortcutBindingsSchema.safeParse(raw);
+    if (!parsed.success) return { ok: false, code: 'INVALID_REQUEST' };
+    const availability = this.shortcutAvailability();
+    if (availability !== 'READY') return { ok: false, code: availability === 'NON_WINDOWS' ? 'UNSUPPORTED' : 'SERVICE_UNAVAILABLE' };
+    if (this.pendingBindingChange) return { ok: false, code: 'BUSY' };
+    const token = Symbol(), next = parsed.data;
+    const acquired = new Set<string>();
+    this.pendingBindingChange = token;
+    const discard = (): void => {
+      if (this.pendingBindingChange !== token) return;
+      this.pendingBindingChange = undefined;
+      for (const accelerator of acquired) this.release(accelerator);
+    };
+    if (this.desired) {
+      for (const id of hostShortcutIds) {
+        const accelerator = next[id];
+        if (accelerator === this.bindings[id]) continue;
+        const previous = this.owned.get(accelerator);
+        const state = this.tryRegister({ id, accelerator }, false);
+        if (this.owned.has(accelerator) && this.owned.get(accelerator) !== previous) acquired.add(accelerator);
+        if (state !== 'REGISTERED') {
+          discard();
+          return { ok: false, code: state === 'CONFLICT' ? 'CONFLICT' : 'OS_ERROR', id };
+        }
+      }
+    }
+    return {
+      ok: true,
+      apply: () => {
+        if (this.pendingBindingChange !== token) return;
+        this.pendingBindingChange = undefined;
+        this.bindings = next;
+        this.applyShortcuts();
+      },
+      discard,
+    };
+  }
+
+  /** Reconcile a verified writer read after reconnecting or losing an
+   * acknowledgment. Registration may have changed at OS level meanwhile. */
+  applyStoredBindings(raw: HostShortcutBindings): void {
+    if (this.closed || this.pendingBindingChange) return;
+    const bindings = hostShortcutBindingsSchema.parse(raw);
+    if (hostShortcutIds.every(id => this.bindings[id] === bindings[id])) return;
+    this.bindings = bindings;
+    this.applyShortcuts();
   }
   /** Only call from the explicit CC host-setting UI operation. No startup,
    * shortcut lifecycle or background preference can call this method. */
@@ -236,10 +298,11 @@ export class HostShortcutController {
   close(): void {
     if (this.closed) return;
     this.closed = true;
+    this.pendingBindingChange = undefined;
     // Invalidate all our callbacks even if the OS denies cleanup. Never
     // unregister other accelerators or modify login-on-start when exiting.
-    for (const shortcut of hostShortcuts) {
-      try { this.release(shortcut); } catch { /* callbacks already inert */ }
+    for (const accelerator of this.owned.keys()) {
+      try { this.release(accelerator); } catch { /* callbacks already inert */ }
     }
   }
 }

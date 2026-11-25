@@ -1,8 +1,11 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { RouterLink } from 'vue-router';
-import { hostSettingsResultSchema, periodicBackupStatusSchema, restoreBackupResultSchema, restoreBackupStatusSchema } from '../../../shared/host-settings-ipc';
-import type { HostSettings } from '../../../shared/host-settings-ipc';
+import { defaultHostShortcutBindings, hostShortcutBindingsSchema, hostShortcutIds } from '@pet-desktop/contracts/host-shortcuts';
+import type { HostShortcutBindings, HostShortcutId } from '@pet-desktop/contracts/host-shortcuts';
+import { hostSettingsResultSchema, hostShortcutBindingsResultSchema, periodicBackupStatusSchema, restoreBackupResultSchema, restoreBackupStatusSchema } from '../../../shared/host-settings-ipc';
+import type { HostSettings, HostShortcutBindingsView } from '../../../shared/host-settings-ipc';
+import { diagnosticsExportResultSchema } from '../../../shared/diagnostics-ipc';
 import {
   backupViewResultSchema, hostPreferencesViewResultSchema, hostScalePercents, preferenceDraft, preferenceSaveMatches,
   preferenceSavePayload, resolveBackupRestoreViewBridge, resolveHostPreferencesViewBridge, resolveHostSettingsViewBridge,
@@ -23,6 +26,21 @@ const hostBusy = ref(false), hostError = ref('');
 const preferences = ref<HostPreferencesView | null>(null), draft = ref<HostPreferenceEdit | null>(null);
 const preferenceBusy = ref(false), preferenceFeedback = ref('');
 const backupBusy = ref(false), backupFeedback = ref('');
+const diagnosticsBridge = window.petDesktop?.role === 'control-center'
+  && typeof window.petDesktop.exportDiagnostics === 'function' ? window.petDesktop : null;
+const diagnosticsBusy = ref(false), diagnosticsFeedback = ref('');
+const hotkeyBridge = window.petDesktop?.role === 'control-center'
+  && typeof window.petDesktop.getHostShortcutBindings === 'function'
+  && typeof window.petDesktop.saveHostShortcutBindings === 'function' ? window.petDesktop : null;
+const bindingPreferences = ref<HostShortcutBindingsView | null>(null);
+const bindingDraft = ref<HostShortcutBindings | null>(null);
+const bindingsBusy = ref(false), bindingsFeedback = ref('');
+const bindingModifiers = [
+  { value: 'CommandOrControl+Shift', label: 'Ctrl + Shift' },
+  { value: 'CommandOrControl+Alt', label: 'Ctrl + Alt' },
+  { value: 'CommandOrControl+Alt+Shift', label: 'Ctrl + Alt + Shift' },
+];
+const bindingKeys = [...'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789', ...Array.from({ length: 12 }, (_, index) => `F${index + 1}`)];
 const restoreStatus = ref('');
 const automaticBackupStatus = ref('');
 const canRestore = computed(() => store.ready || (store.serviceStatus?.stage === 'UNAVAILABLE' && store.serviceStatus.generation > 0));
@@ -51,7 +69,7 @@ const preferenceSave = computed(() => preferenceSavePayload(preferences.value, d
 const preferenceDirty = computed(() => preferenceSave.value !== null);
 const canSetShortcuts = computed(() => host.value?.shortcuts.availability === 'READY'
   && (host.value.shortcuts.preferenceScope !== 'PERSISTED' || (store.ready && !preferenceDirty.value && !preferenceBusy.value))
-  && !hostBusy.value && !backupBusy.value);
+  && !hostBusy.value && !backupBusy.value && !bindingsBusy.value && !bindingDraft.value);
 const shortcutIssues = computed(() => host.value?.shortcuts.enabled === true &&
   host.value.shortcuts.entries.some(entry => entry.status === 'CONFLICT' || entry.status === 'ERROR'));
 const login = computed(() => host.value?.loginStart ?? null);
@@ -78,6 +96,66 @@ async function hostOperation(operation: (current: HostSettingsViewBridge) => Pro
   } finally { if (mounted && epoch === hostEpoch) hostBusy.value = false; }
 }
 function refreshHost(): void { void hostOperation(current => current.getHostSettings()); }
+async function openBindingEditor(): Promise<void> {
+  if (!hotkeyBridge || bindingsBusy.value || !store.ready) return;
+  bindingsBusy.value = true;
+  bindingsFeedback.value = '';
+  const generation = store.serviceStatus?.generation;
+  try {
+    const reply = hostShortcutBindingsResultSchema.safeParse(await hotkeyBridge.getHostShortcutBindings());
+    if (!mounted || !store.ready || store.serviceStatus?.generation !== generation) return;
+    if (reply.success && reply.data.ok) {
+      bindingPreferences.value = reply.data.preferences;
+      bindingDraft.value = { ...reply.data.preferences.bindings };
+    } else bindingsFeedback.value = '暂时无法读取已保存的热键。';
+  } catch {
+    if (mounted) bindingsFeedback.value = '暂时无法读取已保存的热键。';
+  } finally { if (mounted) bindingsBusy.value = false; }
+}
+function changeBinding(id: HostShortcutId, part: 'modifier' | 'key', event: Event): void {
+  const value = (event.target as HTMLSelectElement).value;
+  const current = bindingDraft.value?.[id];
+  if (!current || !bindingDraft.value) return;
+  const split = current.lastIndexOf('+');
+  bindingDraft.value[id] = part === 'modifier' ? value + '+' + current.slice(split + 1) : current.slice(0, split + 1) + value;
+  bindingsFeedback.value = '';
+}
+function closeBindingEditor(): void {
+  bindingPreferences.value = null;
+  bindingDraft.value = null;
+  bindingsFeedback.value = '';
+}
+async function saveBindings(): Promise<void> {
+  if (!hotkeyBridge || bindingsBusy.value || !bindingPreferences.value || !bindingDraft.value || !store.ready) return;
+  const candidate = hostShortcutBindingsSchema.safeParse(bindingDraft.value);
+  if (!candidate.success) {
+    bindingsFeedback.value = '每项热键必须使用不同的有效组合。';
+    return;
+  }
+  bindingsBusy.value = true;
+  bindingsFeedback.value = '';
+  const generation = store.serviceStatus?.generation;
+  try {
+    const reply = hostShortcutBindingsResultSchema.safeParse(await hotkeyBridge.saveHostShortcutBindings({
+      expectedRevision: bindingPreferences.value.revision, bindings: candidate.data,
+    }));
+    if (!mounted || !store.ready || store.serviceStatus?.generation !== generation) return;
+    if (reply.success && reply.data.ok) {
+      closeBindingEditor();
+      bindingsFeedback.value = '热键已保存。';
+      refreshHost();
+    } else if (reply.success && 'id' in reply.data) {
+      bindingsFeedback.value = reply.data.code === 'CONFLICT'
+        ? `「${shortcutLabels[reply.data.id]}」的新组合已被占用，当前已生效的热键继续保留。`
+        : `Windows 无法验证「${shortcutLabels[reply.data.id]}」的新组合。`;
+    } else if (reply.success && !reply.data.ok && reply.data.code === 'REVISION_CONFLICT') {
+      closeBindingEditor();
+      bindingsFeedback.value = '热键设置已更新，请重新打开改键。';
+    } else bindingsFeedback.value = '暂时无法确认热键保存结果，请重试。';
+  } catch {
+    if (mounted) bindingsFeedback.value = '暂时无法确认热键保存结果，请重试。';
+  } finally { if (mounted) bindingsBusy.value = false; }
+}
 function setShortcuts(enabled: boolean): void {
   if (canSetShortcuts.value) void hostOperation(current => current.setHostShortcutEnabled(enabled), true);
 }
@@ -133,6 +211,23 @@ async function savePreferences(): Promise<void> {
     if (mounted && epoch === preferenceEpoch) { preferences.value = null; preferenceFeedback.value = '保存结果尚未确认，请重新读取。'; }
   } finally { if (mounted && epoch === preferenceEpoch) preferenceBusy.value = false; }
 }
+async function exportDiagnostics(): Promise<void> {
+  if (!diagnosticsBridge || diagnosticsBusy.value) return;
+  diagnosticsBusy.value = true;
+  diagnosticsFeedback.value = '';
+  try {
+    const result = diagnosticsExportResultSchema.safeParse(await diagnosticsBridge.exportDiagnostics());
+    if (!mounted) return;
+    if (!result.success) diagnosticsFeedback.value = '无法确认导出结果。';
+    else if (result.data.ok) diagnosticsFeedback.value = `已保存诊断报告，共 ${result.data.entries} 条记录。`;
+    else if (result.data.code === 'DESTINATION_EXISTS') diagnosticsFeedback.value = '所选文件已存在，请选择新文件名。';
+    else if (result.data.code === 'BUSY') diagnosticsFeedback.value = '请先结束当前操作，然后再导出。';
+    else if (result.data.code !== 'CANCELLED') diagnosticsFeedback.value = '无法导出诊断报告。';
+  } catch {
+    if (mounted) diagnosticsFeedback.value = '无法导出诊断报告。';
+  } finally { if (mounted) diagnosticsBusy.value = false; }
+}
+
 async function exportBackup(): Promise<void> {
   if (!preferencesBridge || !store.ready || backupBusy.value || preferenceBusy.value || hostBusy.value) return;
   backupBusy.value = true; backupFeedback.value = '';
@@ -221,7 +316,10 @@ function refreshRecoveryOutcome(): void {
   }
 }
 function refreshSettings(): void { refreshRecoveryOutcome(); refreshHost(); void readPreferences(); void readRestoreStatus(); void readAutomaticBackupStatus(); }
-watch(() => [store.ready, store.serviceStatus?.generation] as const, refreshSettings);
+watch(() => [store.ready, store.serviceStatus?.generation] as const, () => {
+  closeBindingEditor();
+  refreshSettings();
+});
 onMounted(() => {
   refreshSettings();
   if (restoreBridge?.getPeriodicBackupStatus) automaticBackupPoll = window.setInterval(() => { void readAutomaticBackupStatus(); }, 60_000);
@@ -257,11 +355,16 @@ onBeforeUnmount(() => {
       <header class="side-heading"><span class="panel-symbol accent-blue"><Icon name="refresh" /></span><div><h2>服务状态</h2><p>本地业务数据连接</p></div></header>
       <dl class="settings-list"><div><dt>当前连接</dt><dd>{{ serviceStatusLabel(store.serviceStatus) }}</dd></div><div><dt>快照版本</dt><dd>{{ store.snapshot?.revision ?? '未知' }}</dd></div></dl>
       <button class="button button-secondary side-button" type="button" :disabled="store.loading || store.busy" @click="store.refresh()"><Icon name="refresh" /> {{ store.loading ? '刷新中…' : '重新获取快照' }}</button>
+      <div v-if="diagnosticsBridge" class="settings-note">
+        <p>诊断报告包含应用版本、组件状态、随机请求编号、错误类别和耗时。</p>
+        <button class="button button-secondary side-button" type="button" :disabled="diagnosticsBusy" @click="exportDiagnostics">{{ diagnosticsBusy ? '导出中…' : '导出诊断报告' }}</button>
+        <p v-if="diagnosticsFeedback" class="muted" role="status">{{ diagnosticsFeedback }}</p>
+      </div>
     </section>
     <section class="panel side-panel">
       <header class="side-heading"><span class="panel-symbol accent-blue"><Icon name="settings" /></span><div><h2>全局快捷键</h2><p>从任何前台应用快速唤起桌宠</p></div></header>
       <template v-if="host">
-        <p class="muted">快捷键使用固定的 Windows 组合键。系统可能未授予某个按键，托盘救援入口仍然可用。</p>
+        <p class="muted">Windows 可能拒绝已被占用的组合。托盘入口始终可用。</p>
         <dl class="settings-list"><div><dt>偏好</dt><dd>{{ host.shortcuts.enabled ? '希望启用' : '关闭' }} · {{ host.shortcuts.preferenceScope === 'PERSISTED' ? '已保存' : '仅本次运行' }}</dd></div>
           <div v-for="entry in host.shortcuts.entries" :key="entry.id">
             <dt>{{ shortcutLabels[entry.id] }}<br><small>{{ entry.accelerator.replace('CommandOrControl', 'Ctrl').replaceAll('+', ' + ') }}</small></dt>
@@ -272,10 +375,31 @@ onBeforeUnmount(() => {
           {{ host.shortcuts.enabled ? '关闭全局快捷键' : '启用全局快捷键' }}
         </button>
         <button v-if="shortcutIssues" class="button button-secondary side-button" type="button" :disabled="!canSetShortcuts" @click="setShortcuts(true)">重试冲突的快捷键</button>
+        <button v-if="hotkeyBridge && !bindingDraft" class="button button-secondary side-button" type="button"
+          :disabled="bindingsBusy || hostBusy || backupBusy || !store.ready || host.shortcuts.availability !== 'READY'"
+          @click="openBindingEditor">修改全局热键</button>
+        <div v-if="bindingDraft" class="settings-note">
+          <div v-for="id in hostShortcutIds" :key="id" class="hotkey-edit">
+            <span>{{ shortcutLabels[id] }}</span>
+            <select :aria-label="shortcutLabels[id] + '的修饰键'" :disabled="bindingsBusy"
+              :value="bindingDraft[id].slice(0, bindingDraft[id].lastIndexOf('+'))" @change="changeBinding(id, 'modifier', $event)">
+              <option v-for="option in bindingModifiers" :key="option.value" :value="option.value">{{ option.label }}</option>
+            </select>
+            <select :aria-label="shortcutLabels[id] + '的按键'" :disabled="bindingsBusy"
+              :value="bindingDraft[id].slice(bindingDraft[id].lastIndexOf('+') + 1)" @change="changeBinding(id, 'key', $event)">
+              <option v-for="key in bindingKeys" :key="key" :value="key">{{ key }}</option>
+            </select>
+          </div>
+          <button class="button button-secondary side-button" type="button" :disabled="bindingsBusy"
+            @click="bindingDraft = { ...defaultHostShortcutBindings }">载入默认组合</button>
+          <button class="button button-secondary side-button" type="button" :disabled="bindingsBusy || !store.ready" @click="saveBindings">保存热键</button>
+          <button class="button button-secondary side-button" type="button" :disabled="bindingsBusy" @click="closeBindingEditor">取消</button>
+        </div>
       </template>
       <p v-else class="muted">{{ hostBusy ? '读取宿主状态…' : '尚未确认快捷键状态。' }}</p>
       <button class="button button-secondary side-button" type="button" :disabled="hostBusy" @click="refreshHost"><Icon name="refresh" /> 读取实际宿主状态</button>
       <p v-if="hostError" role="status" class="muted">{{ hostError }}</p>
+      <p v-if="bindingsFeedback" role="status" class="muted">{{ bindingsFeedback }}</p>
     </section>
     <section class="panel side-panel">
       <header class="side-heading"><span class="panel-symbol"><Icon name="settings" /></span><div><h2>Windows 登录启动</h2><p>由你主动决定是否在登录系统时启动桌宠</p></div></header>
@@ -312,3 +436,8 @@ onBeforeUnmount(() => {
     </section>
   </div>
 </template>
+
+<style scoped>
+.hotkey-edit { display: flex; align-items: center; flex-wrap: wrap; gap: .4rem; margin-block: .45rem; }
+.hotkey-edit > span { flex: 1 0 8rem; }
+</style>

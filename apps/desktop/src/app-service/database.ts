@@ -97,6 +97,21 @@ export function openPersistentService(databasePath: string, open: (filename: str
         resolveQuickProposal: (scope, at, consume) => authority.resolveQuickProposal(scope.petId, scope.proposalId, at, consume),
         utcOffsetMinutes:()=>-new Date().getTimezoneOffset(),createId:kind=>`${kind}-${randomUUID()}`});
       const host = (request: HostAuthorityRequest): HostAuthorityResult => {
+        if (request.kind === 'shortcut-bindings' || request.kind === 'save-shortcut-bindings') {
+          try {
+            const stored = service.withFeatureTransaction(tx => {
+              const settings = tx.hostPreferences();
+              const previous = settings.getShortcutBindings();
+              if (request.kind === 'shortcut-bindings') return previous;
+              return settings.saveShortcutBindings(request.edit.bindings, request.edit.expectedRevision, Math.max(Date.now(), previous.updatedAt ?? 0));
+            });
+            return { kind: 'shortcut-bindings', result: { ok: true, preferences: { revision: stored.revision, bindings: stored.bindings } } };
+          } catch (error) {
+            const code = error instanceof HostPreferenceStorageError && error.code === 'REVISION_CONFLICT'
+              ? 'REVISION_CONFLICT' : 'SERVICE_UNAVAILABLE';
+            return { kind: 'shortcut-bindings', result: { ok: false, code } };
+          }
+        }
         if (request.kind === 'window-anchors' || request.kind === 'save-window-anchor') {
           try {
             if (request.kind === 'window-anchors') {

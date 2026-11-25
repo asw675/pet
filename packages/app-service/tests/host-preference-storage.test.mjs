@@ -5,6 +5,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { describe, expect, it } from 'vitest';
 import { SQLiteRepository } from '../src/sqlite-repository.ts';
 import { DEFAULT_HOST_PREFERENCES, HOST_SCALE_CHOICES } from '../src/host-preference-storage.ts';
+import { defaultHostShortcutBindings } from '@pet-desktop/contracts/host-shortcuts';
 
 const AT=1_800_000_000_000;
 const pet=(petId='pet-a')=>({petId,characterId:'star-singer',nickname:'旅伴',power:30,presence:'HOME',activity:'IDLE',mood:'CALM',healthStatus:'NORMAL',
@@ -102,5 +103,37 @@ describe('durable Main-observed host preferences/anchors',()=>{
       try{again.transaction(tx=>{expect(tx.hostPreferences().getPreferences()).toEqual({...values,revision:1,updatedAt:AT});expect(tx.hostPreferences().listAnchors()).toEqual([cc]);});}
       finally{again.close();}
     }finally{repo.close();rmSync(dir,{recursive:true,force:true});}
+  });
+
+  it('persists hotkey combinations through WAL reopen with a separate revision, and restores defaults', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pet-host-binding-')), path = join(dir, 'game.sqlite3');
+    const source = new DatabaseSync(path), repo = new SQLiteRepository(source, { persistent: true });
+    const defaults = { revision: 0, updatedAt: null, bindings: defaultHostShortcutBindings };
+    const bindings = { ...defaultHostShortcutBindings, OPEN_CONTROL_CENTER: 'CommandOrControl+Alt+F4' };
+    try {
+      repo.transaction(tx => {
+        const storage = tx.hostPreferences();
+        expect(storage.getShortcutBindings()).toEqual(defaults);
+        expect(storage.saveShortcutBindings(bindings, 0, AT)).toEqual({ revision: 1, updatedAt: AT, bindings });
+        expect(storage.saveShortcutBindings(bindings, 1, AT + 10)).toEqual({ revision: 1, updatedAt: AT, bindings });
+        expect(() => storage.saveShortcutBindings(defaultHostShortcutBindings, 0, AT)).toThrow(/REVISION_CONFLICT/);
+        expect(() => storage.saveShortcutBindings({ ...bindings, RESCUE_INTERACTION: bindings.OPEN_CONTROL_CENTER }, 1, AT)).toThrow(/INVALID_RECORD/);
+        expect(() => storage.saveShortcutBindings({ ...bindings, RESCUE_INTERACTION: 'Alt+F4' }, 1, AT)).toThrow(/INVALID_RECORD/);
+        expect(storage.getPreferences()).toEqual(initial);
+        storage.savePreferences(values, 0, AT);
+      });
+      repo.close();
+      const again = new SQLiteRepository(new DatabaseSync(path), { persistent: true });
+      try {
+        again.transaction(tx => {
+          const storage = tx.hostPreferences();
+          expect(storage.getShortcutBindings()).toEqual({ revision: 1, updatedAt: AT, bindings });
+          expect(storage.saveShortcutBindings(defaultHostShortcutBindings, 1, AT + 100)).toEqual({
+            revision: 2, updatedAt: AT + 100, bindings: defaultHostShortcutBindings,
+          });
+          expect(storage.getPreferences()).toEqual({ ...values, revision: 1, updatedAt: AT });
+        });
+      } finally { again.close(); }
+    } finally { repo.close(); rmSync(dir, { recursive: true, force: true }); }
   });
 });

@@ -4,7 +4,8 @@ import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const stage=fileURLToPath(new URL('../native/publish/win-x64/',import.meta.url));
-const files=Object.freeze({whisperCliSha256:'voice/whisper-cli.exe',sapiHelperSha256:'voice/pet-desktop-sapi.exe',launchInspectorSha256:'launch-inspect/launch-inspect.exe'});
+const files=Object.freeze({whisperCliSha256:'voice/whisper-cli.exe',sapiHelperSha256:'voice/pet-desktop-sapi.exe',
+  launchInspectorSha256:'launch-inspect/launch-inspect.exe',fullscreenProbeSha256:'fullscreen/fullscreen-probe.exe'});
 /** Build-time only. Pin actual final (signed if applicable) binary bytes into
  * the compiled Main/utility bundle, not a runtime mutable adjacent manifest. */
 export function computeNativeArtifactPins(requireAll=false){

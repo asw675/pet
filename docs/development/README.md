@@ -48,6 +48,7 @@
 | 007B-1 | 逐宠记忆候选、同源约束、敏感筛查及授权检索 | 专项93项通过 | [007b1-memory-policy](007b1-memory-policy.md) |
 | 008A-1 | 语音契约、单会话取消及实际音频 RMS 口型算法 | 50项专项通过，实际设备/供应商待接入 | [008a1-voice-contract](008a1-voice-contract.md) |
 | 008B-1 | AudioWorklet 真实录放音 API 与有界清理 | 28项专项、Vite构建通过；设备/权限待联通 | [008b1-webaudio-adapter](008b1-webaudio-adapter.md) |
+| 008B-2 | Whisper/SAPI 本地供应商适配与Windows helper源码 | 24项专项、Node TSC通过；发行工件待验证 | [008b2-local-voice-provider](008b2-local-voice-provider.md) |
 | 008B-3A | 主进程麦克风一次性授权与监督策略 | 5项专项，默认拒绝，实际接入待完成 | [008b3-microphone-lease](008b3-microphone-lease.md) |
 | 009A-1 | 快捷工作台宿主一次性批准/文件身份复核 | 122项专项，平台适配待完成 | [009a1-quick-launch-policy](009a1-quick-launch-policy.md) |
 | 009A-2/B-2 | 真实独立工作台/场景/隐私统计 SQLite 存储与契约 | 53合同+17真实SQLite通过，待主迁移挂载 | [009a2-workspace-storage](009a2-workspace-storage.md) |

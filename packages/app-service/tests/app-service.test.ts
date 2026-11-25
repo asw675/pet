@@ -165,6 +165,17 @@ function depart(service: AppService, petId = 'pet-1', id = 'depart-1') {
 }
 
 describe('application service request boundary', () => {
+  it('atomically replaces the V1 visible companion slot without changing presence or primary pet', () => {
+    const { service } = fixture();
+    const tripId = depart(service, 'pet-1', 'slot-trip');
+    const visible = success(service.dispatch(command('slot-swap', 'PET_SET_VISIBILITY', { petId: 'pet-2', visibility: 'VISIBLE' })));
+    expect(visible.primaryPetId).toBe('pet-1');
+    expect(visible.pets[0]).toMatchObject({ petId: 'pet-1', presence: 'AWAY', visibility: 'HIDDEN', trip: { tripId } });
+    expect(visible.pets[1]).toMatchObject({ petId: 'pet-2', presence: 'HOME', visibility: 'VISIBLE' });
+    expect(visible.pets.filter((pet) => pet.visibility === 'VISIBLE')).toHaveLength(1);
+    expect(success(service.dispatch(command('slot-swap', 'PET_SET_VISIBILITY', { petId: 'pet-2', visibility: 'VISIBLE' })))).toEqual(visible);
+  });
+
   it('initializes both demo pets and validates envelopes, preserving valid request IDs', () => {
     const { service, repo, runtime } = fixture();
     const app = service.getSnapshot();

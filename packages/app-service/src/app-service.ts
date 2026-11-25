@@ -403,10 +403,28 @@ export class AppService {
         return;
       }
       case 'PET_SET_VISIBILITY':
-        if (command.payload.visibility !== pet.visibility) {
-          updatePet({ visibility: command.payload.visibility });
-          this.event(state, 'PetStateChanged', pet.petId, command.commandId, at,
-            { petId: pet.petId, visibility: command.payload.visibility });
+        // V1.1 section 17.2: the initial product has one visible companion
+        // slot. The choice is independent of primary pet and travel presence.
+        // Replace the slot in the same transaction rather than temporarily
+        // exposing two visible pets or making the renderer hide one itself.
+        {
+          const changes: Array<{ record: PetRecord; visibility: PetRecord['visibility'] }> = [];
+          if (command.payload.visibility === 'VISIBLE') {
+            for (const other of tx.listPets()) {
+              if (other.petId !== pet.petId && other.visibility === 'VISIBLE') {
+                changes.push({ record: other, visibility: 'HIDDEN' });
+              }
+            }
+          }
+          if (command.payload.visibility !== pet.visibility) changes.push({ record: pet, visibility: command.payload.visibility });
+          for (const change of changes) {
+            tx.savePet({ ...change.record, visibility: change.visibility, revision: addNonnegative(change.record.revision, 1) });
+          }
+          if (changes.length > 0) this.revise(state);
+          for (const change of changes) {
+            this.event(state, 'PetStateChanged', change.record.petId, command.commandId, at,
+              { petId: change.record.petId, visibility: change.visibility });
+          }
         }
         return;
       case 'TRIP_START': {

@@ -6,11 +6,13 @@ import { backingStoreSize, calculateModelGeometry, hitTestModel } from './geomet
 import type { PixiHealth } from './pixi-renderer';
 
 type Variant = Extract<ResolvedPackVariant, { renderer: 'cubism' }>;
+const tapDuration = 0.36;
 interface Active { readonly pack: ResolvedPack; readonly variant: Variant; readonly session: CubismSession }
 interface Override {
   readonly request: ActionRequest;
   readonly end: number;
   readonly finish: (value: ActionResult) => void;
+  readonly tap?: { readonly area: 'head' | 'body'; readonly start: number };
 }
 
 /** One canvas/context is owned by one independent, cancelable Cubism slot. */
@@ -98,6 +100,10 @@ export class CubismRenderer implements VisualRenderer {
   setBaseAction(semanticId: string): void {
     if (this.base === semanticId) return;
     this.base = semanticId;
+    if (semanticId === 'drag') {
+      this.resetLook();
+      this.finish('interrupted');
+    }
     if (!this.override) this.startBase();
   }
   setExpression(id: string, weight: number): void {
@@ -128,16 +134,24 @@ export class CubismRenderer implements VisualRenderer {
   setPaused(paused: boolean): void {
     if (this.paused === paused) return;
     this.paused = paused;
-    if (paused) this.clearMouth();
+    if (paused) {
+      this.resetLook();
+      this.clearMouth();
+    }
   }
   play(request: ActionRequest): Promise<ActionResult> {
     const reply = (status: ActionResult['status']) => Promise.resolve({ requestId: request.requestId, status });
     if (!this.active || this.destroyed || this.lost || this.paused) return reply('failed');
     if (this.profile.reducedMotion || this.override && request.priority < this.override.request.priority) return reply('interrupted');
     const duration = this.playSemantic(request.semanticId, request.loop);
-    if (duration === null) return reply('unsupported');
+    const area = request.semanticId === 'tap.head' ? 'head' : request.semanticId === 'tap.body' ? 'body' : undefined;
+    const tap: Override['tap'] = duration === null && !request.loop && area ? { area, start: this.time } : undefined;
+    if (duration === null && !tap) return reply('unsupported');
+    const restoreBase = tap && this.override && !this.override.tap;
     this.finish('interrupted');
-    return new Promise(finish => { this.override = { request, end: request.loop ? Infinity : this.time + duration, finish }; });
+    if (restoreBase) this.startBase();
+    const end = request.loop ? Infinity : this.time + (duration ?? tapDuration);
+    return new Promise(finish => { this.override = { request, end, finish, ...(tap ? { tap } : {}) }; });
   }
   tick(dtSeconds: number): void {
     if (!this.active || this.paused || this.profile.reducedMotion || !Number.isFinite(dtSeconds) || dtSeconds <= 0) return;
@@ -184,6 +198,10 @@ export class CubismRenderer implements VisualRenderer {
     this.active = undefined;
     previous?.session.destroy();
   }
+  private resetLook(): void {
+    this.lookTarget = { x: 0, y: 0 };
+    this.look = { ...this.lookTarget };
+  }
   private playSemantic(semantic: string, loop: boolean): number | null {
     const active = this.active;
     const group = active?.pack.manifest.actions[semantic]?.[active.variant.id];
@@ -213,10 +231,12 @@ export class CubismRenderer implements VisualRenderer {
     }
     if (canvas.width !== size.w) canvas.width = size.w;
     if (canvas.height !== size.h) canvas.height = size.h;
+    const tap = this.override?.tap;
     active.session.draw(geometry, size.w, size.h, { seconds: this.time, dt,
       look: this.look, still: this.profile.reducedMotion,
       mouth: !this.paused && this.mouth && this.time < this.mouthUntil ? this.mouth.open : 0,
       sleep: this.base === 'sleep',
+      ...(tap ? { tap: { area: tap.area, strength: Math.sin(Math.PI * (this.time - tap.start) / tapDuration) } } : {}),
     });
     this.frame = true;
   }

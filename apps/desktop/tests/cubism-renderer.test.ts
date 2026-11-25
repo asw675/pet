@@ -1,7 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
 import { AdaptiveRendererHost, type RenderBackend, type VisualRenderer } from '../src/renderer/rendering/adaptive-renderer-host';
 import { CubismRenderer } from '../src/renderer/rendering/cubism-renderer';
-import type { CubismRuntime, CubismSession } from '../src/renderer/rendering/cubism-runtime';
+import { createCubismRuntime, type CubismRuntime, type CubismSdkBindings, type CubismSession } from '../src/renderer/rendering/cubism-runtime';
+import { calculateModelGeometry } from '../src/renderer/rendering/geometry';
 import type { ResolvedPack, ResolvedPackVariant } from '../src/shared/resolve-character-pack';
 
 const profile = { resolutionScale: 1, reducedMotion: false, maxFps: 30 } as const;
@@ -82,6 +83,95 @@ describe('Cubism renderer', () => {
     expect(health).toHaveBeenCalledWith('context-restored');
     renderer.destroy();
     expect(session.destroy).toHaveBeenCalledTimes(1);
+  });
+
+  it('plays an authored body hit, suppresses gaze during the drag entrance and restores the idle base', async () => {
+    const { surface } = canvas();
+    const { load, session } = mockRuntime();
+    const interactionPack = { ...pack, manifest: { ...pack.manifest, actions: {
+      ...pack.manifest.actions,
+      'tap.body': { live2d: 'tap-body' },
+      drag: { live2d: 'drag-motion' },
+    } } };
+    const renderer = new CubismRenderer({ load }, vi.fn());
+    await renderer.init(surface, profile);
+    renderer.resize(100, 120, 1);
+    await renderer.loadPack(interactionPack, new AbortController().signal);
+    renderer.setLook(0.7, -0.6);
+    renderer.tick(0.125);
+    const action = renderer.play({ requestId: 'body', semanticId: 'tap.body', loop: false, priority: 10, blendMs: 0 });
+    expect(session.play).toHaveBeenLastCalledWith('tap-body', false);
+    renderer.setBaseAction('drag');
+    expect(session.play).toHaveBeenLastCalledWith('drag-motion', true);
+    await expect(action).resolves.toEqual({ requestId: 'body', status: 'interrupted' });
+    renderer.tick(0.125);
+    expect(session.draw.mock.lastCall?.[3]).toMatchObject({ look: { x: 0, y: 0 } });
+    renderer.setBaseAction('idle');
+    expect(session.play).toHaveBeenLastCalledWith('idle', true);
+    renderer.destroy();
+  });
+
+  it('uses bounded parameter feedback when an authored tap is absent', async () => {
+    const { surface } = canvas();
+    const { load, session } = mockRuntime();
+    const renderer = new CubismRenderer({ load }, vi.fn());
+    await renderer.init(surface, profile);
+    renderer.resize(100, 120, 1);
+    await renderer.loadPack(pack, new AbortController().signal);
+    const action = renderer.play({ requestId: 'tap', semanticId: 'tap.body', loop: false, priority: 10, blendMs: 0 });
+    renderer.tick(0.18);
+    expect(session.draw.mock.lastCall?.[3]?.tap).toEqual({ area: 'body', strength: 1 });
+    renderer.tick(0.20);
+    await expect(action).resolves.toEqual({ requestId: 'tap', status: 'completed' });
+    expect(session.draw.mock.lastCall?.[3]?.tap).toBeUndefined();
+    renderer.destroy();
+  });
+
+  it('applies mouse gaze over an authored idle pose and fades tap changes back to it', async () => {
+    const ids = ['ParamAngleX', 'ParamAngleY', 'ParamAngleZ', 'ParamEyeBallX', 'ParamBodyAngleX', 'ParamMouthForm'];
+    const values = ids.map(() => 0);
+    const noop = () => {};
+    const model = {
+      getModel: () => ({ canvasinfo: { CanvasWidth: 4, CanvasHeight: 4, PixelsPerUnit: 1 }, parameters: { ids } }),
+      getParameterCount: () => ids.length, getParameterValueByIndex: (index: number) => values[index]!,
+      getParameterMinimumValue: () => -30, getParameterMaximumValue: () => 30,
+      getDrawableCount: () => 1, getDrawableVertexCount: () => 3,
+      setParameterValueByIndex: (index: number, value: number) => { values[index] = value; },
+      loadParameters: () => { values.fill(0); }, saveParameters: noop, update: noop,
+    };
+    const sdk: CubismSdkBindings = {
+      framework: { isStarted: () => true, isInitialized: () => true, startUp: () => true, initialize: noop },
+      moc: { create: () => ({ createModel: () => model, deleteModel: noop, release: noop }) },
+      Renderer: class {
+        initialize = noop; startUp = noop; bindTexture = noop; setIsPremultipliedAlpha = noop;
+        setRenderTargetSize = noop; setMvpMatrix = noop; setRenderState = noop; loadShaders = noop;
+        drawModel = noop; release = noop;
+      },
+      Matrix: class { getArray = () => new Float32Array(16); },
+      shaders: { getInstance: () => ({ getShader: () => ({ _isShaderLoaded: true, release: noop }), _shaderMap: new Map() }) },
+      physics: { create: () => null }, pose: { create: () => null }, motion: { create: () => null },
+      MotionManager: class {
+        startMotionPriority = noop;
+        updateMotion = () => { values[0] = 6; values[1] = 4; values[4] = 1; return true; };
+        stopAllMotions = noop; release = noop;
+      },
+      expression: { create: () => null },
+      ExpressionManager: class { startMotion = noop; updateMotion = () => false; stopAllMotions = noop; release = noop; },
+    };
+    const gl = {
+      isContextLost: () => false, bindFramebuffer: noop, viewport: noop, clearColor: noop, clear: noop,
+      readPixels: (_x: number, _y: number, _w: number, _h: number, _format: number, _type: number, row: Uint8Array) => row.fill(255),
+    } as unknown as WebGL2RenderingContext;
+    const session = await createCubismRuntime(sdk, 'test-shaders').load(gl,
+      { ...pack, readAsset: () => new Uint8Array(64) }, variant, new AbortController().signal);
+    const geometry = calculateModelGeometry({ w: 120, h: 120 }, pack.manifest.logicalSize, pack.manifest.anchor,
+      { x: 0, y: 0, scale: 1, facing: 1 })!;
+    const frame = { seconds: 0.5, dt: 0.1, look: { x: 0.5, y: -0.25 }, mouth: 0, sleep: false, still: false };
+    session.draw(geometry, 120, 120, { ...frame, tap: { area: 'body', strength: 0.5 } });
+    expect(values).toEqual([15, 1, -2.5, 0.5, 4, 0.325]);
+    session.draw(geometry, 120, 120, { ...frame, look: { x: 0, y: 0 } });
+    expect(values).toEqual([6, 4, 0, 0, 1, 0]);
+    session.destroy();
   });
 
   it('falls back on Core failure using a separate canvas and preserves character identity', async () => {

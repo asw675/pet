@@ -22,6 +22,7 @@ const electronMock = vi.hoisted(() => ({ handlers: new Map<string, (...args: any
   permission: undefined as ((...args: any[]) => void) | undefined, check: undefined as (() => boolean) | undefined,
   device: undefined as (() => boolean) | undefined, prompt: vi.fn(), savePrompt: vi.fn(), openPrompt: vi.fn(), power: undefined as EventEmitter | undefined,
   screen: undefined as EventEmitter | undefined,
+  cursor: { x: 0, y: 0 },
   balloon: vi.fn(), menu: vi.fn(),
   registeredShortcuts: new Map<string, () => void>(), blockedShortcuts: new Set<string>() }));
 
@@ -50,6 +51,7 @@ vi.mock('electron', async () => {
     visible = false;
     focused = false;
     destroyed = false;
+    ignoresMouse = true;
     bounds: { x: number; y: number; width: number; height: number };
     constructor(options: { x: number; y: number; width: number; height: number }) {
       super(); this.bounds = { x: options.x, y: options.y, width: options.width, height: options.height };
@@ -70,7 +72,7 @@ vi.mock('electron', async () => {
     getBounds() { return { ...this.bounds }; }
     setBounds(value: typeof this.bounds) { this.bounds = { ...value }; }
     setPosition(x: number, y: number) { this.bounds = { ...this.bounds, x, y }; }
-    setIgnoreMouseEvents() {}
+    setIgnoreMouseEvents(ignored: boolean) { this.ignoresMouse = ignored; }
     async loadURL(url: string) {
       this.webContents.emit('did-start-navigation', { isMainFrame: true, isSameDocument: false });
       this.webContents.url = url; this.webContents.mainFrame = { url };
@@ -84,7 +86,9 @@ vi.mock('electron', async () => {
   }
   electronMock.power = new EventEmitter();
   electronMock.screen = Object.assign(new EventEmitter(), { getAllDisplays: () => [display, secondary], getPrimaryDisplay: () => display,
-    getDisplayMatching: ({ x }: { x: number }) => x < 0 ? secondary : display, getCursorScreenPoint: () => ({ x: 0, y: 0 }),
+    getDisplayMatching: ({ x }: { x: number }) => x < 0 ? secondary : display,
+    getDisplayNearestPoint: ({ x }: { x: number }) => x < 0 ? secondary : display,
+    getCursorScreenPoint: () => electronMock.cursor,
     screenToDipPoint: ({ x, y }: { x: number; y: number }) => x < 0 ? { x, y } : { x: Math.round(x / 1.5), y: Math.round(y / 1.5) } });
   class Tray extends EventEmitter {
     setToolTip() {}
@@ -196,6 +200,7 @@ function fixture() {
 describe('actual Main feature IPC and lifecycle (mocked Electron)', () => {
   let f: ReturnType<typeof fixture>;
   beforeEach(() => {
+    electronMock.cursor = { x: 0, y: 0 };
     vi.useFakeTimers({ toFake: ['setTimeout','clearTimeout','setInterval','clearInterval','performance'] });
     electronMock.handlers.clear(); electronMock.windows.length = 0; electronMock.power?.removeAllListeners(); electronMock.screen?.removeAllListeners();
     electronMock.registeredShortcuts.clear(); electronMock.blockedShortcuts.clear();
@@ -206,6 +211,92 @@ describe('actual Main feature IPC and lifecycle (mocked Electron)', () => {
     f = fixture();
   });
   afterEach(async () => { await f?.host.stop(); vi.useRealTimers(); });
+
+  it('moves only the current leased pet across a negative-origin display and saves on release', async () => {
+    const gestureId = '3065c68a-860d-4359-a8cf-c3dd57ee9221';
+    const begin = { phase: 'begin', gestureId };
+    const initial = f.pet.getBounds();
+    const drag = (phase: string, id = gestureId) => f.callFrom(f.pet, DESKTOP_IPC.petDrag, { phase, gestureId: id });
+    expect(f.call(DESKTOP_IPC.petDrag, begin)).toEqual({ ok: false, code: 'FORBIDDEN' });
+    expect(f.callFrom(f.pet, DESKTOP_IPC.petDrag, { ...begin, x: -800, y: 200 })).toEqual({ ok: false, code: 'INVALID_REQUEST' });
+    expect(drag('begin')).toEqual({ ok: false, code: 'FORBIDDEN' });
+
+    electronMock.cursor = { x: initial.x + 25, y: initial.y + 30 };
+    expect(f.callFrom(f.pet, DESKTOP_IPC.petInteractive, true)).toEqual({ ok: true });
+    expect(drag('begin')).toEqual({ ok: true });
+    expect(f.pet.getBounds()).toEqual(initial);
+    expect(f.pet.ignoresMouse).toBe(false);
+    expect(drag('move', '437e55e8-acb5-415a-bf33-a23c7654f5fd')).toEqual({ ok: false, code: 'FORBIDDEN' });
+
+    electronMock.cursor = { x: -1810, y: 120 };
+    expect(drag('move')).toEqual({ ok: true });
+    expect(f.pet.getBounds()).toMatchObject({ x: -1835, y: 90 });
+    await vi.advanceTimersByTimeAsync(600);
+    expect(f.service.requestHost.mock.calls.some(([request]) => request.kind === 'save-window-anchor')).toBe(false);
+    expect(f.pet.ignoresMouse).toBe(false);
+
+    electronMock.cursor = { x: -1920, y: 1 };
+    expect(drag('end')).toEqual({ ok: true });
+    expect(f.pet.getBounds()).toMatchObject({ x: -1920, y: 0 });
+    expect(f.pet.ignoresMouse).toBe(true);
+    expect(drag('move')).toEqual({ ok: false, code: 'FORBIDDEN' });
+    await vi.advanceTimersByTimeAsync(400);
+    expect(f.service.requestHost).toHaveBeenCalledWith(expect.objectContaining({
+      kind: 'save-window-anchor', anchor: expect.objectContaining({ displayId: 2, petId: 'pet-a', x: -1920, y: 0, offsetX: 0, offsetY: 0 }),
+    }));
+  });
+
+  it('expires a missing terminal drag request, and revokes capture on reload', async () => {
+    const gestureId = '3065c68a-860d-4359-a8cf-c3dd57ee9221';
+    const drag = (phase: string) => f.callFrom(f.pet, DESKTOP_IPC.petDrag, { phase, gestureId });
+    const begin = () => {
+      const bounds = f.pet.getBounds();
+      electronMock.cursor = { x: bounds.x + 25, y: bounds.y + 30 };
+      expect(f.callFrom(f.pet, DESKTOP_IPC.petInteractive, true)).toEqual({ ok: true });
+      expect(drag('begin')).toEqual({ ok: true });
+    };
+    begin();
+    await vi.advanceTimersByTimeAsync(2_001);
+    expect(f.pet.ignoresMouse).toBe(false); // The ordinary pointer lease expired first.
+    electronMock.cursor = { x: -800, y: 450 };
+    expect(drag('move')).toEqual({ ok: true });
+    await vi.advanceTimersByTimeAsync(1_500);
+    expect(f.pet.ignoresMouse).toBe(true);
+    expect(drag('move')).toEqual({ ok: false, code: 'FORBIDDEN' });
+
+    begin();
+    f.pet.reload();
+    expect(f.pet.ignoresMouse).toBe(true);
+    expect(drag('end')).toEqual({ ok: false, code: 'FORBIDDEN' });
+  });
+
+  it('restores a saved pet placement when startup stages its window during anchor loading', async () => {
+    let answerAnchors = (_reply: HostAuthorityResult) => {};
+    let answerPreferences = (_reply: HostAuthorityResult) => {};
+    f.service.requestHost.mockImplementation(async (request) => {
+      if (request.kind === 'window-anchors') return new Promise(resolve => { answerAnchors = resolve; });
+      if (request.kind === 'preferences') return new Promise(resolve => { answerPreferences = resolve; });
+      return { kind: 'shortcut-bindings', result: { ok: false, code: 'SERVICE_UNAVAILABLE' } };
+    });
+    f.status({ stage: 'RESTARTING', generation: 2 });
+    f.status({ stage: 'READY', generation: 2 });
+    f.snapshot(snapshot('pet-b'));
+    const staged = electronMock.windows.at(-1);
+    expect(staged.webContents.getURL()).toContain('petId=pet-b');
+    const savedBounds = { x: -130, y: 932, width: 130, height: 148 };
+    expect(staged.getBounds()).not.toMatchObject(savedBounds);
+    answerAnchors({ kind: 'window-anchors', result: { ok: true, anchors: [{
+      role: 'pet', petId: 'pet-b', displayId: 2, offsetX: 1790, offsetY: 932,
+      ...savedBounds, displayScale1000: 1000, observedAt: 1,
+    }] } });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(staged.getBounds()).toEqual(savedBounds);
+    answerPreferences({ kind: 'preferences', result: { ok: true, preferences: {
+      revision: 1, updatedAt: null, values: { scalePercent: 50, hotkeysEnabled: true, reducedMotion: false },
+    } } });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(staged.getBounds()).toEqual(savedBounds);
+  });
 
   it('steps scale only for the current visible desktop pet and resizes without drifting', async () => {
     const channel = DESKTOP_IPC.changePetScale;

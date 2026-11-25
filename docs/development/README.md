@@ -91,5 +91,6 @@
 | 010P | 免打扰期间旅行结算汇总 | 宿主和投影专项通过，Windows 外壳通知待验 | [010p-travel-return-summary](010p-travel-return-summary.md) |
 | 010Q | 修复页内导航撤销 IPC 权限及 Windows x64 测试包复验 | 设置页、实际热键注册、双窗口、日志及 SAPI 中文合成通过 | [010q-windows-host-preview](010q-windows-host-preview.md) |
 | 010R | 桌宠直接缩放和悬停菜单 | Windows 隔离运行验证缩放、菜单收放及重启记忆 | [010r-pet-controls](010r-pet-controls.md) |
+| 010S | 直接抓住桌宠移动、位置恢复和角色交互 | Windows 隔离验证两档缩放下的短按、拖动和重启恢复 | [010s-pet-drag-and-gestures](010s-pet-drag-and-gestures.md) |
 
 每份记录包含：日期、范围、设计依据、具体变更、测试命令与真实结果、已知限制、下一步。完整验收状态见 [POC 矩阵](../qa/poc-matrix.md)。

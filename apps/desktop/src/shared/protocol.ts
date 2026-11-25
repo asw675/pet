@@ -29,6 +29,7 @@ export const DESKTOP_IPC = Object.freeze({
   status: 'pet-desktop:status:v1',
   openControlCenter: 'pet-desktop:open-control-center:v1',
   petInteractive: 'pet-desktop:pet-interactive:v1',
+  petDrag: 'pet-desktop:pet-drag:v1',
   changePetScale: 'pet-desktop:change-pet-scale:v1',
   petVisualReady: 'pet-desktop:pet-visual-ready:v1',
   aiRequest:'pet-desktop:ai-request:v1',chatEvent:'pet-desktop:chat-event:v1',credentialSave:'pet-desktop:credential-save:v1',credentialRevoke:'pet-desktop:credential-revoke:v1',
@@ -52,6 +53,12 @@ export const hostActionResultSchema = z.discriminatedUnion('ok', [
 ]);
 export type HostActionResult = z.infer<typeof hostActionResultSchema>;
 
+export const petDragRequestSchema = z.strictObject({
+  phase: z.enum(['begin', 'move', 'end', 'cancel']),
+  gestureId: z.uuid(),
+});
+export type PetDragRequest = z.infer<typeof petDragRequestSchema>;
+
 /** A visual completion signal, not a domain action or arbitrary resource reference.
  * The host derives the pet identity from the sending pet window. */
 export const petVisualReadySchema = z.strictObject({
@@ -73,6 +80,7 @@ export interface PetDesktopBridge extends DesktopBridgeBase {
   readCharacterPack(characterId: string): Promise<CharacterPackResult>;
   subscribeCharacterPackChanged(listener: (change: CharacterPackChanged) => void): () => void;
   setInteractive(interactive: boolean): Promise<HostActionResult>;
+  dragPetWindow(request: PetDragRequest): Promise<HostActionResult>;
   changePetScale(direction: PetScaleDirection): Promise<HostActionResult>;
   reportVisualReady(report: PetVisualReady): Promise<HostActionResult>;
   subscribeHostRenderPreferences(listener: (value: HostRenderPreferences) => void): () => void;

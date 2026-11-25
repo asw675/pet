@@ -28,6 +28,7 @@ const canHit = computed(() => !quietMotion.value && pet.value?.presence === 'HOM
 const canUseMenu = computed(() => store.ready && !store.snapshot?.doNotDisturb
   && pet.value?.presence === 'HOME' && pet.value.visibility === 'VISIBLE');
 const menuVisible = ref(false);
+const dragging = ref(false);
 const scalePercent = ref<HostScale | null>(null);
 const changingScale = ref(false);
 const canChangeScale = computed(() => !!bridge && canUseMenu.value && scalePercent.value !== null && !changingScale.value);
@@ -142,6 +143,125 @@ let latestMouse: { x: number; y: number } | null = null;
 let leaseTimer: number | undefined;
 let menuHideTimer: number | undefined;
 
+type DragFinish = 'end' | 'cancel';
+interface PointerDrag {
+  readonly gestureId: string;
+  readonly pointerId: number;
+  readonly target: Element;
+  readonly originX: number;
+  readonly originY: number;
+  moved: boolean;
+  began: boolean;
+  sending: boolean;
+  pendingMove: boolean;
+  finish?: DragFinish;
+}
+let pointerDrag: PointerDrag | undefined;
+let suppressDragClick = false;
+
+/** One in-flight call and one pending sample keep slow host IPC from building
+ * up a queue. A fast release still sends its final move before ending. */
+async function sendDrag(drag: PointerDrag): Promise<void> {
+  if (!bridge || drag.sending) return;
+  drag.sending = true;
+  try {
+    for (;;) {
+      const phase = !drag.began ? 'begin'
+        : drag.pendingMove && drag.finish !== 'cancel' ? 'move' : drag.finish;
+      if (!phase) return;
+      if (phase === 'move') drag.pendingMove = false;
+      let ok = false;
+      try {
+        ok = (await bridge.dragPetWindow({ phase, gestureId: drag.gestureId })).ok;
+      } catch { /* Retire a gesture with a lost host response. */ }
+      if (phase === 'end' || phase === 'cancel') {
+        if (pointerDrag === drag) {
+          pointerDrag = undefined;
+          hitTest(true);
+        }
+        return;
+      }
+      drag.began = true;
+      if (!ok) {
+        if (drag.moved && !drag.finish) hostError.value = '暂时无法拖动桌宠';
+        finishPointerDrag('cancel');
+        drag.finish = 'cancel';
+      }
+    }
+  } finally { drag.sending = false; }
+}
+
+function finishPointerDrag(phase: DragFinish): void {
+  const drag = pointerDrag;
+  if (!drag || drag.finish) return;
+  drag.finish = phase;
+  dragging.value = false;
+  if (drag.moved) suppressDragClick = true;
+  try {
+    if (drag.target.hasPointerCapture(drag.pointerId)) drag.target.releasePointerCapture(drag.pointerId);
+  } catch { /* The visual surface may have already been replaced. */ }
+  void sendDrag(drag);
+}
+
+function cancelPointerDrag(): void { finishPointerDrag('cancel'); }
+
+function beginPointerDrag(event: PointerEvent): void {
+  if (!event.isTrusted || !event.isPrimary || event.button !== 0) return;
+  suppressDragClick = false;
+  if (!bridge || pointerDrag || !canUseMenu.value || document.visibilityState !== 'visible'
+    || !(event.target instanceof Element)) return;
+  const target = event.target;
+  const onHandle = menuVisible.value && Boolean(target.closest('[data-drag]'));
+  const onModel = portraitSurface.value?.contains(target) && petCanvas.value?.hitTestClient(event.clientX, event.clientY);
+  if (!onHandle && !onModel) return;
+  try { target.setPointerCapture(event.pointerId); }
+  catch { return; }
+  clearMenuTimer();
+  pointerDrag = {
+    gestureId: crypto.randomUUID(), pointerId: event.pointerId, target,
+    originX: event.screenX, originY: event.screenY,
+    moved: false, began: false, sending: false, pendingMove: false,
+  };
+  void sendDrag(pointerDrag);
+}
+
+function queueDragMove(drag: PointerDrag, event: PointerEvent): void {
+  if (!drag.moved && Math.hypot(event.screenX - drag.originX, event.screenY - drag.originY) < 5) return;
+  if (!drag.moved) {
+    dragging.value = drag.moved = true;
+    clearProactive();
+    hostError.value = null;
+  }
+  drag.pendingMove = true;
+  void sendDrag(drag);
+}
+
+function onPointerMove(event: PointerEvent): void {
+  const drag = pointerDrag;
+  if (!event.isTrusted || !drag || drag.finish || event.pointerId !== drag.pointerId) return;
+  if ((event.buttons & 1) === 0) finishPointerDrag('cancel');
+  else queueDragMove(drag, event);
+}
+
+function onPointerUp(event: PointerEvent): void {
+  const drag = pointerDrag;
+  if (!event.isTrusted || !drag || drag.finish || event.pointerId !== drag.pointerId) return;
+  latestMouse = { x: event.clientX, y: event.clientY };
+  queueDragMove(drag, event);
+  finishPointerDrag('end');
+}
+
+function onPointerCanceled(event: PointerEvent): void {
+  if (event.isTrusted && event.pointerId === pointerDrag?.pointerId) cancelPointerDrag();
+}
+
+function suppressClickAfterDrag(event: MouseEvent): void {
+  if (!event.isTrusted || !suppressDragClick || event.button !== 0 || event.detail === 0) return;
+  suppressDragClick = false;
+  event.preventDefault();
+  event.stopPropagation();
+}
+
 function clearMenuTimer(): void {
   if (menuHideTimer !== undefined) window.clearTimeout(menuHideTimer);
   menuHideTimer = undefined;
@@ -172,6 +292,7 @@ function hitTest(renew = false): void {
     lease?.set(false);
     return;
   }
+  if (pointerDrag && !pointerDrag.finish) return;
   if (!latestMouse) {
     updateMenu(false);
     lease?.set(false);
@@ -198,11 +319,13 @@ function onMouseMove(event: MouseEvent): void {
 
 function leave(): void {
   latestMouse = null;
+  if (pointerDrag && !pointerDrag.finish) return;
   updateMenu(false);
   lease?.reset();
 }
 
 function onPointerVisibility(): void {
+  cancelPointerDrag();
   leave();
   hideMenu();
 }
@@ -212,7 +335,10 @@ watch([canUseMenu, canHit], ([canUse]) => {
   else onPointerVisibility();
 }, { flush: 'post' });
 
-watch(() => store.serviceStatus?.generation, () => { scalePercent.value = null; }, { flush: 'sync' });
+watch(() => store.serviceStatus?.generation, () => {
+  scalePercent.value = null;
+  cancelPointerDrag();
+}, { flush: 'sync' });
 
 onMounted(() => {
   unsubscribeRenderPreferences = bridge?.subscribeHostRenderPreferences(value => {
@@ -223,11 +349,23 @@ onMounted(() => {
   unsubscribeProactive = bridge?.subscribeProactiveBubble(showProactive);
   document.addEventListener('visibilitychange', onVoiceVisibility);
   document.addEventListener('mousemove', onMouseMove);
+  document.addEventListener('pointermove', onPointerMove, true);
+  document.addEventListener('pointerup', onPointerUp, true);
+  document.addEventListener('pointercancel', onPointerCanceled, true);
+  document.addEventListener('lostpointercapture', onPointerCanceled, true);
+  window.addEventListener('blur', cancelPointerDrag);
   document.documentElement.addEventListener('mouseleave', leave);
   document.addEventListener('visibilitychange', onPointerVisibility);
   // A stationary pointer over the portrait should retain interaction, but
   // Main expires input if these rechecks stop or the cursor exits the window.
-  leaseTimer = window.setInterval(() => hitTest(true), 500);
+  leaseTimer = window.setInterval(() => {
+    const drag = pointerDrag;
+    if (drag?.moved && !drag.finish) {
+      drag.pendingMove = true;
+      void sendDrag(drag);
+    }
+    hitTest(true);
+  }, 500);
 });
 
 onBeforeUnmount(() => {
@@ -240,6 +378,11 @@ onBeforeUnmount(() => {
   clearVisualReportTimer();
   if (leaseTimer !== undefined) window.clearInterval(leaseTimer);
   document.removeEventListener('mousemove', onMouseMove);
+  document.removeEventListener('pointermove', onPointerMove, true);
+  document.removeEventListener('pointerup', onPointerUp, true);
+  document.removeEventListener('pointercancel', onPointerCanceled, true);
+  document.removeEventListener('lostpointercapture', onPointerCanceled, true);
+  window.removeEventListener('blur', cancelPointerDrag);
   document.documentElement.removeEventListener('mouseleave', leave);
   document.removeEventListener('visibilitychange', onPointerVisibility);
   onPointerVisibility();
@@ -286,10 +429,21 @@ function interact(interaction: Interaction): void {
     interaction === 'PET' ? '已互动' : interaction === 'WAKE' ? '已唤醒' : '已安排休息，体力将逐渐恢复');
 }
 
+function onModelTouch(region: string): void {
+  const name = region.toLowerCase();
+  if (name === 'head') interact('PET');
+  else if (name === 'body' && canAct.value) {
+    clearProactive();
+    hostError.value = null;
+    petCanvas.value?.playSemantic('tap.body');
+  }
+}
+
 </script>
 
 <template>
-  <main class="pet-shell" :data-pet-menu="menuVisible ? 'visible' : 'hidden'" @contextmenu.prevent="openControlCenter">
+  <main class="pet-shell" :data-pet-menu="menuVisible ? 'visible' : 'hidden'" :data-pet-drag="dragging ? 'active' : 'idle'"
+    @pointerdown.capture="beginPointerDrag" @click.capture="suppressClickAfterDrag" @contextmenu.prevent="openControlCenter">
     <template v-if="pet">
       <div v-show="menuVisible" class="plate" data-hit data-menu-hit>
         <div class="drag-handle" data-drag title="拖动桌宠窗口">⠿ <span>{{ pet.nickname }}</span></div>
@@ -304,7 +458,9 @@ function interact(interaction: Interaction): void {
         <button class="more" aria-label="打开控制中心" title="控制中心" :disabled="openingCenter" @click="openControlCenter">···</button>
       </div>
       <div ref="portraitSurface" class="portrait-surface">
-        <PetCanvas ref="petCanvas" :character-id="pet.characterId" :activity="pet.activity" :paused="quietMotion" :reduced-motion="reducedMotion" :interactive="canAct && canHit" @touch="interact('PET')" @visual="visual = $event" />
+        <PetCanvas ref="petCanvas" :character-id="pet.characterId" :activity="pet.activity" :paused="quietMotion"
+          :reduced-motion="reducedMotion" :interactive="canAct && canHit" :dragging="dragging"
+          @touch="onModelTouch" @visual="visual = $event" />
       </div>
       <p v-if="proactiveBubble" class="proactive-bubble" role="status">{{ proactiveBubble }}</p>
       <div v-show="menuVisible" class="bottom-menu">
@@ -346,7 +502,7 @@ body { user-select: none; }
 .proactive-bubble { position: absolute; z-index: 1; top: calc(var(--edge) + 34px); left: 12px; right: 12px; max-height: 5.7em; margin: 0; padding: 7px 9px; overflow: hidden; overflow-wrap: anywhere; background: #352b43f2; border: 1px solid #b4a4d199; border-radius: 10px; color: #fff3df; font-size: 12px; line-height: 1.45; pointer-events: none; }
 [data-hit] { pointer-events: auto; }
 .plate { position: absolute; z-index: 2; top: var(--edge); left: 50%; transform: translateX(-50%); display: inline-flex; align-items: center; gap: 5px; min-height: 26px; padding: 1px 3px 1px 6px; background: #352b43eb; border: 1px solid #b4a4d16b; border-radius: 11px; box-shadow: 0 2px 8px #1b172149; width: max-content; max-width: calc(100% - 2 * var(--edge)); }
-.drag-handle { -webkit-app-region: drag; app-region: drag; min-width: 16px; padding: 4px 2px 4px 0; font-size: 12px; font-weight: 700; cursor: move; white-space: nowrap; text-overflow: ellipsis; overflow: hidden; max-width: 130px; }
+.drag-handle { min-width: 16px; padding: 4px 2px 4px 0; font-size: 12px; font-weight: 700; cursor: grab; touch-action: none; white-space: nowrap; text-overflow: ellipsis; overflow: hidden; max-width: 130px; }
 .drag-handle span { color: #fff3df; }
 .level { font-size: 10px; color: #e7cc9f; white-space: nowrap; }
 button { -webkit-app-region: no-drag; app-region: no-drag; border: 1px solid #b4a4d16b; font: inherit; color: #fff3df; background: #352b43ed; cursor: pointer; transition: background .16s ease, border-color .16s ease; }
@@ -356,7 +512,8 @@ button:disabled { opacity: .62; cursor: default; }
 .scale-value { min-width: 2.8em; color: #e7cc9f; font-size: 10px; font-variant-numeric: tabular-nums; text-align: center; white-space: nowrap; }
 .scale-button, .more { display: grid; flex: none; place-items: center; width: 22px; height: 21px; padding: 0; border-radius: 7px; font-size: 16px; line-height: 1; }
 .more { border: 0; }
-.portrait-surface { width: 82%; height: 76%; min-height: 0; }
+.portrait-surface { width: 82%; height: 76%; min-height: 0; pointer-events: auto; touch-action: none; cursor: grab; }
+.pet-shell[data-pet-drag="active"] :is(.portrait-surface, .drag-handle) { cursor: grabbing; }
 .portrait-surface .pet-visual { min-height: 0; }
 .bottom-menu { position: absolute; z-index: 2; bottom: var(--edge); left: var(--edge); right: var(--edge); display: grid; justify-items: center; gap: 4px; }
 .state { display: flex; align-items: center; gap: 5px; max-width: 100%; background: #352b43ed; padding: 3px 7px; border-radius: 10px; font-size: 10px; border: 1px solid #b4a4d145; white-space: nowrap; }

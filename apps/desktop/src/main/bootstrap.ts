@@ -12,13 +12,14 @@ import { version as appVersion } from '../../package.json';
 import { characterPackRequestSchema } from '../shared/character-pack-ipc';
 import type { CharacterPackChanged, CharacterPackResult } from '../shared/character-pack-ipc';
 import { CharacterPackStoreError, InstalledCharacterPacks } from './installed-character-packs';
-import { DESKTOP_IPC, petVisualReadySchema } from '../shared/protocol';
+import { DESKTOP_IPC, petDragRequestSchema, petVisualReadySchema } from '../shared/protocol';
 import type { HostActionResult, PetVisualReady, ServiceStatus } from '../shared/protocol';
 import { authorizeSender, isTrustedDocument, routeRequest } from './boundary';
 import type { SenderContext, WindowBinding } from './boundary';
 import { ServiceClient } from './service-client';
 import type { ServiceChild } from './service-client';
-import { clampBounds, InputLease, rendererUrl } from './window-policy';
+import { clampBounds, InputLease, isCursorInBounds, rendererUrl } from './window-policy';
+import type { Point } from './window-policy';
 import { desiredPetSurface, isCurrentVisualReport, planPetHandover, samePetSurface } from './pet-handover';
 import type { PetSurfaceIdentity, PetSurfaceInfo, PetSurfacePhase } from './pet-handover';
 import { canContinueWindowWalk, createWindowWalkPlan, walkPositionAt } from './walk-window-policy';
@@ -56,6 +57,8 @@ const PET_SIZE = { width: 260, height: 295 };
 const MAX_WINDOW_FAILURES = 3;
 const WINDOW_FAILURE_INTERVAL = 60_000;
 const TEMP_INTERACTION_MS = 20_000;
+const DRAG_START_TIMEOUT_MS = 5_000;
+const DRAG_LEASE_MS = 1_500;
 const PET_VISUAL_TIMEOUT_MS = 10_000;
 const MIC_PENDING_MS = 15_000;
 const MIC_CAPTURE_MS = 35_000;
@@ -99,6 +102,13 @@ interface NativeWalkRun {
   readonly plan: WindowWalkPlan;
   expected: { x: number; y: number };
   timer: ReturnType<typeof setInterval>;
+}
+interface PetDragRun {
+  readonly stamp: FeatureStamp;
+  readonly gestureId: string;
+  readonly offset: Point;
+  moved: boolean;
+  timer: ReturnType<typeof setTimeout>;
 }
 
 function makeTrayIcon() {
@@ -150,6 +160,7 @@ export class DesktopHost {
   private readonly windows = new Map<string, WindowRecord>();
   private readonly senders = new Map<number, WindowRecord>();
   private readonly anchors = new Map<string, HostWindowAnchor>();
+  private readonly provisionalAnchors = new WeakSet<HostWindowAnchor>();
   private readonly anchorWrites = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly failures = new Map<string, number[]>();
   private readonly retryTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -168,6 +179,7 @@ export class DesktopHost {
   private interactionTimer: ReturnType<typeof setTimeout> | undefined;
   private walkingAttempt: string | undefined;
   private walkingRun: NativeWalkRun | undefined;
+  private dragRun: PetDragRun | undefined;
   private readonly microphone = new MicrophoneGrantPolicy(() => randomUUID(), () => performance.now(), MIC_PENDING_MS);
   private micConsent: FeatureStamp | undefined;
   private proactiveTimer: ReturnType<typeof setInterval> | undefined;
@@ -343,6 +355,9 @@ export class DesktopHost {
       const { record, sender } = this.senderOf(event);
       if (!record || !authorizeSender(record.binding, sender, 'pet')) return { ok: false, code: 'FORBIDDEN' };
       if (args.length !== 1 || typeof args[0] !== 'boolean') return { ok: false, code: 'INVALID_REQUEST' };
+      if (this.dragRun?.stamp.record === record) {
+        return this.updatePetInput(record) ? { ok: true } : { ok: false, code: 'SERVICE_UNAVAILABLE' };
+      }
       if (!args[0]) {
         record.inputLease.clear();
         return this.updatePetInput(record) ? { ok: true } : { ok: false, code: 'SERVICE_UNAVAILABLE' };
@@ -366,6 +381,7 @@ export class DesktopHost {
         return { ok: false, code: 'SERVICE_UNAVAILABLE' };
       }
     });
+    ipcMain.handle(DESKTOP_IPC.petDrag, (event, ...args: unknown[]) => this.handlePetDrag(event, args));
     ipcMain.handle(DESKTOP_IPC.changePetScale, (event, ...args: unknown[]) => this.changePetScale(event, args));
     ipcMain.handle(DESKTOP_IPC.petVisualReady, (event, ...args: unknown[]): HostActionResult => {
       const { record, sender } = this.senderOf(event);
@@ -621,7 +637,10 @@ export class DesktopHost {
     if (previous?.revision === preferences.revision) return;
     const { scalePercent, reducedMotion } = preferences.values;
     const scaleChanged = previous?.values.scalePercent !== scalePercent;
-    if (scaleChanged) this.stopWalkMotion();
+    if (scaleChanged) {
+      this.finishPetDrag();
+      this.stopWalkMotion();
+    }
     for (const record of this.windows.values()) {
       if (!record.pet || !this.isCurrent(record)) continue;
       if (scaleChanged) {
@@ -1274,6 +1293,7 @@ export class DesktopHost {
    * visibility follows the plan, but only authority selects/owns the pet. */
   private reconcilePets(): void {
     this.syncTravelReturnSummary();
+    if (this.dragRun && !this.canDrag(this.dragRun.stamp.record)) this.finishPetDrag(this.dragRun);
     const surfaces: PetSurfaceInfo[] = [];
     for (const record of this.windows.values()) {
       const pet = record.pet;
@@ -1334,6 +1354,81 @@ export class DesktopHost {
     this.syncProactive();
   }
 
+  private canDrag(record: WindowRecord): boolean {
+    return this.inputMode !== 'through' && this.isActivePet(record) && record.window.isVisible();
+  }
+
+  private handlePetDrag(event: IpcMainInvokeEvent, args: unknown[]): HostActionResult {
+    const { record, sender } = this.senderOf(event);
+    if (!record || !authorizeSender(record.binding, sender, 'pet')) return { ok: false, code: 'FORBIDDEN' };
+    const request = petDragRequestSchema.safeParse(args[0]);
+    if (args.length !== 1 || !request.success) return { ok: false, code: 'INVALID_REQUEST' };
+    const { phase, gestureId } = request.data;
+    const run = this.dragRun;
+    if (phase === 'begin') {
+      if (run || !this.canDrag(record) || (this.inputMode === 'auto' && !record.inputLease.active)) {
+        return { ok: false, code: 'FORBIDDEN' };
+      }
+      try {
+        const cursor = screen.getCursorScreenPoint();
+        const bounds = record.window.getBounds();
+        if (!isCursorInBounds(cursor, bounds)) return { ok: false, code: 'INVALID_REQUEST' };
+        const drag: PetDragRun = {
+          stamp: this.featureStamp(record), gestureId, offset: { x: cursor.x - bounds.x, y: cursor.y - bounds.y },
+          moved: false, timer: setTimeout(() => this.finishPetDrag(drag), DRAG_START_TIMEOUT_MS),
+        };
+        this.dragRun = drag;
+        this.stopWalkMotion();
+        if (this.updatePetInput(record)) return { ok: true };
+        this.finishPetDrag(drag);
+      } catch { /* Treat native cursor/window failures as unavailable. */ }
+      return { ok: false, code: 'SERVICE_UNAVAILABLE' };
+    }
+    if (!run || run.stamp.record !== record || run.gestureId !== gestureId) return { ok: false, code: 'FORBIDDEN' };
+    if (!this.canDrag(record) || !this.sameFeature(run.stamp, this.featureStamp(record))) {
+      this.finishPetDrag(run);
+      return { ok: false, code: 'FORBIDDEN' };
+    }
+    try {
+      if (phase === 'move' || (phase === 'end' && run.moved)) this.movePetDrag(run);
+      if (phase !== 'move') this.finishPetDrag(run);
+      else if (this.dragRun === run) {
+        clearTimeout(run.timer);
+        run.timer = setTimeout(() => this.finishPetDrag(run), DRAG_LEASE_MS);
+      }
+      return { ok: true };
+    } catch {
+      this.finishPetDrag(run);
+      return { ok: false, code: 'SERVICE_UNAVAILABLE' };
+    }
+  }
+
+  private movePetDrag(run: PetDragRun): void {
+    const { window } = run.stamp.record;
+    const cursor = screen.getCursorScreenPoint();
+    const old = window.getBounds();
+    const next = clampBounds({
+      ...this.petSize(), x: cursor.x - run.offset.x, y: cursor.y - run.offset.y,
+    }, screen.getDisplayNearestPoint(cursor).workArea);
+    if (next.x === old.x && next.y === old.y && next.width === old.width && next.height === old.height) return;
+    run.moved = true;
+    window.setBounds(next, false);
+  }
+
+  private finishPetDrag(run = this.dragRun): void {
+    if (!run || this.dragRun !== run) return;
+    this.dragRun = undefined;
+    clearTimeout(run.timer);
+    const { record } = run.stamp;
+    if (!this.isCurrent(record)) return;
+    if (run.moved) {
+      // Sample the final window bounds once, through the existing save debounce.
+      this.storeAnchor(record);
+      record.inputLease.clear();
+    }
+    this.updatePetInput(record);
+  }
+
   private stopWalkMotion(resetAttempt = false): void {
     if (this.walkingRun) clearInterval(this.walkingRun.timer);
     this.walkingRun = undefined;
@@ -1342,6 +1437,7 @@ export class DesktopHost {
 
   private canWalk(record: WindowRecord): boolean {
     return this.isActivePet(record) && record.window.isVisible() && this.inputMode === 'auto' && !this.snapshot?.pausedRender
+      && this.dragRun?.stamp.record !== record
       && this.snapshot?.pets.some((pet) => pet.petId === record.pet?.identity.petId && pet.presence === 'HOME' && pet.activity === 'WALK') === true;
   }
 
@@ -1396,7 +1492,7 @@ export class DesktopHost {
     const suppressed = !this.isActivePet(record);
     if (suppressed) record.inputLease.clear();
     const ignore = suppressed || this.inputMode === 'through'
-      || (this.inputMode === 'auto' && !record.inputLease.active);
+      || (this.inputMode === 'auto' && !record.inputLease.active && this.dragRun?.stamp.record !== record);
     try {
       if (ignore) record.window.setIgnoreMouseEvents(true, { forward: true });
       else record.window.setIgnoreMouseEvents(false);
@@ -1458,11 +1554,13 @@ export class DesktopHost {
     this.protectContents(record);
     if (pet) this.setPetPhase(record, 'STAGING');
     window.on('move', () => {
-      this.storeAnchor(record);
+      if (this.dragRun?.stamp.record !== record) this.storeAnchor(record);
       if (record.pet?.phase === 'ACTIVE' && this.fullscreenState().kind === 'display'
         && record.window.isVisible() === this.windowHidesInFullscreen(record)) this.reconcilePets();
     });
-    window.on('resize', () => this.storeAnchor(record));
+    window.on('resize', () => {
+      if (this.dragRun?.stamp.record !== record) this.storeAnchor(record);
+    });
     window.on('closed', () => {
       const registered = this.windows.get(record.key) === record;
       this.unregister(record);
@@ -1470,7 +1568,10 @@ export class DesktopHost {
     });
     window.on('hide', () => {
       record.inputLease.clear();
-      if (pet) { if (this.mouthRun?.target === record) this.clearMouth(); }
+      if (pet) {
+        if (this.dragRun?.stamp.record === record) this.finishPetDrag(this.dragRun);
+        if (this.mouthRun?.target === record) this.clearMouth();
+      }
       else if (this.isCurrent(record)) this.invalidateFeatures(record);
     });
     window.on('blur', () => {
@@ -1554,6 +1655,7 @@ export class DesktopHost {
       this.invalidateMicLease(record, true);
     }
     if (this.mouthRun?.target === record) this.clearMouth();
+    if (this.dragRun?.stamp.record === record) this.finishPetDrag(this.dragRun);
     record.inputLease.clear();
     if (this.walkingRun?.senderId === record.binding.senderId) this.stopWalkMotion();
     if (record.pet) this.clearPetTimers(record.pet);
@@ -1563,6 +1665,7 @@ export class DesktopHost {
 
   private destroyWindow(record: WindowRecord): void {
     if (!this.isCurrent(record)) return;
+    if (this.dragRun?.stamp.record === record) this.finishPetDrag(this.dragRun);
     this.storeAnchor(record);
     if (record.pet) {
       record.inputLease.clear();
@@ -1614,7 +1717,10 @@ export class DesktopHost {
     const display = screen.getAllDisplays().find((candidate) => candidate.id === anchor?.displayId)
       ?? screen.getPrimaryDisplay();
     const area = display.workArea;
-    const size = pet ? this.petSize() : { width: anchor?.width ?? 900, height: anchor?.height ?? 680 };
+    // Anchor and preference reads can settle in either order. A saved small
+    // window near an edge could be displaced if first clamped at default size.
+    const size = pet && (this.hostPreferences || !anchor)
+      ? this.petSize() : { width: anchor?.width ?? 900, height: anchor?.height ?? 680 };
     const offset = pet ? 30 * this.windows.size : 0;
     const x = anchor ? area.x + anchor.offsetX : pet ? area.x + area.width - size.width - 24 - offset
       : area.x + Math.round((area.width - size.width) / 2);
@@ -1644,7 +1750,10 @@ export class DesktopHost {
       && before.x === next.x && before.y === next.y && before.width === next.width && before.height === next.height
       && before.offsetX === next.offsetX && before.offsetY === next.offsetY) return;
     this.anchors.set(record.key, next);
-    if (!persist) return;
+    if (!persist) {
+      this.provisionalAnchors.add(next);
+      return;
+    }
     const timer = this.anchorWrites.get(record.key);
     if (timer) clearTimeout(timer);
     this.anchorWrites.set(record.key, setTimeout(() => { void this.persistWindowAnchor(record.key); }, 400));
@@ -1667,9 +1776,14 @@ export class DesktopHost {
         || response.kind !== 'window-anchors' || !response.result.ok) return;
       for (const anchor of response.result.anchors) {
         const key = anchor.role === 'pet' ? `pet:${anchor.petId}` : CENTER_KEY;
-        if (this.anchors.get(key) !== baseline.get(key) || this.anchorWrites.has(key)) continue;
-        this.anchors.set(key, anchor);
+        const current = this.anchors.get(key);
+        // An asynchronously staged window can seed initial bounds while the
+        // service is loading its save. Only real local changes override it.
+        const stillProvisional = current !== undefined && this.provisionalAnchors.has(current);
+        if (this.anchorWrites.has(key) || (current !== baseline.get(key) && !stillProvisional)) continue;
         const record = this.windows.get(key);
+        if (this.dragRun && this.dragRun.stamp.record === record) continue;
+        this.anchors.set(key, anchor);
         if (!record || !this.isCurrent(record) || record.window.isMaximized() || record.window.isFullScreen()) continue;
         record.window.setBounds(this.initialBounds(key, anchor.role === 'pet'));
       }
@@ -1677,6 +1791,7 @@ export class DesktopHost {
   }
 
   private reflowWindows(): void {
+    this.finishPetDrag();
     for (const record of this.windows.values()) {
       if (!this.isCurrent(record) || record.window.isMaximized() || record.window.isFullScreen()) continue;
       const currentBounds = record.window.getBounds();
@@ -1698,6 +1813,7 @@ export class DesktopHost {
     if (this.interactionTimer !== undefined) clearTimeout(this.interactionTimer);
     this.interactionTimer = undefined;
     this.inputMode = mode;
+    if (mode === 'through') this.finishPetDrag();
     if (mode !== 'auto') this.stopWalkMotion();
     if (mode === 'temporary-interactive') {
       this.interactionTimer = setTimeout(() => this.setInputMode('auto'), TEMP_INTERACTION_MS);
@@ -1783,6 +1899,7 @@ export class DesktopHost {
 
   async stop(): Promise<void> {
     if (this.stopping) return;
+    this.finishPetDrag();
     this.stopping = true;
     this.syncFullscreenMonitor();
     if (this.proactiveTimer !== undefined) clearInterval(this.proactiveTimer);

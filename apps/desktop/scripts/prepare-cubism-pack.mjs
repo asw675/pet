@@ -8,7 +8,7 @@ const maxPackBytes = 64 * 1024 * 1024;
 const baseline = new URL('../src/renderer/asset-packs/builtin/star-singer/', import.meta.url);
 const knownReferences = new Set(['Moc', 'Textures', 'Physics', 'Pose', 'DisplayInfo', 'UserData', 'Expressions', 'Motions']);
 const semanticMotionNames = new Map([
-  ['idle', 'idle'], ['walk', 'walk'], ['drag', 'drag'], ['taphead', 'tap.head'],
+  ['idle', 'idle'], ['walk', 'walk'], ['drag', 'drag'], ['taphead', 'tap.head'], ['tapbody', 'tap.body'],
   ['happy', 'happy'], ['talk', 'talk'], ['eat', 'eat'], ['sleep', 'sleep'], ['celebrate', 'celebrate'],
 ]);
 

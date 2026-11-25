@@ -38,6 +38,11 @@ interface Slot {
   retired: boolean;
 }
 interface Job { controller: AbortController; pack: ResolvedPack }
+interface PortraitTap {
+  request: ActionRequest;
+  elapsed: number;
+  finish(result: ActionResult): void;
+}
 function abort(message: string) { return new DOMException(message, 'AbortError'); }
 function safely(action: () => void) { try { action(); } catch { /* independent teardown */ } }
 /** A late factory may still resolve after cancellation; never attach it or
@@ -79,6 +84,8 @@ export class AdaptiveRendererHost {
   private paused = false;
   private baseAction = 'idle';
   private look = { x: 0, y: 0 };
+  private portraitTap: PortraitTap | undefined;
+  private portraitOffset: RenderPose | undefined;
   private readonly recoveryWindowMs: number;
 
   constructor(private readonly options: AdaptiveRendererOptions) {
@@ -94,6 +101,7 @@ export class AdaptiveRendererHost {
   async loadPack(pack: ResolvedPack, signal: AbortSignal): Promise<void> {
     if (this.disposed) throw new Error('Render host destroyed');
     signal.throwIfAborted();
+    this.resetPortrait();
     this.cancelPending();
     this.retireRecovery();
     this.wanted = pack;
@@ -116,12 +124,14 @@ export class AdaptiveRendererHost {
    * pixels may remain, but input/voice for the old identity is blocked. */
   invalidate(characterId: string): void {
     if (this.disposed) return;
+    this.resetPortrait();
     this.cancelPending(); this.retireRecovery(); this.wanted = undefined;
     this.requestedCharacterId = characterId;
     this.loading = true; this.current?.renderer?.clearMouth(); this.emit('loading');
   }
   showPortrait(characterId: string): void {
     if (this.disposed) return;
+    this.resetPortrait();
     this.cancelPending(); this.retireRecovery();
     this.wanted = undefined; this.requestedCharacterId = characterId;
     retire(this.current); this.current = undefined; this.loading = false; this.emit('fallback');
@@ -134,33 +144,87 @@ export class AdaptiveRendererHost {
   setQuality(profile: RenderProfile): void {
     if (this.disposed) return;
     this.profile = { ...profile };
+    if (profile.reducedMotion) this.resetPortrait();
     for (const slot of [this.current, this.staged]) slot?.renderer?.setQuality(profile);
   }
   setPose(pose: RenderPose): void {
     if (this.disposed) return;
-    this.pose = { ...pose }; for (const slot of [this.current, this.staged]) slot?.renderer?.setPose(pose);
+    this.pose = { ...pose }; this.portraitOffset = undefined;
+    for (const slot of [this.current, this.staged]) slot?.renderer?.setPose(pose);
   }
   setBaseAction(semanticId: string): void {
     this.baseAction = semanticId; for (const slot of [this.current, this.staged]) slot?.renderer?.setBaseAction(semanticId);
   }
   setLook(x: number, y: number): void {
-    this.look = { x, y };
-    for (const slot of [this.current, this.staged]) slot?.renderer?.setLook?.(x, y);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+    this.look = { x: Math.max(-1, Math.min(1, x)), y: Math.max(-1, Math.min(1, y)) };
+    for (const slot of [this.current, this.staged]) slot?.renderer?.setLook?.(this.look.x, this.look.y);
   }
   setPaused(paused: boolean): void {
     if (this.disposed) return;
+    if (paused) this.resetPortrait();
     this.paused = paused; for (const slot of [this.current, this.staged]) slot?.renderer?.setPaused(paused);
   }
   clearMouth(): void { this.current?.renderer?.clearMouth(); }
   setMouth(sample: MouthSample): void { if (this.interactive && !this.paused) this.current?.renderer?.setMouth(sample); }
-  tick(dtSeconds: number): void { if (!this.disposed) this.current?.renderer?.tick(dtSeconds); }
+  tick(dtSeconds: number): void {
+    if (this.disposed) return;
+    const renderer = this.current?.renderer;
+    if (renderer?.activeVariant?.renderer === 'static' && this.interactive && !this.paused && !this.profile.reducedMotion
+      && Number.isFinite(dtSeconds) && dtSeconds > 0) this.paintPortraitFeedback(renderer, Math.min(dtSeconds, 0.1));
+    renderer?.tick(dtSeconds);
+  }
   play(action: ActionRequest): Promise<ActionResult> {
-    return this.interactive && this.current?.renderer ? this.current.renderer.play(action) : Promise.resolve({ requestId: action.requestId, status: 'failed' });
+    const renderer = this.current?.renderer;
+    if (!this.interactive || !renderer) return Promise.resolve({ requestId: action.requestId, status: 'failed' });
+    const variant = renderer.activeVariant;
+    // A verified static fallback can acknowledge a tap through its existing
+    // geometry. Authored sprite and Cubism actions stay with their adapters.
+    if (variant?.renderer !== 'static' || action.loop || (action.semanticId !== 'tap.head' && action.semanticId !== 'tap.body')
+      || this.wanted?.manifest.actions[action.semanticId]?.[variant.id]) return renderer.play(action);
+    if (this.paused || this.profile.reducedMotion || this.portraitTap && action.priority < this.portraitTap.request.priority) {
+      return Promise.resolve({ requestId: action.requestId, status: 'interrupted' });
+    }
+    this.finishPortraitTap('interrupted');
+    return new Promise(finish => { this.portraitTap = { request: action, elapsed: 0, finish }; });
   }
   hitTest(x: number, y: number): HitRegion | null { return this.interactive ? this.current?.renderer?.hitTest(x, y) ?? null : null; }
   destroy(): void {
     if (this.disposed) return;
+    this.resetPortrait();
     this.disposed = true; this.cancelPending(); this.retireRecovery(); retire(this.current); this.current = undefined; this.wanted = undefined;
+  }
+
+  private finishPortraitTap(status: 'completed' | 'interrupted'): void {
+    const tap = this.portraitTap;
+    this.portraitTap = undefined;
+    tap?.finish({ requestId: tap.request.requestId, status });
+  }
+
+  private resetPortrait(): void {
+    this.finishPortraitTap('interrupted');
+    if (this.portraitOffset) this.current?.renderer?.setPose(this.pose);
+    this.portraitOffset = undefined;
+  }
+
+  private paintPortraitFeedback(renderer: VisualRenderer, dt: number): void {
+    const tap = this.portraitTap;
+    if (tap && (tap.elapsed += dt) >= 0.32) this.finishPortraitTap('completed');
+    const bounce = this.portraitTap ? Math.sin(Math.PI * this.portraitTap.elapsed / 0.32) : 0;
+    const distance = Math.min(5, Math.max(0, this.viewport.h) * 0.025);
+    const previous = this.portraitOffset ?? this.pose;
+    const blend = Math.min(1, dt * 13);
+    const approach = (before: number, target: number, threshold: number): number =>
+      Math.abs(before - target) < threshold ? target : before + (target - before) * blend;
+    const pose = {
+      ...this.pose,
+      x: approach(previous.x, this.pose.x + this.look.x * distance, 0.02),
+      y: approach(previous.y, this.pose.y - this.look.y * distance - bounce * distance * 0.7, 0.02),
+      scale: this.pose.scale * (1 + bounce * 0.035),
+    };
+    if (previous.x === pose.x && previous.y === pose.y && previous.scale === pose.scale) return;
+    this.portraitOffset = pose;
+    renderer.setPose(pose);
   }
 
   private emit(stage: AdaptiveRenderState['stage']): void {
@@ -215,6 +279,7 @@ export class AdaptiveRendererHost {
   private promote(job: Job, slot: Slot): void {
     if (!this.live(job) || slot.retired) { retire(slot); throw abort('Obsolete visual promotion'); }
     const old = this.current;
+    if (old !== slot) this.resetPortrait();
     this.current = slot; if (this.staged === slot) this.staged = undefined;
     this.loading = false;
     // A previous surface stays visible until the verified candidate is ready.
@@ -248,6 +313,8 @@ export class AdaptiveRendererHost {
     // Candidate renderers own their own failure/abort; never let a stale
     // candidate's GPU event degrade a different already active surface.
     if (slot !== this.current) return;
+    this.finishPortraitTap('interrupted');
+    this.portraitOffset = undefined;
     if (!this.wanted) {
       // A new requested pack is being verified outside this host.
       this.current = undefined; slot.surface.show(false); retire(slot); this.emit('loading'); return;

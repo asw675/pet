@@ -156,7 +156,10 @@ test('installs a normalized Cubism Editor export and sends verified model data t
   await Promise.all([
     writeFile(join(exportDir, 'Star.moc3'), moc),
     cp(join(source, 'assets', 'portrait.png'), join(textures, 'Texture.00.png')),
-    writeFile(modelPath, JSON.stringify({ Version: 3, FileReferences: { Moc: 'Star.moc3', Textures: ['Star.2048/Texture.00.png'] } })),
+    writeFile(join(exportDir, 'Wave.motion3.json'), JSON.stringify({ Version: 3,
+      Meta: { Duration: 1, Fps: 30, CurveCount: 0, TotalSegmentCount: 0, TotalPointCount: 0 }, Curves: [] })),
+    writeFile(modelPath, JSON.stringify({ Version: 3, FileReferences: { Moc: 'Star.moc3', Textures: ['Star.2048/Texture.00.png'],
+      Motions: { TapBody: [{ File: 'Wave.motion3.json' }] } } })),
   ]);
   const helper = fileURLToPath(new URL('../scripts/prepare-cubism-pack.mjs', import.meta.url));
   execFileSync(process.execPath, [helper, modelPath, output, '1.2.0']);
@@ -167,6 +170,7 @@ test('installs a normalized Cubism Editor export and sends verified model data t
   });
   const model = await loadInstalledPack(pet, 'star-singer', new AbortController().signal);
   expect(model?.manifest.packVersion).toBe('1.2.0');
+  expect(model?.manifest.actions['tap.body']).toEqual({ live2d: 'tapbody' });
   expect(model?.variants.map(item => item.renderer)).toEqual(['cubism', 'static']);
   expect(model?.variants[0]).toMatchObject({ model: { textures: ['assets/live2d/textures/texture-1.png'] } });
   expect(model?.readAsset('assets/live2d/star-singer.moc3')).toEqual(new Uint8Array(moc));

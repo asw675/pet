@@ -106,7 +106,7 @@ describe('role-specific preload bridges', () => {
     ];
     const pet = createPetBridge(ipc);
     const center = createControlCenterBridge(ipc);
-    expect(Object.keys(pet).sort()).toEqual([...commonKeys, 'setInteractive', 'changePetScale', 'reportVisualReady','subscribeVoiceMouth','subscribeHostRenderPreferences','subscribeProactiveBubble',
+    expect(Object.keys(pet).sort()).toEqual([...commonKeys, 'setInteractive', 'dragPetWindow', 'changePetScale', 'reportVisualReady','subscribeVoiceMouth','subscribeHostRenderPreferences','subscribeProactiveBubble',
       'readCharacterPack', 'subscribeCharacterPackChanged'].sort());
     expect(Object.keys(center).sort()).toEqual([...commonKeys, 'listGallery', 'listCharacters', 'listInventory', 'listActiveTravel', 'listTravelCatalog', 'previewTravel', 'listTravelReports', 'listEvents',
       'getHostSettings','setHostShortcutEnabled','getHostShortcutBindings','saveHostShortcutBindings','setLoginStart','getHostPreferences','saveHostPreferences','exportBackup','exportDiagnostics','restoreBackup','getRestoreBackupStatus','getPeriodicBackupStatus',
@@ -140,6 +140,20 @@ describe('role-specific preload bridges', () => {
     expect(await bridge.saveHostPreferences({ scalePercent: 101, reducedMotion: true, expectedRevision: 0 } as never))
       .toEqual({ ok: false, code: 'INVALID_REQUEST' });
     expect(spy).toHaveBeenCalledTimes(1);
+  });
+
+  it('allows only pet gesture phases and does not forward caller-controlled coordinates', async () => {
+    const ipc = new FakeIpc();
+    const pet = createPetBridge(ipc);
+    const center = createControlCenterBridge(ipc);
+    const request = { phase: 'begin', gestureId: '3065c68a-860d-4359-a8cf-c3dd57ee9221' } as const;
+    expect('dragPetWindow' in center).toBe(false);
+    expect(await pet.dragPetWindow({ ...request, x: 100 } as never)).toEqual({ ok: false, code: 'INVALID_REQUEST' });
+    expect(await pet.dragPetWindow({ ...request, gestureId: 'other' })).toEqual({ ok: false, code: 'INVALID_REQUEST' });
+    expect(await pet.dragPetWindow({ ...request, phase: 'position' } as never)).toEqual({ ok: false, code: 'INVALID_REQUEST' });
+    expect(ipc.calls).toEqual([]);
+    expect(await pet.dragPetWindow(request)).toEqual({ ok: true });
+    expect(ipc.calls).toEqual([[DESKTOP_IPC.petDrag, request]]);
   });
 
   it('exports diagnostics without sharing paths or records with either renderer', async () => {

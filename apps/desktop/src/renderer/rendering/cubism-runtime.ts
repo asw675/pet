@@ -14,7 +14,7 @@ interface CoreCanvasInfo {
 interface FrameworkModel {
   getModel(): { readonly canvasinfo: CoreCanvasInfo; readonly parameters: { readonly ids: readonly string[] } };
   getParameterCount(): number;
-  getParameterDefaultValue(index: number): number;
+  getParameterValueByIndex(index: number): number;
   getParameterMaximumValue(index: number): number;
   getParameterMinimumValue(index: number): number;
   getDrawableCount(): number;
@@ -102,6 +102,7 @@ export interface CubismFrame {
   readonly look: { readonly x: number; readonly y: number };
   readonly mouth: number;
   readonly sleep: boolean;
+  readonly tap?: { readonly area: 'head' | 'body'; readonly strength: number };
   readonly still: boolean;
 }
 export interface CubismSession {
@@ -256,11 +257,11 @@ export function createCubismRuntime(sdk: CubismSdkBindings, shaderPath: string):
         await waitForShaders(() => !gl.isContextLost() && sdk.shaders.getInstance().getShader(gl)?._isShaderLoaded === true, signal);
         const matrix = new sdk.Matrix();
         const parameterIds = new Map(activeModel.getModel().parameters.ids.map((name, index) => [name, index]));
-        const set = (id: string, value: number, relative = false) => {
+        const set = (id: string, value: number, additive = false) => {
           const index = parameterIds.get(id);
           if (index === undefined) return;
           const low = activeModel.getParameterMinimumValue(index), high = activeModel.getParameterMaximumValue(index);
-          const next = relative ? value + activeModel.getParameterDefaultValue(index) : value;
+          const next = additive ? value + activeModel.getParameterValueByIndex(index) : value;
           activeModel.setParameterValueByIndex(index, Math.max(low, Math.min(high, next)));
         };
         const eyeIds = variant.model.eyeBlink.length ? variant.model.eyeBlink : ['ParamEyeLOpen', 'ParamEyeROpen'];
@@ -278,10 +279,19 @@ export function createCubismRuntime(sdk: CubismSdkBindings, shaderPath: string):
             }
             if (!frame.still) {
               set('ParamBreath', 0.5 + Math.sin(frame.seconds * 1.7) * 0.45);
-              if (!authoredMotion) {
-                set('ParamAngleX', frame.look.x * 18 + Math.sin(frame.seconds * 1.05) * 2, true);
-                set('ParamAngleY', frame.look.y * 12 + Math.sin(frame.seconds * 0.8) * 1.5, true);
-                set('ParamAngleZ', Math.sin(frame.seconds * 0.7) * 2.5, true);
+              // Gaze layers over authored motion and leaves its base pose in control.
+              const sway = authoredMotion ? 0 : 1;
+              set('ParamAngleX', frame.look.x * 18 + sway * Math.sin(frame.seconds * 1.05) * 2, true);
+              set('ParamAngleY', frame.look.y * 12 + sway * Math.sin(frame.seconds * 0.8) * 1.5, true);
+              set('ParamAngleZ', sway * Math.sin(frame.seconds * 0.7) * 2.5, true);
+              if (frame.tap) {
+                const strength = frame.tap.strength;
+                if (frame.tap.area === 'head') set('ParamAngleY', -8 * strength, true);
+                else {
+                  set('ParamBodyAngleX', 6 * strength, true);
+                  set('ParamAngleZ', -5 * strength, true);
+                }
+                set('ParamMouthForm', 0.65 * strength, true);
               }
               set('ParamEyeBallX', frame.look.x);
               set('ParamEyeBallY', frame.look.y);

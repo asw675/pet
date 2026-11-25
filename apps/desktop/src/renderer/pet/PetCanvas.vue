@@ -16,6 +16,7 @@ const props = defineProps<{
   paused: boolean;
   reducedMotion: boolean;
   interactive: boolean;
+  dragging?: boolean;
 }>();
 const emit = defineEmits<{
   touch: [region: string];
@@ -72,16 +73,22 @@ function frame(now: number): void {
 
 function syncAnimation(): void {
   if (!renderer) return;
-  renderer.setPaused(!active());
-  if (!active()) stopFrames();
+  const running = active();
+  renderer.setPaused(!running);
+  if (!running) { clearLook(); stopFrames(); }
   else if (frameRequest === null) frameRequest = window.requestAnimationFrame(frame);
 }
 
 function syncQuality(): void {
   const reducedMotion = props.reducedMotion || (motionPreference?.matches ?? false);
   profile = { maxFps: reducedMotion ? 15 : 30, resolutionScale: 1, reducedMotion };
+  if (reducedMotion) clearLook();
   renderer?.setQuality(profile);
   resize();
+}
+
+function syncBaseAction(): void {
+  renderer?.setBaseAction(props.dragging ? 'drag' : semanticIdForActivity(props.activity));
 }
 
 function acceptRenderState(state: AdaptiveRenderState): void {
@@ -98,6 +105,7 @@ async function replacePack(): Promise<void> {
   loadAbort = request;
   const characterId = props.characterId;
   const isCurrent = () => mounted && loadAbort === request && !request.signal.aborted;
+  clearLook();
   instance.invalidate(characterId);
   try {
     const bridge = window.petDesktop?.role === 'pet' ? window.petDesktop : undefined;
@@ -121,7 +129,7 @@ async function replacePack(): Promise<void> {
 }
 
 function hitTestClient(x: number, y: number): HitRegion | null {
-  if (!props.interactive || !renderer || !surface.value || !hasFrame.value
+  if (!renderer || !surface.value || !hasFrame.value
     || loadState.value !== 'ready' || renderer.activeCharacterId !== props.characterId) return null;
   const bounds = surface.value.getBoundingClientRect();
   if (x < bounds.left || x >= bounds.right || y < bounds.top || y >= bounds.bottom) return null;
@@ -129,13 +137,14 @@ function hitTestClient(x: number, y: number): HitRegion | null {
 }
 
 function onClick(event: MouseEvent): void {
-  if (!event.isTrusted) return;
+  if (!event.isTrusted || event.button !== 0 || props.dragging || !props.interactive || !active()) return;
   const region = hitTestClient(event.clientX, event.clientY);
   if (region) emit('touch', region.id);
 }
 
 function onLook(event: PointerEvent): void {
-  if (!event.isTrusted || !props.interactive || !surface.value) return;
+  if (!event.isTrusted || !event.isPrimary || props.dragging || !props.interactive || !active() || profile.reducedMotion
+    || !renderer?.interactive || !surface.value) return;
   const bounds = surface.value.getBoundingClientRect();
   if (bounds.width > 0 && bounds.height > 0) {
     renderer?.setLook(2 * (event.clientX - bounds.left) / bounds.width - 1,
@@ -146,7 +155,7 @@ function onLook(event: PointerEvent): void {
 function clearLook(): void { renderer?.setLook(0, 0); }
 
 function playSemantic(semanticId: string): void {
-  if (!renderer || props.paused || renderer.activeCharacterId !== props.characterId || loadState.value !== 'ready') return;
+  if (!renderer || props.dragging || !active() || renderer.activeCharacterId !== props.characterId || loadState.value !== 'ready') return;
   // Visual requests never act as domain command receipts or gate gameplay.
   void renderer.play({ requestId: crypto.randomUUID(), semanticId, loop: false, priority: 10, blendMs: 0 });
 }
@@ -162,7 +171,10 @@ function setVoiceMouth(sample: MouthSample | null): void {
 defineExpose({ hitTestClient, playSemantic, setVoiceMouth });
 
 watch(() => props.characterId, () => { void replacePack(); });
-watch(() => props.activity, (activity) => renderer?.setBaseAction(semanticIdForActivity(activity)));
+watch([() => props.activity, () => props.dragging], syncBaseAction);
+watch([() => props.interactive, () => props.dragging], ([interactive, dragging]) => {
+  if (!interactive || dragging) clearLook();
+}, { flush: 'sync' });
 watch(() => props.paused, syncAnimation);
 watch(() => props.reducedMotion, syncQuality);
 
@@ -196,12 +208,13 @@ onMounted(() => {
     onState: acceptRenderState,
   });
   motionPreference = window.matchMedia('(prefers-reduced-motion: reduce)');
-  renderer.setBaseAction(semanticIdForActivity(props.activity));
+  syncBaseAction();
   syncQuality();
   resizeObserver = new ResizeObserver(resize);
   resizeObserver.observe(stage);
   document.addEventListener('visibilitychange', syncAnimation);
   window.addEventListener('resize', resize);
+  window.addEventListener('blur', clearLook);
   motionPreference.addEventListener('change', syncQuality);
   syncAnimation();
   if (window.petDesktop?.role === 'pet') {
@@ -220,6 +233,7 @@ onBeforeUnmount(() => {
   resizeObserver?.disconnect();
   document.removeEventListener('visibilitychange', syncAnimation);
   window.removeEventListener('resize', resize);
+  window.removeEventListener('blur', clearLook);
   motionPreference?.removeEventListener('change', syncQuality);
   renderer?.destroy();
   renderer = null;
@@ -229,7 +243,7 @@ onBeforeUnmount(() => {
 <template>
   <div class="pet-visual" :data-load-state="loadState">
     <div ref="surface" class="pet-stage" aria-label="角色动画" @click="onClick"
-      @pointermove="onLook" @pointerleave="clearLook"></div>
+      @pointermove="onLook" @pointerleave="clearLook" @pointercancel="clearLook"></div>
     <div v-if="!hasFrame" class="initial-fallback" aria-hidden="true">
       <PetPortrait :character-id="characterId" :sleeping="activity === 'REST' || activity === 'SLEEP'" :paused="paused" />
     </div>

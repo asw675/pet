@@ -214,15 +214,28 @@ export function reportReadPayload(page: TravelReportsPage | null, snapshot: AppS
 export function reportFactText(fact: TripReportFact): { title: string; text: string } {
   switch (fact.type) {
     case 'GATHER_RESOLVED': return { title: '完成采集', text: `节点 ${fact.payload.nodeId} · ${travelItemLabel(fact.payload.itemId)} × ${fact.payload.quantity} · 经验 +${fact.payload.xp}` };
-    case 'BATTLE_RESOLVED': return {
-      title: fact.payload.outcome === 'WIN' ? '战斗胜利' : '战斗失败',
-      text: `敌人 ${fact.payload.enemyId} · 记录胜率 ${fact.payload.winChanceBps / 100}% · 经验 +${fact.payload.xp} · 金币 +${fact.payload.coins}`
-        + (fact.payload.drop ? ` · 掉落 ${travelItemLabel(fact.payload.drop.itemId)} × ${fact.payload.drop.quantity}` : ' · 无掉落'),
-    };
+    case 'BATTLE_RESOLVED': {
+      const { payload } = fact;
+      const boss = 'battle' in payload && payload.battle.rulesVersion === 'battle-v3' && payload.battle.boss !== null;
+      const encounter = 'battle' in payload
+        ? `敌人 ${payload.battle.enemy.displayName} · ${payload.battle.rounds.length} 回合 · 宠物生命 ${payload.battle.petStartHp} → ${payload.battle.petEndHp}`
+        : `敌人 ${payload.enemyId} · 记录胜率 ${payload.winChanceBps / 100}%`;
+      return { title: `${boss ? '首领' : '战斗'}${payload.outcome === 'WIN' ? '胜利' : '失败'}`,
+        text: `${encounter} · 经验 +${payload.xp} · 金币 +${payload.coins}`
+          + (payload.drop ? ` · 掉落 ${travelItemLabel(payload.drop.itemId)} × ${payload.drop.quantity}` : ' · 无掉落') };
+    }
     case 'EVENT_RESOLVED': return { title: '旅行事件', text: `事件 ${fact.payload.eventDefId} · ${fact.payload.cgId ? `记录 CG ${fact.payload.cgId}` : '未获得 CG'}` };
     case 'RETURNING': return { title: '进入返程', text: returnReasonLabel[fact.payload.reason] };
     case 'TRIP_RETURNED': return { title: '已归家结算', text: returnReasonLabel[fact.payload.reason] };
   }
+}
+
+export const battleSkillLabel = {
+  STARFLARE: '星辉爆发', KEEN_SHOT: '先机精射', MECHANICAL_GUARD: '机巧护防', GUARDIAN_FRENZY: '守护者狂暴',
+} as const;
+
+export function battleActionSkills(action: { actor: 'PET' | 'ENEMY'; readonly skills?: readonly (keyof typeof battleSkillLabel)[] }): string {
+  return action.skills?.length ? ` · ${action.skills.map(skill => battleSkillLabel[skill]).join('、')}` : '';
 }
 export function rewardLabel(reward: TripReport['rewards'][number]): string {
   switch (reward.kind) {

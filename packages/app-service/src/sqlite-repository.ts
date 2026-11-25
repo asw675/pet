@@ -4,7 +4,7 @@ import {
 } from '@pet-desktop/contracts';
 import type { CgAssetRef, DomainEvent } from '@pet-desktop/contracts';
 import type { EquipmentSlot } from '@pet-desktop/contracts/inventory';
-import { travelReportsQuerySchema } from '@pet-desktop/contracts/travel';
+import { battleFactPayloadSchema, travelReportsQuerySchema } from '@pet-desktop/contracts/travel';
 import type { TripDepartureLoadout, TravelReportsQuery } from '@pet-desktop/contracts/travel';
 import { eventListQuerySchema } from '@pet-desktop/contracts/events';
 import type { EventListQuery, EventReward } from '@pet-desktop/contracts/events';
@@ -15,7 +15,8 @@ import { AI_STATE_MIGRATION_SQL, AiStateStorage } from '#ai-state-storage';
 import { WORKSPACE_MIGRATION_SQL, WorkspaceStorage } from '#workspace-storage';
 import { VOICE_PROFILE_MIGRATION_SQL, VoiceProfileStorage } from '#voice-profile-storage';
 import { HOST_PREFERENCES_MIGRATION_SQL, HostPreferenceStorage } from '#host-preference-storage';
-import { advanceTrip, MAX_TRIP_FACTS, MAX_TRIP_NODES } from '@pet-desktop/domain';
+import { advanceTrip, MAX_TRIP_DRAWS, MAX_TRIP_FACTS, MAX_TRIP_NODES, TRIP_ROUND_RULES_VERSION, TRIP_RULES_VERSION,
+  TRIP_SKILL_RULES_VERSION } from '@pet-desktop/domain';
 import type { RewardDraft, TripCheckpoint, TripFact, TripSnapshot } from '@pet-desktop/domain';
 import type {
   AppRepository, AppTransaction, CgUnlock, CgUnlockInput, CommandOutcome, CommandReceipt, CommerceMaterialAmount, CommerceOperationRecord,
@@ -1141,16 +1142,19 @@ function validateRewardDraft(value: unknown): RewardDraft {
 }
 
 function validateSnapshot(value: unknown): TripSnapshot {
-  const snapshot = closed(value, 'trip snapshot', [
+  const data = object(value, 'trip snapshot');
+  const rules = enumeration(data.rulesVersion, 'rules version', [TRIP_RULES_VERSION, TRIP_ROUND_RULES_VERSION, TRIP_SKILL_RULES_VERSION]);
+  const snapshot = closed(data, 'trip snapshot', [
     'tripId', 'petId', 'routeId', 'contentVersion', 'nodes', 'returnDurationMs', 'startAt',
     'expectedReturnAt', 'seed', 'power', 'rulesVersion', 'contentHash',
+    ...(rules !== TRIP_RULES_VERSION ? ['battle'] : []),
   ]);
   id(snapshot.tripId); id(snapshot.petId); id(snapshot.routeId);
   integer(snapshot.contentVersion, 'content version', 1);
   integer(snapshot.returnDurationMs, 'return duration', 1);
   integer(snapshot.startAt, 'start time'); integer(snapshot.expectedReturnAt, 'expected return time');
   integer(snapshot.seed, 'seed', 1, UINT32_MAX); integer(snapshot.power, 'power', 1, 1000);
-  string(snapshot.rulesVersion, 'rules version'); string(snapshot.contentHash, 'content hash');
+  string(snapshot.contentHash, 'content hash');
   const common = ['kind', 'nodeId', 'durationMs'];
   for (const raw of array(snapshot.nodes, 'route nodes', MAX_TRIP_NODES)) {
     const data = object(raw, 'route node');
@@ -1177,21 +1181,24 @@ function validateSnapshot(value: unknown): TripSnapshot {
         break;
     }
   }
-  // Every field and nested discriminator is now checked. The versioned domain
-  // validator additionally checks route bounds, rules version and content hash.
+  // The domain additionally proves route bounds, round-battle pins and hash.
   return snapshot as unknown as TripSnapshot;
 }
 
 function validateCheckpoint(value: unknown): TripCheckpoint {
-  const checkpoint = closed(value, 'trip checkpoint', [
+  const data = object(value, 'trip checkpoint');
+  const hasBattleHp = Object.hasOwn(data, 'battleHp');
+  const checkpoint = closed(data, 'trip checkpoint', [
     'tripId', 'phase', 'nodeIndex', 'rngState', 'drawCount', 'sequence', 'logicalTime',
     'nextDueAt', 'returnReason', 'actualReturnedAt', 'rewardDraft',
+    ...(hasBattleHp ? ['battleHp'] : []),
   ]);
   id(checkpoint.tripId);
   enumeration(checkpoint.phase, 'trip phase', ['OUTBOUND', 'RETURNING', 'COMPLETE']);
   integer(checkpoint.nodeIndex, 'node index', 0, MAX_TRIP_NODES);
   integer(checkpoint.rngState, 'random state', 1, UINT32_MAX);
-  integer(checkpoint.drawCount, 'draw count', 0, MAX_TRIP_NODES * 2);
+  integer(checkpoint.drawCount, 'draw count', 0, hasBattleHp ? MAX_TRIP_DRAWS : MAX_TRIP_NODES * 2);
+  if (hasBattleHp) integer(checkpoint.battleHp, 'battle HP', 0, 1_000_000);
   integer(checkpoint.sequence, 'fact sequence', 0, MAX_TRIP_FACTS);
   integer(checkpoint.logicalTime, 'logical time'); nullableInteger(checkpoint.nextDueAt, 'next due time');
   nullableInteger(checkpoint.actualReturnedAt, 'return time');
@@ -1231,13 +1238,7 @@ function validateFact(value: unknown): TripFact {
       break;
     }
     case 'BATTLE_RESOLVED': {
-      const p = closed(fact.payload, 'battle fact', ['nodeId', 'enemyId', 'outcome', 'winChanceBps', 'xp', 'coins', 'drop']);
-      id(p.nodeId); id(p.enemyId); enumeration(p.outcome, 'battle outcome', ['WIN', 'LOSS']);
-      integer(p.winChanceBps, 'win probability', 0, 10_000); integer(p.xp, 'battle XP'); integer(p.coins, 'battle coins');
-      if (p.drop !== null) {
-        const drop = closed(p.drop, 'battle drop', ['itemId', 'quantity']);
-        id(drop.itemId); integer(drop.quantity, 'drop quantity', 1);
-      }
+      battleFactPayloadSchema.parse(fact.payload);
       break;
     }
     case 'EVENT_RESOLVED': {
@@ -1738,6 +1739,7 @@ class SQLiteTransaction implements AppTransaction {
     const { snapshot: s, checkpoint: c, status } = validateTrip(record);
     if (status !== 'TRAVELING' || c.phase !== 'OUTBOUND' || c.sequence !== 0) throw new Error('New trip must begin outbound');
     const marker = boolean(departureLoadoutRequired, 'departure loadout required') ? s.tripId : null;
+    if (s.rulesVersion !== TRIP_RULES_VERSION && marker === null) throw new Error('Round trip requires a frozen departure loadout');
     db.prepare(`INSERT INTO trips (trip_id, pet_id, route_id, status, seed, snapshot_json, checkpoint_json,
       json_schema_version, start_at, expected_return_at, actual_returned_at, next_due_at, rules_version, cg_pin_schema, departure_loadout_trip_id)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 2, ?)`)
@@ -1749,6 +1751,9 @@ class SQLiteTransaction implements AppTransaction {
     const db = this.db, record = validateTripDepartureLoadoutRecord(value), loadout = record.loadout;
     const trip = this.getTrip(record.tripId);
     if (trip === null || loadout.battlePower !== trip.snapshot.power) throw new Error('Departure loadout contradicts its trip power');
+    if (trip.snapshot.rulesVersion !== TRIP_RULES_VERSION && !sameJson(loadout.stats, trip.snapshot.battle.petStats)) {
+      throw new Error('Departure loadout contradicts its trip battle stats');
+    }
     const pet = this.getPet(trip.snapshot.petId);
     if (pet === null || pet.presence !== 'HOME' || pet.energy10 < loadout.energyCost10) throw new Error('Departure loadout requires current HOME pet energy');
     db.prepare(`INSERT INTO trip_departure_loadouts (trip_id,command_id,route_catalog_version,item_catalog_version,level,
@@ -1764,6 +1769,7 @@ class SQLiteTransaction implements AppTransaction {
 
   getTripDepartureLoadout(tripId: string): TripDepartureLoadout | null {
     const db = this.db, key = id(tripId), value = db.prepare(`SELECT l.*,t.departure_loadout_trip_id AS required_trip_id,
+      t.rules_version AS trip_rules_version, json_extract(t.snapshot_json,'$.battle.petStats') AS trip_battle_stats,
       json_extract(t.snapshot_json,'$.power') AS trip_power FROM trip_departure_loadouts l JOIN trips t USING(trip_id) WHERE trip_id=?`).get(key);
     if (value === undefined || value === null) return null;
     const row = object(value,'trip departure loadout row');
@@ -1773,6 +1779,11 @@ class SQLiteTransaction implements AppTransaction {
     id(row.command_id);
     if (row.required_trip_id !== key || battlePower !== integer(row.trip_power,'trip snapshot departure power',1,1000)) {
       throw new Error('Persisted departure loadout contradicts its trip identity or power');
+    }
+    const stats = departureStatsFromRow(row,'stats');
+    if (row.trip_rules_version !== TRIP_RULES_VERSION
+      && !sameJson(stats, parseJson(row.trip_battle_stats, 'trip snapshot battle stats JSON'))) {
+      throw new Error('Persisted departure loadout contradicts its trip battle stats');
     }
     const supplies = db.prepare('SELECT item_id,quantity FROM trip_departure_supplies WHERE trip_id=? ORDER BY item_id').all(key).map(raw => {
       const supply = object(raw,'departure supply row');
@@ -1786,7 +1797,7 @@ class SQLiteTransaction implements AppTransaction {
     });
     return canonicalTripDepartureLoadout({ routeCatalogVersion:integer(row.route_catalog_version,'departure route catalog version',1),
       itemCatalogVersion:integer(row.item_catalog_version,'departure item catalog version',1),level:integer(row.level,'departure level',1,20),
-      energyCost10,supplies,stats:departureStatsFromRow(row,'stats'),battlePower,equipment });
+      energyCost10,supplies,stats,battlePower,equipment });
   }
 
   updateTrip(record: TripRecord): void {
@@ -1827,6 +1838,11 @@ class SQLiteTransaction implements AppTransaction {
     for (const raw of facts) {
       const fact = validateFact(raw);
       if (fact.tripId !== tripId || fact.petId !== trip.snapshot.petId) throw new Error('Trip fact belongs to another trip or pet');
+      if (fact.type === 'BATTLE_RESOLVED') {
+        const expectedVersion = { 'trip-v1': null, 'trip-v2': 'battle-v2', 'trip-v3': 'battle-v3' }[trip.snapshot.rulesVersion];
+        const actualVersion = 'battle' in fact.payload ? fact.payload.battle.rulesVersion : null;
+        if (actualVersion !== expectedVersion) throw new Error('Battle fact contradicts its trip rules version');
+      }
       const existing = previous[fact.sequence - 1];
       if (existing !== undefined) {
         if (!sameJson(existing, fact)) throw new Error('Conflicting trip fact');

@@ -1270,6 +1270,137 @@ describe.skipIf(!supported)('prepared travel and historical reports in actual SQ
   const version = ROUTE_CATALOG_VERSION;
   const payload = (petId, routeId, selectedSupplies = []) => ({ petId, routeId, routeCatalogVersion: version, selectedSupplies });
 
+  it('settles concurrent skilled and legacy trips after a SQLite restart with their original rule and report shapes', () => {
+    const f = fixture();
+    let instance = f.open();
+    const legacy = expectSuccess(f.request(instance.service, f.command('TRIP_START', { petId: 'pet-1', routeId: DEMO_ROUTE.routeId })));
+    const legacyId = legacy.pets.find(pet => pet.petId === 'pet-1').trip.tripId;
+    const intent = payload('pet-2', DEMO_ROUTE.routeId);
+    const quote = readTravelPreview(instance.service, intent);
+    const depart = f.command('TRIP_START_PREPARED', intent, 'round-departure', quote.snapshot.revision);
+    const prepared = expectSuccess(f.request(instance.service, depart));
+    const roundId = prepared.pets.find(pet => pet.petId === intent.petId).trip.tripId;
+    const snapshot = instance.repo.transaction(tx => tx.getTrip(roundId).snapshot);
+    expect(snapshot).toMatchObject({ rulesVersion: 'trip-v3', battle: { petSkill: 'KEEN_SHOT', bossNodeId: null,
+      encounters: [{ nodeId: 'meadow-slime', enemy: { enemyId: 'slime' } }] } });
+    f.advance(initialTime + minutes(8));
+    const active = () => activeTravelIpcResultSchema.parse(instance.service.handleRequest({
+      schemaVersion: 1, requestId: 'active-round', method: 'travel/active', payload: {},
+    })).activeTravel;
+    const before = active();
+    const battle = before.rows.find(row => row.tripId === roundId).facts.find(fact => fact.type === 'BATTLE_RESOLVED');
+    expect(battle.payload.battle).toMatchObject({ rulesVersion: 'battle-v3', petSkill: 'KEEN_SHOT', boss: null,
+      enemy: { enemyId: 'slime' }, petStats: snapshot.battle.petStats });
+    expect(battle.payload.battle.rounds[0].actions).toEqual(expect.arrayContaining([expect.objectContaining({ actor: 'PET', skills: ['KEEN_SHOT'] })]));
+    expect(battle.payload.battle.rounds.length).toBeGreaterThan(0);
+    expect(before.rows.find(row => row.tripId === legacyId).facts[1].payload).toHaveProperty('winChanceBps');
+    instance.close();
+    instance = f.open();
+    expect(active()).toEqual(before);
+    expect(expectSuccess(f.request(instance.service, depart))).toEqual(prepared);
+    f.advance(initialTime + minutes(15));
+    const settled = () => readTravelReports(instance.service).travelReports.rows;
+    const reports = settled();
+    expect(reports).toHaveLength(2);
+    expect(reports.find(row => row.tripId === roundId)).toMatchObject({ rulesVersion: 'trip-v3', facts: expect.arrayContaining([battle]) });
+    expect(reports.find(row => row.tripId === legacyId)).toMatchObject({ rulesVersion: 'trip-v1' });
+    const wallet = instance.service.getSnapshot().walletCoins;
+    instance.close();
+    instance = f.open();
+    expect(settled()).toEqual(reports);
+    expect(instance.service.getSnapshot().walletCoins).toBe(wallet);
+  });
+
+  it('atomically applies Boss defeat recovery at return and does not repeat it after restart', () => {
+    const f = fixture();
+    const petId = 'pet-1';
+    let failReturn = false;
+    let instance = f.open(repo => ({
+      close: () => repo.close(),
+      transaction: action => repo.transaction(tx => action(new Proxy(tx, {
+        get(target, key) {
+          if (key === 'saveHomeSchedule' && failReturn) return schedule => {
+            if (schedule.petId === petId && target.getPet(petId).presence === 'HOME') throw new Error('injected home schedule failure');
+            return target.saveHomeSchedule(schedule);
+          };
+          const value = Reflect.get(target, key);
+          return typeof value === 'function' ? value.bind(target) : value;
+        },
+      }))),
+    }));
+    instance.repo.transaction(tx => {
+      tx.savePet({ ...tx.getPet(petId), xp: cumulativeXpAtLevel(10) });
+      tx.addInventory('ration', 2);
+      tx.addInventory('healing-potion', 1);
+    });
+    const intent = payload(petId, 'starfall-ruins', [{ itemId: 'ration', quantity: 2 }, { itemId: 'healing-potion', quantity: 1 }]);
+    const quote = readTravelPreview(instance.service, intent);
+    const departed = expectSuccess(f.request(instance.service, f.command('TRIP_START_PREPARED', intent, 'ruins-defeat', quote.snapshot.revision)));
+    const tripId = departed.pets.find(pet => pet.petId === petId).trip.tripId;
+    const durable = () => instance.repo.transaction(tx => ({ pet: tx.getPet(petId), trip: tx.getTrip(tripId),
+      settlement: tx.getSettlement(tripId), rewards: tx.listRewards(tripId), facts: tx.listTripFacts(tripId) }));
+    const { snapshot, checkpoint } = durable().trip;
+    const expected = advanceTrip(snapshot, checkpoint, snapshot.expectedReturnAt);
+    expect(expected.checkpoint).toMatchObject({ returnReason: 'DEFEATED', battleHp: 0 });
+    expect(expected.facts.find(fact => fact.type === 'BATTLE_RESOLVED' && fact.payload.battle.boss !== null))
+      .toMatchObject({ type: 'BATTLE_RESOLVED', payload: { enemyId: 'ruins-core-guardian', outcome: 'LOSS', battle: { boss: 'RUINS_GUARDIAN' } } });
+    const arrival = expected.checkpoint.actualReturnedAt;
+    f.advance(arrival - 1);
+    expect(instance.service.getSnapshot().pets.find(pet => pet.petId === petId)).toMatchObject({ presence: 'RETURNING', healthPoints: 100 });
+    const before = durable();
+    failReturn = true;
+    f.advance(arrival);
+    expect(instance.service.handleRequest({ schemaVersion: 1, requestId: 'failed-recovery', method: 'snapshot/get', payload: {} }))
+      .toMatchObject({ ok: false, error: { code: 'INTERNAL_ERROR' } });
+    expect(durable()).toEqual(before);
+    failReturn = false;
+    expect(instance.service.getSnapshot().pets.find(pet => pet.petId === petId))
+      .toMatchObject({ presence: 'HOME', healthStatus: 'RECOVERING', healthPoints: 90 });
+    const after = durable();
+    expect(after.settlement).not.toBeNull();
+    expect(after.rewards.length).toBeGreaterThan(0);
+    instance.close();
+    instance = f.open();
+    expect(instance.service.getSnapshot().pets.find(pet => pet.petId === petId)).toMatchObject({ healthPoints: 90 });
+    expect(durable()).toEqual(after);
+    f.advance(arrival + minutes(60) - 1);
+    expect(instance.service.getSnapshot().pets.find(pet => pet.petId === petId)).toMatchObject({ healthStatus: 'RECOVERING', healthPoints: 99.9 });
+    f.advance(arrival + minutes(60));
+    expect(instance.service.getSnapshot().pets.find(pet => pet.petId === petId)).toMatchObject({ healthStatus: 'NORMAL', healthPoints: 100 });
+  });
+
+  it('commits the existing ruins Boss victory exactly once and preserves its skill history over restart', () => {
+    const f = fixture();
+    let instance = f.open();
+    const petId = 'pet-1';
+    instance.repo.transaction(tx => {
+      tx.savePet({ ...tx.getPet(petId), xp: cumulativeXpAtLevel(15) });
+      tx.addInventory('ration', 2);
+      tx.addInventory('healing-potion', 1);
+    });
+    const intent = payload(petId, 'starfall-ruins', [{ itemId: 'ration', quantity: 2 }, { itemId: 'healing-potion', quantity: 1 }]);
+    const quote = readTravelPreview(instance.service, intent);
+    const started = expectSuccess(f.request(instance.service, f.command('TRIP_START_PREPARED', intent, 'ruins-boss-win', quote.snapshot.revision)));
+    const tripId = started.pets.find(pet => pet.petId === petId).trip.tripId;
+    const frozen = instance.repo.transaction(tx => tx.getTrip(tripId)).snapshot;
+    expect(frozen.battle.bossNodeId).toBe('ruins-core-guardian');
+    instance.close();
+    instance = f.open();
+    f.advance(frozen.expectedReturnAt);
+    const settled = () => readTravelReports(instance.service).travelReports.rows[0];
+    const history = settled();
+    const boss = history.facts.find(fact => fact.payload.enemyId === frozen.battle.bossNodeId);
+    expect(boss).toMatchObject({ type: 'BATTLE_RESOLVED', payload: { outcome: 'WIN', battle: { rulesVersion: 'battle-v3', boss: 'RUINS_GUARDIAN', petSkill: 'STARFLARE' } } });
+    const skills = boss.payload.battle.rounds.flatMap(round => round.actions.flatMap(action => action.skills));
+    expect(skills).toEqual(expect.arrayContaining(['STARFLARE', 'GUARDIAN_FRENZY']));
+    const walletCoins = instance.service.getSnapshot().walletCoins;
+    expect(walletCoins).toBe(220);
+    instance.close();
+    instance = f.open();
+    expect(settled()).toEqual(history);
+    expect(instance.service.getSnapshot().walletCoins).toBe(walletCoins);
+  });
+
   it('prepares and settles all three versioned routes, charges exact supplies, rolls back failures, and freezes complete equipment after it changes away', () => {
     const f = fixture();
     let failDeparture = false;

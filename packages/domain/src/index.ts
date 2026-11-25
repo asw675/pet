@@ -1,3 +1,14 @@
+import { BATTLE_DRAWS_PER_ROUND_V2, MAX_BATTLE_ROUNDS_V2, findBattleEnemyV2, freezeBattleEnemyV2,
+  freezeBattleStatsV2, simulateBattleV2 } from '#battle-v2';
+import type { BattleEnemyV2, BattleReportV2 } from '#battle-v2';
+import { BATTLE_BOSS_V3, BATTLE_SKILLS_V3, battleSkillForProfession, simulateBattleV3 } from '#battle-v3';
+import type { BattleReportV3, BattleSkillV3 } from '#battle-v3';
+import type { CharacterProfession } from './character-catalog.js';
+import type { BattleStats } from '#progression';
+import { drawRandomInt, nextRandomUint32 } from '#trip-random';
+
+export { drawRandomInt, nextRandomUint32 } from '#trip-random';
+
 export type TripStatus = 'TRAVELING' | 'SETTLED';
 export type TripPresence = 'AWAY' | 'RETURNING' | 'HOME';
 export type TripPhase = 'OUTBOUND' | 'RETURNING' | 'COMPLETE';
@@ -56,17 +67,39 @@ export interface CreateTripSnapshotInput {
   readonly route: RouteDefinition;
 }
 
-/** The complete V1 calculation inputs: JSON-only, with no live equipment/route refs. */
-export interface TripSnapshot extends RouteDefinition {
+interface TripSnapshotBase extends RouteDefinition {
   readonly tripId: string;
   readonly petId: string;
   readonly startAt: number;
   readonly expectedReturnAt: number;
   readonly seed: number;
   readonly power: number;
-  readonly rulesVersion: string;
   readonly contentHash: string;
 }
+
+export interface TripSnapshotV1 extends TripSnapshotBase {
+  readonly rulesVersion: typeof TRIP_RULES_VERSION;
+}
+
+interface FrozenTripBattles {
+  readonly petStats: BattleStats;
+  readonly encounters: readonly { readonly nodeId: string; readonly enemy: BattleEnemyV2 }[];
+}
+
+export interface TripSnapshotV2 extends TripSnapshotBase {
+  readonly rulesVersion: typeof TRIP_ROUND_RULES_VERSION;
+  readonly battle: FrozenTripBattles;
+}
+
+export interface TripSnapshotV3 extends TripSnapshotBase {
+  readonly rulesVersion: typeof TRIP_SKILL_RULES_VERSION;
+  readonly battle: FrozenTripBattles & { readonly petSkill: BattleSkillV3; readonly bossNodeId: string | null };
+}
+
+type RoundTripSnapshot = TripSnapshotV2 | TripSnapshotV3;
+
+/** JSON-only departure inputs with no live equipment, enemy or route references. */
+export type TripSnapshot = TripSnapshotV1 | RoundTripSnapshot;
 
 export interface ItemReward {
   readonly itemId: string;
@@ -94,6 +127,8 @@ export interface TripCheckpoint {
   readonly returnReason: ReturnReason | null;
   readonly actualReturnedAt: number | null;
   readonly rewardDraft: RewardDraft;
+  /** V2 only. Travel battle HP persists between encounters and is separate from home health. */
+  readonly battleHp?: number;
 }
 
 interface TripFactBase {
@@ -120,11 +155,10 @@ type TripFactDetails = (
       readonly nodeId: string;
       readonly enemyId: string;
       readonly outcome: 'WIN' | 'LOSS';
-      readonly winChanceBps: number;
       readonly xp: number;
       readonly coins: number;
       readonly drop: ItemReward | null;
-    };
+    } & ({ readonly winChanceBps: number } | { readonly battle: BattleReportV2 | BattleReportV3 });
   }
   | {
     readonly type: 'EVENT_RESOLVED';
@@ -165,35 +199,14 @@ export interface TripAdvanceResult {
 
 const UINT32_MAX = 0xffff_ffff;
 
-/** Versioned, deterministic gameplay PRNG. Not suitable for security purposes. */
-export function nextRandomUint32(state: number): number {
-  if (!Number.isInteger(state) || state <= 0 || state > UINT32_MAX) {
-    throw new RangeError('Random state must be a non-zero uint32');
-  }
-
-  let value = state;
-  value ^= value << 13;
-  value ^= value >>> 17;
-  value ^= value << 5;
-  return value >>> 0;
-}
-
-/** V1 uses exactly one draw and modulo mapping (not rejection sampling). */
-export function drawRandomInt(state: number, maxExclusive: number): {
-  readonly state: number;
-  readonly value: number;
-} {
-  if (!Number.isInteger(maxExclusive) || maxExclusive < 1 || maxExclusive > UINT32_MAX + 1) {
-    throw new RangeError('Random bound must be an integer in [1, 2^32]');
-  }
-  const next = nextRandomUint32(state);
-  return { state: next, value: next % maxExclusive };
-}
-
 export const TRIP_RULES_VERSION = 'trip-v1';
+export const TRIP_ROUND_RULES_VERSION = 'trip-v2';
+export const TRIP_SKILL_RULES_VERSION = 'trip-v3';
+export const TRIP_ROUND_DEFEAT_HEALTH_COST10 = 100;
 export const MAX_TRIP_NODES = 12;
-/** V1 emits one fact per node plus entering return and arriving home. */
+/** Both versions emit one fact per node plus entering return and arriving home. */
 export const MAX_TRIP_FACTS = MAX_TRIP_NODES + 2;
+export const MAX_TRIP_DRAWS = MAX_TRIP_NODES * (MAX_BATTLE_ROUNDS_V2 * BATTLE_DRAWS_PER_ROUND_V2 + 1);
 const MAX_TRIP_DURATION_MS = 7 * 24 * 60 * 60 * 1_000;
 const MAX_POWER = 1_000;
 const MAX_REWARD = 1_000_000;
@@ -281,7 +294,7 @@ function copyNode(node: RouteNode): RouteNode {
 
 /** A non-cryptographic content fingerprint of an explicit, versioned field order. */
 function routeContentHash(route: RouteDefinition): string {
-  const data = JSON.stringify([route.routeId, route.contentVersion, route.returnDurationMs,
+  return fingerprint([route.routeId, route.contentVersion, route.returnDurationMs,
     route.nodes.map((node) => {
       const base = [node.kind, node.nodeId, node.durationMs];
       switch (node.kind) {
@@ -294,6 +307,10 @@ function routeContentHash(route: RouteDefinition): string {
           return [...base, node.eventDefId, node.cgId, node.chanceBps];
       }
     })]);
+}
+
+function fingerprint(value: unknown): string {
+  const data = JSON.stringify(value);
   let hash = 0x811c9dc5;
   for (let index = 0; index < data.length; index++) {
     hash = Math.imul(hash ^ data.charCodeAt(index), 0x01000193) >>> 0;
@@ -302,7 +319,7 @@ function routeContentHash(route: RouteDefinition): string {
 }
 
 /** Copy and freeze every V1 input at departure; the caller supplies time, ID and seed. */
-export function createTripSnapshot(input: CreateTripSnapshotInput): TripSnapshot {
+export function createTripSnapshot(input: CreateTripSnapshotInput): TripSnapshotV1 {
   assertId(input.tripId, 'tripId', 125); // reserve ":14" for stable fact event IDs
   assertId(input.petId, 'petId');
   assertInteger(input.seed, 1, UINT32_MAX, 'seed');
@@ -328,8 +345,67 @@ export function createTripSnapshot(input: CreateTripSnapshotInput): TripSnapshot
   });
 }
 
+function roundTripContentHash(snapshot: RouteDefinition, battle: FrozenTripBattles): string {
+  const stats = (value: BattleStats) => [value.hp, value.atk, value.def, value.spd, value.luk];
+  return fingerprint([TRIP_ROUND_RULES_VERSION, routeContentHash(snapshot), stats(battle.petStats),
+    battle.encounters.map(({ nodeId, enemy }) => [nodeId, enemy.enemyId, enemy.definitionVersion, enemy.displayName, stats(enemy.stats)])]);
+}
+
+/** Freeze the equipped pet stats and the exact authored enemy for each battle node. */
+export function createRoundTripSnapshot(input: CreateTripSnapshotInput & { readonly petStats: BattleStats }): TripSnapshotV2 {
+  const base = createTripSnapshot(input);
+  const battle = Object.freeze({ petStats: freezeBattleStatsV2(input.petStats),
+    encounters: Object.freeze(base.nodes.filter(node => node.kind === 'BATTLE').map(node => {
+      const enemy = findBattleEnemyV2(node.enemyId);
+      if (!enemy) throw new RangeError(`No round battle enemy is defined for ${node.enemyId}`);
+      return Object.freeze({ nodeId: node.nodeId, enemy });
+    })) });
+  return Object.freeze({ ...base, rulesVersion: TRIP_ROUND_RULES_VERSION, battle, contentHash: roundTripContentHash(base, battle) });
+}
+
+function ruinsBossNode(snapshot: RouteDefinition): string | null {
+  if (snapshot.routeId !== 'starfall-ruins') return null;
+  return snapshot.nodes.find(node => node.kind === 'BATTLE' && node.nodeId === 'ruins-core-guardian'
+    && node.enemyId === 'ruins-core-guardian')?.nodeId ?? null;
+}
+
+function skillTripContentHash(route: RouteDefinition, battle: TripSnapshotV3['battle']): string {
+  return fingerprint([TRIP_SKILL_RULES_VERSION, roundTripContentHash(route, battle), battle.petSkill, battle.bossNodeId]);
+}
+
+export function createSkilledTripSnapshot(input: CreateTripSnapshotInput & { readonly petStats: BattleStats;
+  readonly profession: CharacterProfession }): TripSnapshotV3 {
+  const base = createRoundTripSnapshot(input);
+  const petSkill = battleSkillForProfession(input.profession);
+  if (!BATTLE_SKILLS_V3.includes(petSkill)) throw new RangeError('Unknown battle profession');
+  const battle = Object.freeze({ ...base.battle, petSkill, bossNodeId: ruinsBossNode(base) });
+  return Object.freeze({ ...base, rulesVersion: TRIP_SKILL_RULES_VERSION, battle, contentHash: skillTripContentHash(base, battle) });
+}
+
+function validateFrozenBattles(snapshot: RoundTripSnapshot): void {
+  const { battle } = snapshot;
+  const skilled = snapshot.rulesVersion === TRIP_SKILL_RULES_VERSION;
+  if (!battle || typeof battle !== 'object' || Object.keys(battle).length !== (skilled ? 4 : 2) || !Array.isArray(battle.encounters)) {
+    throw new RangeError('Invalid round battle snapshot shape');
+  }
+  if (skilled && (!BATTLE_SKILLS_V3.includes(snapshot.battle.petSkill) || snapshot.battle.bossNodeId !== ruinsBossNode(snapshot))) {
+    throw new RangeError('Invalid frozen profession skill or Boss node');
+  }
+  freezeBattleStatsV2(battle.petStats);
+  const nodes = snapshot.nodes.filter(node => node.kind === 'BATTLE');
+  if (battle.encounters.length !== nodes.length) throw new RangeError('Snapshot must freeze every battle encounter');
+  for (const [index, node] of nodes.entries()) {
+    const encounter = battle.encounters[index];
+    if (!encounter || typeof encounter !== 'object' || Object.keys(encounter).length !== 2 || encounter.nodeId !== node.nodeId
+      || freezeBattleEnemyV2(encounter.enemy).enemyId !== node.enemyId) {
+      throw new RangeError('Frozen enemy does not match its route node');
+    }
+  }
+}
+
 function validateSnapshot(snapshot: TripSnapshot): void {
-  if (snapshot.rulesVersion !== TRIP_RULES_VERSION) {
+  if (snapshot.rulesVersion !== TRIP_RULES_VERSION && snapshot.rulesVersion !== TRIP_ROUND_RULES_VERSION
+    && snapshot.rulesVersion !== TRIP_SKILL_RULES_VERSION) {
     throw new RangeError('Unsupported trip rules version; do not re-simulate with newer rules');
   }
   assertId(snapshot.tripId, 'tripId', 125);
@@ -338,7 +414,14 @@ function validateSnapshot(snapshot: TripSnapshot): void {
   assertInteger(snapshot.power, 1, MAX_POWER, 'power');
   const duration = getTripDurationMs(snapshot);
   assertInteger(snapshot.startAt, 0, Number.MAX_SAFE_INTEGER - duration, 'startAt');
-  if (snapshot.expectedReturnAt !== snapshot.startAt + duration || snapshot.contentHash !== routeContentHash(snapshot)) {
+  let contentHash: string;
+  if (snapshot.rulesVersion === TRIP_RULES_VERSION) contentHash = routeContentHash(snapshot);
+  else {
+    validateFrozenBattles(snapshot);
+    contentHash = snapshot.rulesVersion === TRIP_SKILL_RULES_VERSION ? skillTripContentHash(snapshot, snapshot.battle)
+      : roundTripContentHash(snapshot, snapshot.battle);
+  }
+  if (snapshot.expectedReturnAt !== snapshot.startAt + duration || snapshot.contentHash !== contentHash) {
     throw new RangeError('Trip snapshot content or timing does not match its frozen version');
   }
 }
@@ -365,7 +448,42 @@ export function createTripCheckpoint(snapshot: TripSnapshot): TripCheckpoint {
     returnReason: null,
     actualReturnedAt: null,
     rewardDraft: EMPTY_REWARDS,
+    ...(snapshot.rulesVersion !== TRIP_RULES_VERSION ? { battleHp: snapshot.battle.petStats.hp } : {}),
   });
+}
+
+function resolveRoundEncounter(snapshot: RoundTripSnapshot, node: BattleNode, petHp: number, rngState: number) {
+  const encounter = snapshot.battle.encounters.find(candidate => candidate.nodeId === node.nodeId);
+  if (!encounter) throw new RangeError('Missing frozen battle encounter');
+  const input = { petStats: snapshot.battle.petStats, petHp, enemy: encounter.enemy, rngState };
+  const battle = snapshot.rulesVersion === TRIP_SKILL_RULES_VERSION ? simulateBattleV3({ ...input,
+    petSkill: snapshot.battle.petSkill, boss: snapshot.battle.bossNodeId === node.nodeId ? BATTLE_BOSS_V3 : null }) : simulateBattleV2(input);
+  // Reserve a drop draw for every resolved encounter, including losses.
+  const drop = drawRandomInt(battle.rngState, BASIS_POINTS);
+  return { ...battle, rngState: drop.state, drawCount: battle.drawCount + 1, dropRoll: drop.value };
+}
+
+/** Rebuild only the bounded RNG/HP cursor from frozen inputs. This never writes facts or rewards. */
+function validateRoundCursor(snapshot: RoundTripSnapshot, checkpoint: TripCheckpoint): void {
+  let rngState = snapshot.seed, drawCount = 0, petHp = snapshot.battle.petStats.hp;
+  let defeated = false;
+  for (const node of snapshot.nodes.slice(0, checkpoint.nodeIndex)) {
+    if (defeated) throw new RangeError('Checkpoint cannot resolve nodes after a defeat');
+    if (node.kind === 'BATTLE') {
+      const battle = resolveRoundEncounter(snapshot, node, petHp, rngState);
+      rngState = battle.rngState;
+      drawCount += battle.drawCount;
+      petHp = battle.report.petEndHp;
+      defeated = battle.report.outcome === 'LOSS';
+    } else {
+      rngState = nextRandomUint32(rngState);
+      drawCount++;
+    }
+  }
+  if (checkpoint.rngState !== rngState || checkpoint.drawCount !== drawCount || checkpoint.battleHp !== petHp
+    || defeated !== (checkpoint.returnReason === 'DEFEATED')) {
+    throw new RangeError('Checkpoint contradicts the frozen round battle cursor');
+  }
 }
 
 function validateCheckpoint(snapshot: TripSnapshot, checkpoint: TripCheckpoint): void {
@@ -379,15 +497,16 @@ function validateCheckpoint(snapshot: TripSnapshot, checkpoint: TripCheckpoint):
     draws += node.kind === 'BATTLE' ? 2 : 1;
     lastNodeAt += node.durationMs;
   }
-  if (checkpoint.drawCount !== draws || checkpoint.logicalTime < lastNodeAt) {
-    throw new RangeError('Checkpoint draw count or logical time contradicts its resolved nodes');
-  }
-  // Verify the persisted random cursor in bounded O(nodes) time. This does not
-  // replay events or grant rewards, and accepts no new seed on restart.
-  let expectedState = snapshot.seed;
-  for (let i = 0; i < draws; i++) expectedState = nextRandomUint32(expectedState);
-  if (checkpoint.rngState !== expectedState) {
-    throw new RangeError('Checkpoint random state contradicts its seed and draw count');
+  if (checkpoint.logicalTime < lastNodeAt) throw new RangeError('Checkpoint logical time contradicts its resolved nodes');
+  if (snapshot.rulesVersion !== TRIP_RULES_VERSION) {
+    validateRoundCursor(snapshot, checkpoint);
+  } else {
+    if (Object.hasOwn(checkpoint, 'battleHp') || checkpoint.drawCount !== draws) {
+      throw new RangeError('Checkpoint draw count contradicts its resolved nodes');
+    }
+    let expectedState = snapshot.seed;
+    for (let i = 0; i < draws; i++) expectedState = nextRandomUint32(expectedState);
+    if (checkpoint.rngState !== expectedState) throw new RangeError('Checkpoint random state contradicts its seed and draw count');
   }
   validateRewards(checkpoint.rewardDraft, checkpoint.nodeIndex);
   const nextNode = snapshot.nodes[checkpoint.nodeIndex];
@@ -534,7 +653,6 @@ function advance(snapshot: TripSnapshot, checkpoint: TripCheckpoint, targetTime:
 
     const node = snapshot.nodes[progress.nodeIndex]!;
     let defeated = false;
-    // Rules V1 fixes draw order and count: gather 1, battle 2 (even on loss), event 1.
     switch (node.kind) {
       case 'GATHER': {
         const quantity = node.minQuantity + draw(node.maxQuantity - node.minQuantity + 1);
@@ -546,10 +664,21 @@ function advance(snapshot: TripSnapshot, checkpoint: TripCheckpoint, targetTime:
         break;
       }
       case 'BATTLE': {
-        // Minimal auto-battle: bounded integer win chance based on frozen power.
-        const winChanceBps = Math.min(9_500, Math.max(500, 5_000 + (snapshot.power - node.enemyPower) * 100));
-        const won = draw(BASIS_POINTS) < winChanceBps;
-        const dropRoll = draw(BASIS_POINTS);
+        let won: boolean, dropRoll: number, detail: { winChanceBps: number } | { battle: BattleReportV2 | BattleReportV3 };
+        if (snapshot.rulesVersion !== TRIP_RULES_VERSION) {
+          const battle = resolveRoundEncounter(snapshot, node, progress.battleHp!, progress.rngState);
+          progress = { ...progress, battleHp: battle.report.petEndHp, rngState: battle.rngState,
+            drawCount: progress.drawCount + battle.drawCount };
+          won = battle.report.outcome === 'WIN';
+          dropRoll = battle.dropRoll;
+          detail = { battle: battle.report };
+        } else {
+          // V1 always consumes two draws (including the possible drop on a loss).
+          const winChanceBps = Math.min(9_500, Math.max(500, 5_000 + (snapshot.power - node.enemyPower) * 100));
+          won = draw(BASIS_POINTS) < winChanceBps;
+          dropRoll = draw(BASIS_POINTS);
+          detail = { winChanceBps };
+        }
         const drop = won && node.drop !== null && dropRoll < node.drop.chanceBps
           ? Object.freeze({ itemId: node.drop.itemId, quantity: node.drop.quantity }) : null;
         const xp = won ? node.winXp : node.lossXp;
@@ -557,7 +686,7 @@ function advance(snapshot: TripSnapshot, checkpoint: TripCheckpoint, targetTime:
         progress = { ...progress, rewardDraft: addRewards(progress.rewardDraft, xp, coins, drop) };
         append(at, { type: 'BATTLE_RESOLVED', payload: {
           nodeId: node.nodeId, enemyId: node.enemyId, outcome: won ? 'WIN' : 'LOSS',
-          winChanceBps, xp, coins, drop,
+          ...detail, xp, coins, drop,
         } });
         defeated = !won;
         break;

@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { describe, expect, it } from 'vitest';
-import { advanceTrip, createTripCheckpoint, createTripSnapshot, DEMO_ROUTE } from '@pet-desktop/domain';
+import { advanceTrip, createRoundTripSnapshot, createTripCheckpoint, createTripSnapshot, DEMO_ROUTE } from '@pet-desktop/domain';
 import { MIGRATION_001, MIGRATION_002, MIGRATION_003, MIGRATION_004, MIGRATION_005, MIGRATION_006, MIGRATION_007, SQLiteRepository, SCHEMA_VERSION } from '../src/sqlite-repository.ts';
 import { AI_STATE_MIGRATION_SQL, AiStateStorage } from '../src/ai-state-storage.ts';
 import { WORKSPACE_MIGRATION_SQL, WorkspaceStorage } from '../src/workspace-storage.ts';
@@ -1290,6 +1290,37 @@ describe('SQLite repository — departure authority and immutable history',()=>{
     tx.savePet(pet());tx.savePreferences(preferences());tx.addInventory('ration',3);tx.addInventory('herb',1);
     if(gearEnabled){tx.insertItemInstance(weapon);tx.insertItemInstance(armor);tx.equipItem(binding);tx.equipItem(armorBinding);}
   });
+
+  it('reopens a frozen trip-v2 snapshot and preserves battle-v2 facts after adding trip-v3',()=>withFile(path=>{
+    const open = () => new SQLiteRepository(new DatabaseSync(path), { persistent: true });
+    const loadout = departureLoadout();
+    const snapshot = createRoundTripSnapshot({ tripId: 'trip-round-archive', petId: 'pet-a', startAt: START, seed: 8,
+      power: loadout.battlePower, route: DEMO_ROUTE, petStats: loadout.stats });
+    const trip = { snapshot, checkpoint: createTripCheckpoint(snapshot), status: 'TRAVELING', reportReadAt: null };
+    const record = { tripId: snapshot.tripId, commandId: 'old-prepared-receipt', loadout };
+    const progress = advanceTrip(snapshot, trip.checkpoint, START + 8 * 60_000);
+    expect(progress.facts[1].payload.battle).toMatchObject({ rulesVersion: 'battle-v2', outcome: 'WIN' });
+    const saved = { ...trip, checkpoint: progress.checkpoint };
+    let repo = open();
+    try {
+      seed(repo,false);
+      repo.transaction(tx=>{
+        stageDeparture(tx,trip,record);
+        tx.saveCommandReceipt(departureReceipt(trip,record));
+        tx.appendTripFacts(snapshot.tripId,progress.facts);
+        tx.updateTrip(saved);
+      });
+    } finally { repo.close(); }
+    repo = open();
+    try {
+      const read = repo.transaction(tx=>({ trip: tx.getTrip(snapshot.tripId), facts: tx.listTripFacts(snapshot.tripId),
+        loadout: tx.getTripDepartureLoadout(snapshot.tripId) }));
+      expect(read).toEqual({ trip: saved, facts: progress.facts, loadout });
+      expect(read.facts[1].payload.battle.rounds[0].actions[0]).not.toHaveProperty('skills');
+      expect(advanceTrip(read.trip.snapshot,read.trip.checkpoint,snapshot.expectedReturnAt).checkpoint).toEqual(
+        advanceTrip(snapshot,trip.checkpoint,snapshot.expectedReturnAt).checkpoint);
+    } finally { repo.close(); }
+  }));
 
   it('commits prepared departure, supplies, exact gear and receipt atomically and returns stable canonical loadout',()=>withMemory((repo,db)=>{
     seed(repo);const success=departureReceipt(trip,record);

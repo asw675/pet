@@ -4,7 +4,7 @@ import { RouterLink } from 'vue-router';
 import type { TravelReportsQuery, TripReport } from '@pet-desktop/contracts/travel';
 import { routeName } from '../../shared/presentation';
 import {
-  reportFactText, reportPageOffset, reportReadPayload, reportsQueryKey, returnReasonLabel,
+  battleActionSkills, battleSkillLabel, reportFactText, reportPageOffset, reportReadPayload, reportsQueryKey, returnReasonLabel,
   rewardLabel, suppliesText, travelDuration,
 } from '../../shared/travel-view-policy';
 import { slotLabel, statsText } from '../../shared/inventory-view-policy';
@@ -82,6 +82,7 @@ async function markRead(report: TripReport): Promise<void> {
             <h3>{{ routeName(report.routeId) }} <small>v{{ report.contentVersion }}</small></h3>
             <p class="small muted">{{ report.routeId }} · {{ returnReasonLabel[report.returnReason] }}</p>
             <p class="small muted">实际归来 {{ reportTime(report.actualReturnedAt) }}</p>
+            <p v-if="report.rulesVersion !== 'trip-v1' && report.returnReason === 'DEFEATED'" class="small muted">战斗受挫后在家恢复健康。</p>
           </div>
           <div class="report-actions">
             <span :class="report.readAt === null ? 'subtle-tag' : 'status-pill status-home'">{{ report.readAt === null ? '未读' : '已读' }}</span>
@@ -111,7 +112,7 @@ async function markRead(report: TripReport): Promise<void> {
             </dl>
             <section class="departure-history">
               <h4>出发时冻结的战斗档案</h4>
-              <div class="frozen-power"><span>实际使用的战力</span><strong>{{ report.departurePower }}</strong></div>
+              <div class="frozen-power"><span>出发战力</span><strong>{{ report.departurePower }}</strong></div>
               <template v-if="report.loadout">
                 <dl class="report-dates">
                   <div><dt>出发等级</dt><dd>Lv.{{ report.loadout.level }}</dd></div>
@@ -138,6 +139,22 @@ async function markRead(report: TripReport): Promise<void> {
                   <span class="fact-sequence">{{ fact.sequence }}</span><div>
                     <div class="fact-heading"><strong>{{ reportFactText(fact).title }}</strong><time class="small muted">{{ reportTime(fact.scheduledAt) }}</time></div>
                     <p class="small">{{ reportFactText(fact).text }}</p>
+                    <details v-if="fact.type === 'BATTLE_RESOLVED' && 'battle' in fact.payload" class="battle-rounds">
+                      <summary>查看战斗回合</summary>
+                      <p v-if="fact.payload.battle.rulesVersion === 'battle-v3'" class="small muted">
+                        职业技能 {{ battleSkillLabel[fact.payload.battle.petSkill] }}
+                      </p>
+                      <ol>
+                        <li v-for="round in fact.payload.battle.rounds" :key="round.round">
+                          <p class="small">第 {{ round.round }} 回合 · 宠物生命 {{ round.petHp }} · 敌人生命 {{ round.enemyHp }}</p>
+                          <ul>
+                            <li v-for="action in round.actions" :key="action.actor" class="small muted">
+                              {{ action.actor === 'PET' ? '宠物' : '敌人' }}{{ action.hit ? (action.critical ? '暴击' : '命中') : '未命中' }}<template v-if="action.hit"> · 伤害 {{ action.damage }}</template>{{ battleActionSkills(action) }}
+                            </li>
+                          </ul>
+                        </li>
+                      </ol>
+                    </details>
                     <p v-if="fact.type === 'RETURNING'" class="small muted">计划返程抵达 {{ reportTime(fact.payload.dueAt) }}</p>
                     <span class="fact-identity">{{ fact.eventId }}</span>
                   </div>
@@ -163,6 +180,10 @@ async function markRead(report: TripReport): Promise<void> {
 </template>
 
 <style scoped>
+.battle-rounds { margin: 8px 0; }
+.battle-rounds summary { cursor: pointer; }
+.battle-rounds ol, .battle-rounds ul { padding-inline-start: 22px; }
+.battle-rounds p { margin: 6px 0 2px; }
 .report-toolbar { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 13px; padding: 14px; margin-bottom: 17px; }
 .report-toolbar label { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; color: var(--muted); font-size: 12px; }
 .report-toolbar select { min-width: 0; max-width: 240px; background: #261f27; border: 1px solid var(--border); color: var(--text); border-radius: 7px; padding: 8px; }

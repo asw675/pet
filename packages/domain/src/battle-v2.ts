@@ -1,8 +1,8 @@
-import { drawRandomInt } from '#trip-core';
+import { drawRandomInt } from '#trip-random';
 import { MAX_BATTLE_STAT } from '#progression';
 import type { BattleStats } from '#progression';
 
-/** Gameplay version only. This module is not linked into trip-v1. */
+/** Round evaluator used only for the versioned round-trip path. */
 export const BATTLE_RULES_VERSION = 'battle-v2' as const;
 export const BATTLE_ENEMY_CATALOG_VERSION = 1 as const;
 export const MAX_BATTLE_ROUNDS_V2 = 20;

@@ -6,10 +6,11 @@ import type { AppSnapshot, CharacterCatalogPage, DomainCommand, DomainEvent, Gal
 import type { TravelCatalog, TravelPreview, TravelReportsPage, TravelReportsQuery, TripPreparationPayload } from '@pet-desktop/contracts/travel';
 import type { EventListQuery, EventPage } from '@pet-desktop/contracts/events';
 import {
-  advanceTrip, createTripCheckpoint, createTripSnapshot, DEMO_ROUTE, recallTrip,
+  advanceTrip, createSkilledTripSnapshot, createTripCheckpoint, createTripSnapshot, DEMO_ROUTE, recallTrip,
+  TRIP_ROUND_DEFEAT_HEALTH_COST10, TRIP_RULES_VERSION,
 } from '@pet-desktop/domain';
 import type { RewardDraft, TripAdvanceResult, TripFact } from '@pet-desktop/domain';
-import { CHARACTER_CATALOG_VERSION, evaluateCharacterAcquisition, normalizeCharacterNickname } from '@pet-desktop/domain/character-catalog';
+import { CHARACTER_CATALOG_VERSION, evaluateCharacterAcquisition, findCharacterDefinition, normalizeCharacterNickname } from '@pet-desktop/domain/character-catalog';
 import { advanceHomeState, interactHome } from '@pet-desktop/domain/home-simulation';
 import type { HomeSimulationState } from '@pet-desktop/domain/home-simulation';
 import { ROUTE_CATALOG_VERSION } from '@pet-desktop/domain/route-catalog';
@@ -372,6 +373,10 @@ export class AppService {
         throw new Error('Settlement requires a verified return fact');
       }
       updatedPet = this.settle(state, updated, updatedPet, replayed.rewardDraft, causationId ?? lastFact.eventId);
+      if (updated.snapshot.rulesVersion !== TRIP_RULES_VERSION && updated.checkpoint.returnReason === 'DEFEATED') {
+        updatedPet = { ...updatedPet, healthStatus: 'RECOVERING',
+          healthPoints10: Math.max(0, updatedPet.healthPoints10 - TRIP_ROUND_DEFEAT_HEALTH_COST10) };
+      }
     }
     // A presence transition establishes the new clock boundary. Do not move
     // an away pet's durable home clock to a later polling target before its
@@ -616,10 +621,13 @@ export class AppService {
         // not yet durably saved by its preceding read-only tick before leaving.
         const beforeDeparture = advanceHomeState(readHomeState(tx, pet, at), at);
         const loadout = freezeDepartureLoadout(tx, pet, preview);
-        // Neither equipment changes nor route catalog updates after departure
-        // can affect the already-frozen trip-v1 power/route inputs.
-        const snapshot = createTripSnapshot({ tripId: this.runtime.createId('trip'), petId: pet.petId,
-          power: loadout.battlePower, seed: this.runtime.seed(), startAt: at, route: route.route });
+        const departure = { tripId: this.runtime.createId('trip'), petId: pet.petId,
+          power: loadout.battlePower, seed: this.runtime.seed(), startAt: at, route: route.route };
+        // Known fighters on the prepared path freeze actual stats, skills and enemies.
+        // The legacy intent and unavailable historical templates keep the V1 power rules.
+        const character = findCharacterDefinition(pet.characterId);
+        const snapshot = command.type === 'TRIP_START_PREPARED' && character && loadout.stats !== null
+          ? createSkilledTripSnapshot({ ...departure, petStats: loadout.stats, profession: character.profession }) : createTripSnapshot(departure);
         tx.insertTrip({ snapshot, checkpoint: createTripCheckpoint(snapshot), status: 'TRAVELING', reportReadAt: null }, true);
         for (const supply of loadout.supplies) tx.addInventory(supply.itemId, -supply.quantity);
         tx.insertTripDepartureLoadout({ tripId: snapshot.tripId, commandId: command.commandId, loadout });

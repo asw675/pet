@@ -91,16 +91,114 @@ export const tripDepartureLoadoutSchema = z.strictObject({
 export type TripDepartureLoadout = z.infer<typeof tripDepartureLoadoutSchema>;
 
 const returnReason = z.enum(['COMPLETED', 'RECALLED', 'DEFEATED']);
+const tripRulesVersion = z.enum(['trip-v1', 'trip-v2', 'trip-v3']);
 const factFields = { eventId: z.string().min(1).max(140), tripId: id, petId: id, sequence: positive.max(14), scheduledAt: integer };
 const itemReward = z.strictObject({ itemId: id, quantity: positive });
+const battleSide = z.enum(['PET', 'ENEMY']);
+const battleHp = integer.max(1_000_000);
+const battleAction = z.strictObject({ actor: battleSide, hit: z.boolean(), critical: z.boolean(), damage: battleHp,
+  targetHpBefore: battleHp.min(1), targetHpAfter: battleHp });
+const battleRound = z.strictObject({
+  round: positive.max(20), first: battleSide, petHp: battleHp, enemyHp: battleHp,
+  actions: z.array(battleAction).min(1).max(2),
+});
+const petBattleSkill = z.enum(['STARFLARE', 'KEEN_SHOT', 'MECHANICAL_GUARD']);
+const actionBattleSkill = z.enum([...petBattleSkill.options, 'GUARDIAN_FRENZY']);
+const skilledBattleRound = battleRound.extend({ actions: z.array(battleAction.extend({ skills: z.array(actionBattleSkill).max(2) })).min(1).max(2) });
+const combatantStats = battleStatsSchema.refine(stats => stats.hp > 0, 'Combatant HP must be positive');
+const battleReportFields = {
+  petStats: combatantStats, petStartHp: battleHp.min(1), petEndHp: battleHp,
+  enemy: z.strictObject({ enemyId: id, definitionVersion: positive, displayName: z.string().min(1).max(64)
+    .refine(name => name.trim() !== '' && !/[\p{Cc}\p{Cf}\p{Cs}]/u.test(name)), stats: combatantStats }),
+  enemyEndHp: battleHp, outcome: z.enum(['WIN', 'LOSS']), termination: z.enum(['ENEMY_KO', 'PET_KO', 'ROUND_LIMIT']),
+};
+const battleReport = z.discriminatedUnion('rulesVersion', [
+  z.strictObject({ ...battleReportFields, rulesVersion: z.literal('battle-v2'), rounds: z.array(battleRound).min(1).max(20) }),
+  z.strictObject({ ...battleReportFields, rulesVersion: z.literal('battle-v3'), rounds: z.array(skilledBattleRound).min(1).max(20),
+    petSkill: petBattleSkill, boss: z.literal('RUINS_GUARDIAN').nullable() }),
+]).superRefine((report, ctx) => {
+  let petHp = report.petStartHp, enemyHp = report.enemy.stats.hp;
+  const first = report.petStats.spd >= report.enemy.stats.spd ? 'PET' : 'ENEMY';
+  const reject = (message: string) => ctx.addIssue({ code: 'custom', message });
+  if (petHp > report.petStats.hp) reject('Battle started above the pet maximum HP');
+  if (report.rulesVersion === 'battle-v3' && report.boss !== null && report.enemy.enemyId !== 'ruins-core-guardian') reject('Boss identity differs from enemy');
+  for (const [index, round] of report.rounds.entries()) {
+    if (petHp === 0 || enemyHp === 0 || round.round !== index + 1 || round.first !== first) reject('Invalid battle round order');
+    for (const [position, action] of round.actions.entries()) {
+      const targetHp = action.actor === 'PET' ? enemyHp : petHp;
+      if ((position === 0) !== (action.actor === first) || petHp === 0 || enemyHp === 0
+        || action.targetHpBefore !== targetHp || action.targetHpAfter !== targetHp - action.damage
+        || action.hit !== (action.damage > 0) || (action.critical && !action.hit)) reject('Battle action contradicts turn order or damage');
+      if (report.rulesVersion === 'battle-v3') {
+        const { skills } = report.rounds[index]!.actions[position]!;
+        const applied: z.infer<typeof actionBattleSkill>[] = [];
+        if (action.actor === 'PET') {
+          if (report.petSkill === 'STARFLARE' && round.round % 3 === 0) applied.push('STARFLARE');
+          if (report.petSkill === 'KEEN_SHOT' && round.round === 1) applied.push('KEEN_SHOT');
+        } else {
+          if (report.petSkill === 'MECHANICAL_GUARD' && (round.round - 1) % 3 === 0) applied.push('MECHANICAL_GUARD');
+          if (report.boss === 'RUINS_GUARDIAN' && enemyHp * 2 <= report.enemy.stats.hp) applied.push('GUARDIAN_FRENZY');
+        }
+        if (skills.length !== applied.length || skills.some((skill, i) => skill !== applied[i])) {
+          reject('Battle action skill differs from its round or Boss state');
+        }
+      }
+      if (action.actor === 'PET') enemyHp = action.targetHpAfter;
+      else petHp = action.targetHpAfter;
+    }
+    if (round.petHp !== petHp || round.enemyHp !== enemyHp || (round.actions.length === 1 && petHp > 0 && enemyHp > 0)) {
+      reject('Battle round HP or counterattack is inconsistent');
+    }
+  }
+  const termination = enemyHp === 0 ? 'ENEMY_KO' : petHp === 0 ? 'PET_KO' : 'ROUND_LIMIT';
+  if (report.petEndHp !== petHp || report.enemyEndHp !== enemyHp || report.termination !== termination
+    || report.outcome !== (termination === 'ENEMY_KO' ? 'WIN' : 'LOSS')
+    || (termination === 'ROUND_LIMIT' && report.rounds.length !== 20)) reject('Battle termination contradicts its rounds');
+});
+const battleFactFields = { nodeId: id, enemyId: id, outcome: z.enum(['WIN', 'LOSS']), xp: integer, coins: integer, drop: itemReward.nullable() };
+export const battleFactPayloadSchema = z.union([
+  z.strictObject({ ...battleFactFields, winChanceBps: integer.max(10_000) }),
+  z.strictObject({ ...battleFactFields, battle: battleReport }).refine(({ enemyId, outcome, battle }) =>
+    enemyId === battle.enemy.enemyId && outcome === battle.outcome, 'Battle summary and report disagree'),
+]).refine(payload => payload.outcome === 'WIN' || (payload.coins === 0 && payload.drop === null), 'Losing battle has win rewards');
+
 export const tripReportFactSchema = z.discriminatedUnion('type', [
   z.strictObject({ ...factFields, type: z.literal('GATHER_RESOLVED'), payload: z.strictObject({ nodeId: id, itemId: id, quantity: positive, xp: integer }) }),
-  z.strictObject({ ...factFields, type: z.literal('BATTLE_RESOLVED'), payload: z.strictObject({ nodeId: id, enemyId: id, outcome: z.enum(['WIN', 'LOSS']), winChanceBps: integer.max(10_000), xp: integer, coins: integer, drop: itemReward.nullable() }) }),
+  z.strictObject({ ...factFields, type: z.literal('BATTLE_RESOLVED'), payload: battleFactPayloadSchema }),
   z.strictObject({ ...factFields, type: z.literal('EVENT_RESOLVED'), payload: z.strictObject({ nodeId: id, eventDefId: id, cgId: id.nullable() }) }),
   z.strictObject({ ...factFields, type: z.literal('RETURNING'), payload: z.strictObject({ reason: returnReason, dueAt: integer }) }),
   z.strictObject({ ...factFields, type: z.literal('TRIP_RETURNED'), payload: z.strictObject({ reason: returnReason, actualReturnedAt: integer }) }),
 ]);
 export type TripReportFact = z.infer<typeof tripReportFactSchema>;
+
+function matchingBattleHistory(version: z.infer<typeof tripRulesVersion>, routeId: string, facts: readonly TripReportFact[],
+  petStats?: z.infer<typeof combatantStats>): boolean {
+  let expectedHp = petStats?.hp;
+  let expectedStats = petStats;
+  let expectedSkill: z.infer<typeof petBattleSkill> | undefined;
+  for (const fact of facts) {
+    if (fact.type !== 'BATTLE_RESOLVED') continue;
+    const { payload } = fact;
+    if (!('battle' in payload)) {
+      if (version !== 'trip-v1') return false;
+      continue;
+    }
+    const { battle } = payload;
+    if ((version === 'trip-v2' && battle.rulesVersion !== 'battle-v2') || (version === 'trip-v3' && battle.rulesVersion !== 'battle-v3')
+      || version === 'trip-v1') return false;
+    if (battle.rulesVersion === 'battle-v3') {
+      const isBoss = routeId === 'starfall-ruins' && payload.nodeId === 'ruins-core-guardian' && payload.enemyId === 'ruins-core-guardian';
+      expectedSkill ??= battle.petSkill;
+      if ((battle.boss !== null) !== isBoss || battle.petSkill !== expectedSkill) return false;
+    }
+    const stats = expectedStats ??= battle.petStats;
+    expectedHp ??= stats.hp;
+    if (battle.petStartHp !== expectedHp || !(['hp', 'atk', 'def', 'spd', 'luk'] as const)
+      .every(stat => battle.petStats[stat] === stats[stat])) return false;
+    expectedHp = battle.petEndHp;
+  }
+  return true;
+}
 
 /** Public, exact frozen route plan for an active journey. These authored
  * settings are not future outcomes; no seed, RNG cursor, pending roll or
@@ -118,12 +216,13 @@ export const travelMapNodeSchema = z.discriminatedUnion('kind', [
 export type TravelMapNode = z.infer<typeof travelMapNodeSchema>;
 
 export const activeTravelTripSchema = z.strictObject({
-  tripId: id, petId: id, routeId: id, contentVersion: positive, rulesVersion: id, departurePower: positive.max(1000),
+  tripId: id, petId: id, routeId: id, contentVersion: positive, rulesVersion: tripRulesVersion, departurePower: positive.max(1000),
   startAt: integer, expectedReturnAt: integer, phase: z.enum(['OUTBOUND','RETURNING']), nextDueAt: integer,
   returnReason: returnReason.nullable(), nodeIndex: integer.max(12), returnDurationMs: duration,
   nodes: z.array(travelMapNodeSchema).min(2).max(12), facts: z.array(tripReportFactSchema).max(13),
 }).superRefine((trip, ctx) => {
   const reject = (message: string) => ctx.addIssue({ code: 'custom', message });
+  if (!matchingBattleHistory(trip.rulesVersion, trip.routeId, trip.facts)) reject('Battle history contradicts trip rules or prior HP');
   const nodeIds = new Set(trip.nodes.map(node => node.nodeId));
   const nominalDuration = trip.nodes.reduce((sum,node) => sum + node.durationMs, trip.returnDurationMs);
   if (nodeIds.size !== trip.nodes.length || nominalDuration > 7 * 24 * 60 * 60_000
@@ -193,12 +292,16 @@ const rewardLine = z.strictObject({ kind: z.enum(['XP', 'COIN', 'ITEM', 'CG']), 
  * speculative drops/checkpoints. The report does not depend on the latest
  * pet equipment/catalog or even the route remaining installed. */
 export const tripReportSchema = z.strictObject({
-  tripId: id, petId: id, routeId: id, contentVersion: positive, rulesVersion: id,
+  tripId: id, petId: id, routeId: id, contentVersion: positive, rulesVersion: tripRulesVersion,
   startAt: integer, expectedReturnAt: integer, actualReturnedAt: integer, readAt: integer.nullable(),
   returnReason, departurePower: positive.max(1000), loadout: tripDepartureLoadoutSchema.nullable(),
   facts: z.array(tripReportFactSchema).min(2).max(14), rewards: z.array(rewardLine).max(26),
 }).superRefine((report, ctx) => {
   const reject = (message: string) => ctx.addIssue({ code: 'custom', message });
+  if ((report.rulesVersion !== 'trip-v1' && !report.loadout?.stats)
+    || !matchingBattleHistory(report.rulesVersion, report.routeId, report.facts, report.loadout?.stats ?? undefined)) {
+    reject('Battle history contradicts trip rules or frozen loadout');
+  }
   if (report.startAt >= report.expectedReturnAt || report.startAt >= report.actualReturnedAt
     || (report.readAt !== null && report.readAt < report.actualReturnedAt)
     || (report.loadout !== null && report.loadout.battlePower !== report.departurePower)) reject('Inconsistent report times or frozen power');
@@ -226,7 +329,6 @@ export const tripReportSchema = z.strictObject({
     }
     if (fact.type === 'GATHER_RESOLVED') { add('ITEM', fact.payload.itemId, fact.payload.quantity); add('XP', 'xp', fact.payload.xp); }
     if (fact.type === 'BATTLE_RESOLVED') {
-      if (fact.payload.outcome === 'LOSS' && (fact.payload.coins !== 0 || fact.payload.drop !== null)) reject('Losing battle has win rewards');
       add('XP', 'xp', fact.payload.xp); add('COIN', 'coin', fact.payload.coins);
       if (fact.payload.drop) add('ITEM', fact.payload.drop.itemId, fact.payload.drop.quantity);
     }

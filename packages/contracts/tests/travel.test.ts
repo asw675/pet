@@ -93,6 +93,34 @@ describe('immutable historical departure and report projection', () => {
       [...report.rewards.slice(0, 2), { kind: 'ITEM', targetId: 'herb', amount: 4 }, report.rewards[3]]]) expect(tripReportSchema.safeParse({ ...report, rewards }).success).toBe(false);
     expect(tripReportSchema.safeParse({ ...report, facts: report.facts.map((entry) => entry.type === 'BATTLE_RESOLVED' ? { ...entry, payload: { ...entry.payload, outcome: 'LOSS' } } : entry) }).success).toBe(false);
   });
+  it('accepts a bounded round report only with matching rules, frozen stats, HP and turn order', () => {
+    const { winChanceBps: _legacyProbability, ...payload } = report.facts[1]!.payload as Extract<TripReport['facts'][number], { type: 'BATTLE_RESOLVED' }>['payload'] & { winChanceBps: number };
+    const battle = { rulesVersion: 'battle-v2', petStats: stats, petStartHp: stats.hp, petEndHp: stats.hp,
+      enemy: { enemyId: 'slime', definitionVersion: 1, displayName: '史莱姆', stats: { hp: 12, atk: 9, def: 5, spd: 7, luk: 4 } },
+      enemyEndHp: 0, outcome: 'WIN', termination: 'ENEMY_KO', rounds: [{ round: 1, first: 'PET', petHp: stats.hp, enemyHp: 0,
+        actions: [{ actor: 'PET', hit: true, critical: false, damage: 12, targetHpBefore: 12, targetHpAfter: 0 }] }] };
+    const asReport = (candidate: unknown) => ({ ...report, rulesVersion: 'trip-v2', facts: report.facts.map(entry =>
+      entry.type === 'BATTLE_RESOLVED' ? { ...entry, payload: { ...payload, battle: candidate } } : entry) });
+    const current = asReport(battle);
+    expect(tripReportSchema.safeParse(current).success).toBe(true);
+    expect(tripReportSchema.safeParse({ ...current, rulesVersion: 'trip-v1' }).success).toBe(false);
+    expect(tripReportSchema.safeParse({ ...current, loadout: null }).success).toBe(false);
+    expect(tripReportSchema.safeParse({ ...report, rulesVersion: 'trip-v2' }).success).toBe(false);
+    expect(tripReportSchema.safeParse(asReport({ ...battle, petStats: { ...stats, atk: 99 } })).success).toBe(false);
+    expect(tripReportSchema.safeParse(asReport({ ...battle, rounds: [{ ...battle.rounds[0], first: 'ENEMY' }] })).success).toBe(false);
+    expect(tripReportSchema.safeParse(asReport({ ...battle, rounds: [battle.rounds[0], { ...battle.rounds[0], round: 2 }] })).success).toBe(false);
+
+    const first = battle.rounds[0]!;
+    const firstAction = first.actions[0]!;
+    const withSkills = (skills: string[]) => ({ ...battle, rulesVersion: 'battle-v3', petSkill: 'KEEN_SHOT', boss: null,
+      rounds: [{ ...first, actions: [{ ...firstAction, skills }] }] });
+    const skilledHistory = (candidate: unknown) => ({ ...asReport(candidate), rulesVersion: 'trip-v3' });
+    expect(tripReportSchema.safeParse(skilledHistory(withSkills(['KEEN_SHOT']))).success).toBe(true);
+    expect(tripReportSchema.safeParse(skilledHistory(withSkills([]))).success).toBe(false);
+    expect(tripReportSchema.safeParse(skilledHistory(withSkills(['GUARDIAN_FRENZY']))).success).toBe(false);
+    expect(tripReportSchema.safeParse(skilledHistory({ ...withSkills(['KEEN_SHOT']), boss: 'RUINS_GUARDIAN' })).success).toBe(false);
+    expect(tripReportSchema.safeParse(skilledHistory(battle)).success).toBe(false);
+  });
   it('requires bounded pagination, exact count, stable ordering and pet scope', () => {
     const page = { revision: 7, petId: 'pet-1', offset: 0, limit: 10, total: 1, rows: [report] };
     expect(travelReportsPageSchema.parse(page)).toEqual(page);

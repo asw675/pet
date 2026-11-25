@@ -13,6 +13,7 @@
     "./item-catalog": "./src/item-catalog.ts",
     "./commerce-rules": "./src/commerce-rules.ts",
     "./battle-v2": "./src/battle-v2.ts",
+    "./battle-v3": "./src/battle-v3.ts",
     "./route-catalog": "./src/route-catalog.ts",
     "./trip-preparation": "./src/trip-preparation.ts",
     "./event-engine": "./src/event-engine.ts",
@@ -20,7 +21,9 @@
     "./recommendation-engine": "./src/recommendation-engine.ts"
   },
   "imports": {
-    "#trip-core": "./src/index.ts",
+    "#trip-random": "./src/trip-random.ts",
+    "#battle-v2": "./src/battle-v2.ts",
+    "#battle-v3": "./src/battle-v3.ts",
     "#progression": "./src/progression.ts",
     "#item-catalog": "./src/item-catalog.ts",
     "#equipment-rules": "./src/equipment-rules.ts",

@@ -1,13 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import { appSnapshotSchema, domainCommandSchema } from '@pet-desktop/contracts';
 import type { AppSnapshot, PetSnapshot } from '@pet-desktop/contracts';
-import { travelCatalogSchema, travelPreviewSchema, travelReportsPageSchema, tripReportSchema } from '@pet-desktop/contracts/travel';
+import { travelCatalogSchema, travelPreviewSchema, travelReportsPageSchema, tripReportFactSchema, tripReportSchema } from '@pet-desktop/contracts/travel';
 import type { TravelCatalog, TravelPreview, TravelReportsQuery, TravelReportsPage, TripPreparationPayload, TripReport } from '@pet-desktop/contracts/travel';
-import { advanceTrip, createTripCheckpoint, createTripSnapshot, DEMO_ROUTE } from '@pet-desktop/domain';
+import { advanceTrip, createRoundTripSnapshot, createSkilledTripSnapshot, createTripCheckpoint, createTripSnapshot, DEMO_ROUTE } from '@pet-desktop/domain';
 import { ROUTE_CATALOG, ROUTE_CATALOG_VERSION } from '@pet-desktop/domain/route-catalog';
 import { previewTripPreparation } from '@pet-desktop/domain/trip-preparation';
 import {
-  confirmDeparture, createDepartureConfirmation, createTripPreparationPayload, preparationKey, previewMatchesPreparation,
+  battleActionSkills, confirmDeparture, createDepartureConfirmation, createTripPreparationPayload, preparationKey, previewMatchesPreparation,
   reportFactText, reportPageOffset, reportReadPayload, reportsMatchQuery, reportsQueryKey, rewardLabel, suppliesText,
   travelDuration, travelQueryCanAccept, travelReasonText, travelSnapshotsMatch, travelSupplyCount, usableTravelCatalog, usableTravelPreview, usableTravelReports,
 } from '../src/renderer/shared/travel-view-policy';
@@ -222,6 +222,28 @@ const historyPage = travelReportsPageSchema.parse({ revision: snapshot.revision,
 const historyStamp: StampedTravelReports = { generation: GEN, snapshot, query: historyQuery, projection: historyPage };
 
 describe('real settled history, exact pagination and mark-read commands', () => {
+  it('shows the frozen enemy, rounds and combat life for a new battle fact', () => {
+    const frozen = createRoundTripSnapshot({ petId: star.petId, tripId: 'round-trip', startAt: 1_000, seed: 8,
+      power: 30, route: DEMO_ROUTE, petStats: { hp: 75, atk: 22, def: 12, spd: 14, luk: 16 } });
+    const returned = advanceTrip(frozen, createTripCheckpoint(frozen), frozen.expectedReturnAt);
+    const battle = returned.facts.find(fact => fact.type === 'BATTLE_RESOLVED')!;
+    expect(reportFactText(tripReportFactSchema.parse(battle))).toMatchObject({ title: '战斗胜利', text: expect.stringMatching(/晨露史莱姆.*回合.*宠物生命 75 → \d+/u) });
+  });
+
+  it('renders the real Boss and localized skill names from its versioned battle facts', () => {
+    const frozen = createSkilledTripSnapshot({ petId: star.petId, tripId: 'ruins-trip', startAt: 1_000, seed: 8, power: 100,
+      route: ROUTE_CATALOG[2]!.route, profession: 'MAGE', petStats: { hp: 250, atk: 60, def: 30, spd: 55, luk: 21 } });
+    const returned = advanceTrip(frozen, createTripCheckpoint(frozen), frozen.expectedReturnAt);
+    const boss = returned.facts.find(fact => fact.type === 'BATTLE_RESOLVED' && fact.payload.enemyId === 'ruins-core-guardian');
+    if (!boss || boss.type !== 'BATTLE_RESOLVED' || !('battle' in boss.payload) || boss.payload.battle.rulesVersion !== 'battle-v3') {
+      throw new Error('Missing expected Boss fact');
+    }
+    const displayed = reportFactText(tripReportFactSchema.parse(boss));
+    expect(displayed.title).toBe('首领胜利');
+    expect(displayed.text).toContain('遗迹核心守护者');
+    expect(boss.payload.battle.rounds.flatMap(round => round.actions.map(battleActionSkills))).toContain(' · 守护者狂暴');
+  });
+
   it('holds a report page only for the identical filter/offset/limit/generation/revision', () => {
     expect(reportsMatchQuery(historyPage, historyQuery)).toBe(true);
     expect(usableTravelReports(historyStamp, GEN, snapshot, historyQuery)).toBe(historyPage);

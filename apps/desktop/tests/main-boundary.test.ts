@@ -56,6 +56,25 @@ describe('Main window identity and URL boundary', () => {
 });
 
 describe('Main request routing', () => {
+  it('allows gallery queries and CG metadata changes only for the control center', async () => {
+    const query: IpcRequest = { ...getSnapshot, method: 'gallery/list', payload: { filter: 'ALL', offset: 0, limit: 12 } };
+    const favorite = dispatch({ ...common, type: 'CG_SET_FAVORITE', payload: { petId: 'pet-a', cgId: 'morning-dew', variant: 'default', favorite: true } });
+    const forwardGallery = vi.fn(async (request: IpcRequest): Promise<IpcResult> => ({ schemaVersion: 1, ok: true,
+      requestId: request.requestId, snapshot, gallery: { revision: snapshot.revision, rows: [], total: 0, offset: 0, limit: 12 } }));
+    await expect(routeRequest(pet, sender(pet), [query], forwardGallery, 1)).resolves.toMatchObject({ ok: false, error: { code: 'FORBIDDEN' } });
+    await expect(routeRequest(pet, sender(pet), [favorite], forwardGallery, 1)).resolves.toMatchObject({ ok: false, error: { code: 'FORBIDDEN' } });
+    expect(forwardGallery).not.toHaveBeenCalled();
+    await expect(routeRequest(center, sender(center), [query], forwardGallery, undefined)).resolves.toMatchObject({ ok: true, gallery: { total: 0 } });
+    await expect(routeRequest(center, sender(center), [favorite], relay(), undefined)).resolves.toMatchObject({ ok: true });
+  });
+
+  it('rejects a valid request ID paired with a success result for the wrong method', async () => {
+    const query: IpcRequest = { ...getSnapshot, method: 'gallery/list', payload: { filter: 'ALL', offset: 0, limit: 12 } };
+    await expect(routeRequest(center, sender(center), [query], relay(), undefined)).resolves.toMatchObject({ ok: false, error: { code: 'INTERNAL_ERROR' } });
+    const unsolicitedGallery = vi.fn(async (request: IpcRequest): Promise<IpcResult> => ({ schemaVersion: 1, ok: true,
+      requestId: request.requestId, snapshot, gallery: { revision: snapshot.revision, rows: [], total: 0, offset: 0, limit: 12 } }));
+    await expect(routeRequest(center, sender(center), [getSnapshot], unsolicitedGallery, undefined)).resolves.toMatchObject({ ok: false, error: { code: 'INTERNAL_ERROR' } });
+  });
   it('never forwards requests from an unregistered sender, child frame or mismatched URL', async () => {
     const forward = relay();
     for (const [binding, context] of [

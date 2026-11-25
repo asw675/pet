@@ -1,12 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import { CONTRACT_SCHEMA_VERSION, ipcResultSchema } from '@pet-desktop/contracts';
-import type { AppSnapshot, DomainCommand, DomainEvent } from '@pet-desktop/contracts';
+import type { AppSnapshot, DomainCommand, DomainEvent, GalleryPage, GalleryQuery } from '@pet-desktop/contracts';
 import { DEMO_ROUTE } from '@pet-desktop/domain';
+import { findBuiltinCg } from '@pet-desktop/domain/cg-catalog';
 import type { TripFact } from '@pet-desktop/domain';
 import { AppService } from '../src/app-service.js';
 import type {
-  AppRepository, AppRuntime, AppTransaction, CgUnlock, CommandOutcome, CommandReceipt,
-  InventoryItem, OutboxRecord, PetRecord, PreferencesRecord, RewardLine, SettlementRecord, TripRecord,
+  AppRepository, AppRuntime, AppTransaction, CgUnlock, CgUnlockInput, CommandOutcome, CommandReceipt,
+  InventoryItem, OutboxRecord, PetRecord, PreferencesRecord, RewardLine, SettlementRecord, TripCgAssetPin, TripRecord,
 } from '../src/ports.js';
 
 const MINUTE = 60_000;
@@ -27,13 +28,14 @@ interface MemoryState {
   wallet: number;
   inventory: InventoryItem[];
   cgs: CgUnlock[];
+  cgPins: TripCgAssetPin[];
   receipts: CommandReceipt[];
   outbox: OutboxRecord[];
 }
 
 function emptyState(): MemoryState {
   return { preferences: null, pets: [], trips: [], facts: [], settlements: [], rewards: [],
-    wallet: 0, inventory: [], cgs: [], receipts: [], outbox: [] };
+    wallet: 0, inventory: [], cgs: [], cgPins: [], receipts: [], outbox: [] };
 }
 
 /** A transactional fake with value semantics, intentionally independent of SQL. */
@@ -110,10 +112,40 @@ class MemoryRepository implements AppRepository, AppTransaction {
     if (existing === undefined) this.state.inventory.push({ itemId, quantity });
     else existing.quantity += quantity;
   }
+  insertTripCgAssetPin(pin: TripCgAssetPin): void {
+    const existing = this.state.cgPins.find((entry) => entry.tripId === pin.tripId && entry.cgId === pin.cgId && entry.variant === pin.variant);
+    if (existing) throw new Error('Duplicate trip CG pin');
+    this.state.cgPins.push(copy(pin));
+  }
+  listTripCgAssetPins(tripId: string): TripCgAssetPin[] { return copy(this.state.cgPins.filter((pin) => pin.tripId === tripId)); }
+  getCgUnlock(petId: string, cgId: string, variant: string): CgUnlock | null {
+    return copy(this.state.cgs.find((cg) => cg.petId === petId && cg.cgId === cgId && cg.variant === variant) ?? null);
+  }
   listCgUnlocks(petId: string): CgUnlock[] { return copy(this.state.cgs.filter((cg) => cg.petId === petId)); }
-  unlockCg(unlock: CgUnlock): boolean {
-    if (this.state.cgs.some((cg) => cg.petId === unlock.petId && cg.cgId === unlock.cgId && cg.variant === unlock.variant)) return false;
-    this.state.cgs.push(copy(unlock));
+  unlockCg(unlock: CgUnlockInput): boolean {
+    if (this.getCgUnlock(unlock.petId, unlock.cgId, unlock.variant) !== null) return false;
+    const pin = this.state.cgPins.find((entry) => entry.tripId === unlock.sourceTripId && entry.petId === unlock.petId
+      && entry.cgId === unlock.cgId && entry.variant === unlock.variant);
+    this.state.cgs.push(copy({ ...unlock, assetRef: pin?.assetRef ?? { state: 'LEGACY_UNVERSIONED' },
+      historicalCharacterId: pin?.characterId ?? null, historicalEventDefId: pin?.eventDefId ?? null,
+      favorite: false, viewedAt: null }));
+    return true;
+  }
+  setCgFavorite(petId: string, cgId: string, variant: string, favorite: boolean): boolean {
+    const existing = this.state.cgs.find((cg) => cg.petId === petId && cg.cgId === cgId && cg.variant === variant);
+    if (!existing) throw new Error('Missing CG');
+    if (existing.favorite === favorite) return false;
+    existing.favorite = favorite;
+    return true;
+  }
+  markCgViewed(petId: string, cgId: string, variant: string, characterId: string, eventDefId: string,
+    assetVersion: string, assetHash: string, viewedAt: number): boolean {
+    const existing = this.state.cgs.find((cg) => cg.petId === petId && cg.cgId === cgId && cg.variant === variant);
+    const ref = existing?.assetRef;
+    if (!existing || ref?.state !== 'PINNED' || ref.characterId !== characterId || ref.eventDefId !== eventDefId
+      || ref.assetVersion !== assetVersion || ref.assetHash !== assetHash) throw new Error('Missing historical CG');
+    if (existing.viewedAt !== null) return false;
+    existing.viewedAt = viewedAt;
     return true;
   }
   getCommandReceipt(commandId: string): CommandReceipt | null {
@@ -162,6 +194,16 @@ function success(outcome: CommandOutcome): AppSnapshot {
 function depart(service: AppService, petId = 'pet-1', id = 'depart-1') {
   const app = success(service.dispatch(command(id, 'TRIP_START', { petId, routeId: DEMO_ROUTE.routeId })));
   return app.pets.find((pet) => pet.petId === petId)!.trip!.tripId;
+}
+
+const galleryQuery: GalleryQuery = { filter: 'ALL', offset: 0, limit: 50 };
+
+function requestGallery(service: AppService, query: GalleryQuery = galleryQuery): { snapshot: AppSnapshot; gallery: GalleryPage } {
+  const result = service.handleRequest({ schemaVersion: 1, requestId: 'gallery-read', method: 'gallery/list', payload: query });
+  expect(ipcResultSchema.safeParse(result).success).toBe(true);
+  if (!result.ok || !('gallery' in result)) throw new Error('Expected revisioned gallery result');
+  expect(result.gallery.revision).toBe(result.snapshot.revision);
+  return { snapshot: result.snapshot, gallery: result.gallery };
 }
 
 describe('application service request boundary', () => {
@@ -472,8 +514,136 @@ describe('deterministic, atomic offline settlement', () => {
     expect(app.pets[0]).toMatchObject({ xp: 48, trip: { tripId: second, status: 'SETTLED' } });
     expect(repo.getWalletCoins()).toBe(16);
     expect(repo.state.rewards.filter((line) => line.kind === 'CG')).toHaveLength(2);
+    const pin = repo.listTripCgAssetPins(first)[0]!;
     expect(repo.listCgUnlocks('pet-1')).toEqual([{ petId: 'pet-1', cgId: 'morning-dew', variant: 'default', sourceTripId: first,
-      unlockedAt: START + 15 * MINUTE }]);
+      unlockedAt: START + 15 * MINUTE, assetRef: pin.assetRef, historicalCharacterId: pin.characterId,
+      historicalEventDefId: pin.eventDefId, favorite: false, viewedAt: null }]);
     expect(repo.state.outbox.filter((entry) => entry.event.type === 'CGUnlocked')).toHaveLength(1);
+  });
+});
+
+describe('historical CG acquisition and gallery projection', () => {
+  it('projects both pets with only locked metadata, has stable pagination, and filters on the authority', () => {
+    const { service } = fixture();
+    const { gallery } = requestGallery(service);
+    expect(gallery.total).toBe(2);
+    expect(gallery.rows.map((row) => [row.petId, row.characterId, row.unlockStatus])).toEqual([
+      ['pet-1', 'star-singer', 'LOCKED'], ['pet-2', 'fluffy-ranger', 'LOCKED'],
+    ]);
+    for (const row of gallery.rows) {
+      expect(Object.keys(row).sort()).toEqual([
+        'petId', 'characterId', 'cgId', 'variant', 'title', 'hint', 'routeId', 'eventDefId', 'rarity', 'unlockStatus',
+      ].sort());
+    }
+    expect(requestGallery(service, { ...galleryQuery, offset: 1, limit: 1 }).gallery.rows).toEqual([gallery.rows[1]]);
+    expect(requestGallery(service, { ...galleryQuery, offset: 2, limit: 1 }).gallery.rows).toEqual([]);
+    expect(requestGallery(service, { ...galleryQuery, petId: 'pet-2', characterId: 'fluffy-ranger', filter: 'LOCKED',
+      routeId: DEMO_ROUTE.routeId, eventDefId: 'dew-postcard', rarity: 'COMMON' }).gallery.rows).toEqual([gallery.rows[1]]);
+    expect(requestGallery(service, { ...galleryQuery, petId: 'pet-2', characterId: 'star-singer' }).gallery.total).toBe(0);
+    expect(requestGallery(service, { ...galleryQuery, filter: 'FAVORITES' }).gallery.total).toBe(0);
+    expect(service.handleRequest({ schemaVersion: 1, requestId: 'bad-pet', method: 'gallery/list',
+      payload: { ...galleryQuery, petId: 'missing' } })).toMatchObject({ ok: false, error: { code: 'NOT_FOUND' } });
+    expect(service.handleRequest({ schemaVersion: 1, requestId: 'bad-page', method: 'gallery/list',
+      payload: { ...galleryQuery, limit: 51 } })).toMatchObject({ ok: false, error: { code: 'INVALID_REQUEST' } });
+  });
+
+  it('pins the exact CG identity at departure, then settles and queries it at one revision', () => {
+    const { service, repo, runtime } = fixture();
+    const tripId = depart(service);
+    const entry = findBuiltinCg('star-singer', 'morning-dew')!;
+    expect(entry.assetHash).toMatch(/^[0-9a-f]{64}$/u);
+    expect(repo.listTripCgAssetPins(tripId)).toEqual([{
+      tripId, petId: 'pet-1', characterId: 'star-singer', cgId: 'morning-dew', variant: 'default', eventDefId: 'dew-postcard',
+      assetRef: { state: 'PINNED', characterId: 'star-singer', eventDefId: 'dew-postcard', assetVersion: entry.assetVersion, assetHash: entry.assetHash },
+    }]);
+    expect(requestGallery(service).gallery.rows[0]!.unlockStatus).toBe('LOCKED');
+    runtime.at += 15 * MINUTE;
+    // The query catches up the due trip and reflects the authoritative unlock
+    // with exactly the same revision as the snapshot in its response.
+    const result = requestGallery(service, { ...galleryQuery, filter: 'UNLOCKED' });
+    expect(result.snapshot.pets[0]).toMatchObject({ presence: 'HOME', xp: 24 });
+    expect(result.gallery.rows[0]).toMatchObject({ petId: 'pet-1', title: entry.title, hint: entry.hint,
+      sourceTripId: tripId, unlockedAt: START + 15 * MINUTE, favorite: false, viewedAt: null,
+      assetRef: repo.listTripCgAssetPins(tripId)[0]!.assetRef });
+    expect(result.gallery.total).toBe(1);
+    expect(result.gallery.rows[0]).not.toHaveProperty('caption');
+    expect(result.gallery.rows[0]).not.toHaveProperty('image');
+  });
+
+  it('never replaces a missing acquisition version with the current picture', () => {
+    const { service, repo, runtime } = fixture();
+    const tripId = depart(service);
+    // A realistic historical version not bundled in this build, frozen by the
+    // earlier content release. This editing hook exists only in the test fake.
+    const historicalRef = { state: 'PINNED' as const, assetVersion: '0.0.1', assetHash: '1'.repeat(64),
+      characterId: 'star-singer', eventDefId: 'dew-postcard' };
+    repo.state.cgPins[0]!.assetRef = historicalRef;
+    runtime.at += 15 * MINUTE;
+    const row = requestGallery(service, { ...galleryQuery, petId: 'pet-1' }).gallery.rows[0]!;
+    expect(row).toMatchObject({ unlockStatus: 'UNLOCKED', title: '历史纪念画面', rarity: null, sourceTripId: tripId,
+      assetRef: historicalRef });
+    expect(row.title).not.toBe(findBuiltinCg('star-singer', 'morning-dew')!.title);
+    const latest = findBuiltinCg('star-singer', 'morning-dew')!;
+    expect(service.dispatch(command('view-wrong-version', 'CG_MARK_VIEWED', { petId: 'pet-1', cgId: latest.cgId, variant: latest.variant,
+      characterId: latest.characterId, eventDefId: latest.eventDefId, assetVersion: latest.assetVersion, assetHash: latest.assetHash })))
+      .toMatchObject({ ok: false, error: { code: 'BUSINESS_RULE' } });
+    expect(repo.getCgUnlock('pet-1', 'morning-dew', 'default')!.viewedAt).toBeNull();
+  });
+
+  it('preserves unavailable CG unlocks instead of erasing or mapping them to unrelated characters', () => {
+    const { service, repo, runtime } = fixture();
+    repo.savePet({ ...repo.getPet('pet-1')!, characterId: 'unreleased-character' });
+    const tripId = depart(service);
+    expect(repo.listTripCgAssetPins(tripId)[0]).toMatchObject({ characterId: 'unreleased-character',
+      assetRef: { state: 'UNAVAILABLE_AT_DEPARTURE' } });
+    runtime.at += 15 * MINUTE;
+    const result = requestGallery(service, { ...galleryQuery, petId: 'pet-1' });
+    expect(result.snapshot.walletCoins).toBe(8); // missing art cannot alter travel rewards
+    expect(result.gallery.rows).toEqual([expect.objectContaining({ characterId: 'unreleased-character',
+      eventDefId: 'dew-postcard', unlockStatus: 'UNLOCKED', assetRef: { state: 'UNAVAILABLE_AT_DEPARTURE' }, rarity: null })]);
+    const favorite = command('unavailable-fav', 'CG_SET_FAVORITE', { petId: 'pet-1', cgId: 'morning-dew', variant: 'default', favorite: true });
+    expect(service.dispatch(favorite).ok).toBe(true);
+    expect(requestGallery(service, { ...galleryQuery, filter: 'FAVORITES' }).gallery.total).toBe(1);
+    expect(service.dispatch(command('unavailable-view', 'CG_MARK_VIEWED', { petId: 'pet-1', cgId: 'morning-dew', variant: 'default',
+      characterId: 'unreleased-character', eventDefId: 'dew-postcard', assetVersion: '1.0.0', assetHash: 'a'.repeat(64) })))
+      .toMatchObject({ ok: false, error: { code: 'BUSINESS_RULE' } });
+  });
+
+  it('changes favorite and first-view only, with idempotent receipts and authoritative timestamps', () => {
+    const { service, repo, runtime } = fixture();
+    const keys = { petId: 'pet-1', cgId: 'morning-dew', variant: 'default' };
+    expect(service.dispatch(command('locked-fav', 'CG_SET_FAVORITE', { ...keys, favorite: true })))
+      .toMatchObject({ ok: false, error: { code: 'NOT_FOUND' } });
+    const tripId = depart(service);
+    runtime.at += 15 * MINUTE;
+    const original = service.getSnapshot();
+    const rewards = repo.listRewards(tripId);
+    const ref = repo.getCgUnlock(keys.petId, keys.cgId, keys.variant)!.assetRef;
+    if (ref.state !== 'PINNED') throw new Error('Expected built-in CG pin');
+    const viewPayload = { ...keys, characterId: ref.characterId, eventDefId: ref.eventDefId,
+      assetVersion: ref.assetVersion, assetHash: ref.assetHash };
+    expect(service.dispatch(command('other-pet-fav', 'CG_SET_FAVORITE', { ...keys, petId: 'pet-2', favorite: true })))
+      .toMatchObject({ ok: false, error: { code: 'NOT_FOUND' } });
+    expect(service.dispatch(command('wrong-hash', 'CG_MARK_VIEWED', { ...viewPayload, assetHash: 'f'.repeat(64) })))
+      .toMatchObject({ ok: false, error: { code: 'BUSINESS_RULE' } });
+    const favorite = command('favorite', 'CG_SET_FAVORITE', { ...keys, favorite: true });
+    const favorited = success(service.dispatch(favorite));
+    expect(favorited.revision).toBe(original.revision + 1);
+    expect(success(service.dispatch(command('favorite-noop', 'CG_SET_FAVORITE', { ...keys, favorite: true })))).toEqual(favorited);
+    runtime.at += 1_000;
+    const viewedAt = runtime.at;
+    const view = command('view-once', 'CG_MARK_VIEWED', viewPayload, { issuedAt: 0 });
+    const viewed = success(service.dispatch(view));
+    expect(viewed.revision).toBe(favorited.revision + 1);
+    runtime.at += 2_000;
+    expect(success(service.dispatch(command('view-noop', 'CG_MARK_VIEWED', viewPayload)))).toEqual(viewed);
+    expect(success(service.dispatch(favorite))).toEqual(favorited); // original receipt stays immutable
+    expect(success(service.dispatch(view))).toEqual(viewed);
+    expect(repo.getCgUnlock(keys.petId, keys.cgId, keys.variant)).toMatchObject({ favorite: true, viewedAt });
+    expect(requestGallery(service, { ...galleryQuery, filter: 'FAVORITES' }).gallery.rows[0]).toMatchObject({ favorite: true, viewedAt });
+    expect(service.getSnapshot()).toEqual({ ...original, revision: viewed.revision });
+    expect(repo.listRewards(tripId)).toEqual(rewards);
+    expect(repo.state.outbox.filter((record) => record.event.type === 'CGFavoriteChanged')).toHaveLength(1);
+    expect(repo.state.outbox.filter((record) => record.event.type === 'CGViewed')).toHaveLength(1);
   });
 });

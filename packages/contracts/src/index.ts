@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { cgMarkViewedPayloadSchema, cgSetFavoritePayloadSchema, galleryPageSchema, galleryQuerySchema } from '#gallery';
 
 /** Independent from the application, database and game-rule versions. */
 export const CONTRACT_SCHEMA_VERSION = 1 as const;
@@ -135,6 +136,8 @@ export const domainCommandSchema = z.discriminatedUnion('type', [
     type: z.literal('TRIP_REPORT_READ'),
     payload: z.strictObject({ petId: idSchema, tripId: idSchema }),
   }),
+  z.strictObject({ ...commandFields, type: z.literal('CG_SET_FAVORITE'), payload: cgSetFavoritePayloadSchema }),
+  z.strictObject({ ...commandFields, type: z.literal('CG_MARK_VIEWED'), payload: cgMarkViewedPayloadSchema }),
   z.strictObject({
     ...commandFields,
     type: z.literal('APP_SET_MODE'),
@@ -203,23 +206,37 @@ export const ipcRequestSchema = z.discriminatedUnion('method', [
     method: z.literal('command/dispatch'),
     payload: z.strictObject({ command: domainCommandSchema }),
   }),
+  z.strictObject({ ...requestFields, method: z.literal('gallery/list'), payload: galleryQuerySchema }),
 ]);
 export type IpcRequest = z.infer<typeof ipcRequestSchema>;
 
-export const ipcResultSchema = z.discriminatedUnion('ok', [
-  z.strictObject({
-    schemaVersion: z.literal(CONTRACT_SCHEMA_VERSION),
-    ok: z.literal(true),
-    requestId: idSchema,
-    snapshot: appSnapshotSchema,
-  }),
-  z.strictObject({
-    schemaVersion: z.literal(CONTRACT_SCHEMA_VERSION),
-    ok: z.literal(false),
-    error: ipcErrorSchema,
-  }),
-]);
+const snapshotSuccessSchema = z.strictObject({
+  schemaVersion: z.literal(CONTRACT_SCHEMA_VERSION),
+  ok: z.literal(true),
+  requestId: idSchema,
+  snapshot: appSnapshotSchema,
+});
+const errorResultSchema = z.strictObject({
+  schemaVersion: z.literal(CONTRACT_SCHEMA_VERSION),
+  ok: z.literal(false),
+  error: ipcErrorSchema,
+});
+const gallerySuccessSchema = snapshotSuccessSchema.extend({ gallery: galleryPageSchema })
+  .refine((result) => result.gallery.revision === result.snapshot.revision, 'Gallery and snapshot revisions must match');
+
+// Old snapshot and persistent command result shape stays exactly as before.
+// The gallery query has a distinct closed success shape plus the same snapshot.
+export const snapshotIpcResultSchema = z.union([snapshotSuccessSchema, errorResultSchema]);
+export type SnapshotIpcResult = z.infer<typeof snapshotIpcResultSchema>;
+export const galleryIpcResultSchema = z.union([gallerySuccessSchema, errorResultSchema]);
+export type GalleryIpcResult = z.infer<typeof galleryIpcResultSchema>;
+export const ipcResultSchema = z.union([snapshotSuccessSchema, gallerySuccessSchema, errorResultSchema]);
 export type IpcResult = z.infer<typeof ipcResultSchema>;
+
+/** Request correlation includes its method, not merely an equal request ID. */
+export function resultMatchesMethod(method: IpcRequest['method'], result: IpcResult): boolean {
+  return !result.ok || (method === 'gallery/list' ? 'gallery' in result : !('gallery' in result));
+}
 
 /** Explicit renderer-facing API, independent of Electron and transport internals. */
 export interface AppBridge {

@@ -92,6 +92,42 @@ describe('ServiceClient', () => {
   beforeEach(() => { vi.useFakeTimers(); });
   afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); });
 
+  it('correlates a gallery query by ID and method before publishing its snapshot', async () => {
+    const { client, current } = setup();
+    const revisions: number[] = [];
+    client.subscribeSnapshot((view) => revisions.push(view.revision));
+    client.start();
+    const child = current();
+    child.bootstrap(1);
+    const request: IpcRequest = { schemaVersion: 1, requestId: 'gallery', method: 'gallery/list', payload: { filter: 'ALL', offset: 0, limit: 10 } };
+    const list = client.request(request);
+    const galleryResult: IpcResult = { schemaVersion: 1, ok: true, requestId: 'gallery', snapshot: snapshot(2),
+      gallery: { revision: 2, rows: [], total: 0, offset: 0, limit: 10 } };
+    child.message({ kind: 'result', result: galleryResult });
+    expect(await list).toEqual(galleryResult);
+    expect(revisions).toEqual([1, 2]);
+    const wrong = client.request({ ...request, requestId: 'wrong-method' });
+    child.message({ kind: 'result', result: success('wrong-method', 50) });
+    expect(await wrong).toMatchObject({ ok: false, error: { code: 'SERVICE_UNAVAILABLE' } });
+    expect(revisions).toEqual([1, 2]);
+    expect(client.getStatus().stage).not.toBe('READY');
+  });
+
+  it('does not complete bootstrap from a gallery-shaped success result', () => {
+    const { client, current } = setup();
+    const revisions: number[] = [];
+    client.subscribeSnapshot((view) => revisions.push(view.revision));
+    client.start();
+    const child = current();
+    child.ready();
+    const bootstrap = child.messages.at(-1);
+    if (bootstrap?.kind !== 'request') throw new Error('Missing bootstrap');
+    child.message({ kind: 'result', result: { schemaVersion: 1, ok: true, requestId: bootstrap.request.requestId,
+      snapshot: snapshot(5), gallery: { revision: 5, rows: [], total: 0, offset: 0, limit: 10 } } });
+    expect(revisions).toEqual([]);
+    expect(client.getStatus().stage).not.toBe('READY');
+  });
+
   it('initializes once, waits for a valid ready handshake and loads an authoritative snapshot', async () => {
     const { client, current, spawn } = setup();
     const stages: ServiceStatus[] = [];

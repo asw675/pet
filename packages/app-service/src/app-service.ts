@@ -2,7 +2,7 @@ import {
   appSnapshotSchema, CONTRACT_SCHEMA_VERSION, domainCommandSchema, domainEventSchema,
   idSchema, ipcRequestSchema, timestampSchema,
 } from '@pet-desktop/contracts';
-import type { AppSnapshot, DomainCommand, DomainEvent, IpcErrorCode, IpcResult, PetSnapshot } from '@pet-desktop/contracts';
+import type { AppSnapshot, DomainCommand, DomainEvent, GalleryPage, GalleryQuery, IpcErrorCode, IpcResult, PetSnapshot } from '@pet-desktop/contracts';
 import {
   advanceTrip, createTripCheckpoint, createTripSnapshot, DEMO_ROUTE, recallTrip,
 } from '@pet-desktop/domain';
@@ -10,11 +10,12 @@ import type { RewardDraft, TripAdvanceResult, TripFact } from '@pet-desktop/doma
 import type {
   AppRepository, AppRuntime, AppTransaction, CommandOutcome, PetRecord, PreferencesRecord, RewardLine, TripRecord,
 } from './ports.js';
+import { freezeTripCgAssets, projectGallery, TRIP_CG_VARIANT as CG_VARIANT } from '#gallery-service';
 
 const DEPARTURE_ENERGY10 = 150;
-const CG_VARIANT = 'default';
 
 type Failure = Extract<CommandOutcome, { ok: false }>;
+type GalleryOutcome = { ok: true; snapshot: AppSnapshot; gallery: GalleryPage } | Failure;
 
 function failure(code: IpcErrorCode, message: string, retryable = false): Failure {
   return { ok: false, error: { code, message, retryable } };
@@ -436,6 +437,11 @@ export class AppService {
         const snapshot = createTripSnapshot({ tripId: this.runtime.createId('trip'), petId: pet.petId,
           power: pet.power, seed: this.runtime.seed(), startAt: at, route: DEMO_ROUTE });
         tx.insertTrip({ snapshot, checkpoint: createTripCheckpoint(snapshot), status: 'TRAVELING', reportReadAt: null });
+        // Freeze the CG content identity in the same transaction as departure.
+        // The trip snapshot and reward keys intentionally retain their existing
+        // deterministic format; only its eventual first acquisition gains a
+        // separately persisted historical asset reference.
+        for (const pin of freezeTripCgAssets(pet, snapshot)) tx.insertTripCgAssetPin(pin);
         updatePet({ presence: 'AWAY', activity: null, energy10: pet.energy10 - DEPARTURE_ENERGY10 });
         this.event(state, 'TripStarted', snapshot.tripId, command.commandId, at,
           { petId: pet.petId, routeId: snapshot.routeId, expectedReturnAt: snapshot.expectedReturnAt });
@@ -461,6 +467,35 @@ export class AppService {
         }
         return;
       }
+      case 'CG_SET_FAVORITE': {
+        const { cgId, variant, favorite } = command.payload;
+        const unlock = tx.getCgUnlock(pet.petId, cgId, variant);
+        if (unlock === null) return failure('NOT_FOUND', 'The CG has not been unlocked for this pet.');
+        if (unlock.favorite !== favorite) {
+          if (!tx.setCgFavorite(pet.petId, cgId, variant, favorite)) throw new Error('CG favorite update did not commit');
+          this.revise(state);
+          this.event(state, 'CGFavoriteChanged', pet.petId, command.commandId, at, { petId: pet.petId, cgId, variant, favorite });
+        }
+        return;
+      }
+      case 'CG_MARK_VIEWED': {
+        const { cgId, variant, characterId, eventDefId, assetVersion, assetHash } = command.payload;
+        const unlock = tx.getCgUnlock(pet.petId, cgId, variant);
+        if (unlock === null) return failure('NOT_FOUND', 'The CG has not been unlocked for this pet.');
+        const ref = unlock.assetRef;
+        if (ref.state !== 'PINNED' || ref.characterId !== characterId || ref.eventDefId !== eventDefId
+          || ref.assetVersion !== assetVersion || ref.assetHash !== assetHash) {
+          return failure('BUSINESS_RULE', 'The requested image does not match the historical acquisition.');
+        }
+        if (unlock.viewedAt === null) {
+          if (!tx.markCgViewed(pet.petId, cgId, variant, characterId, eventDefId, assetVersion, assetHash, at)) {
+            throw new Error('CG first-view update did not commit');
+          }
+          this.revise(state);
+          this.event(state, 'CGViewed', pet.petId, command.commandId, at, { petId: pet.petId, cgId, variant });
+        }
+        return;
+      }
       default: {
         const exhaustive: never = command;
         return exhaustive;
@@ -475,6 +510,19 @@ export class AppService {
       const state = this.state(tx);
       this.advanceAll(state);
       return this.snapshot(state);
+    });
+  }
+
+  /** Gallery and its revisioned snapshot share one authoritative transaction. */
+  private getGallery(query: GalleryQuery): GalleryOutcome {
+    return this.repository.transaction((tx) => {
+      const state = this.state(tx);
+      this.advanceAll(state);
+      if (query.petId !== undefined && tx.getPet(query.petId) === null) {
+        return failure('NOT_FOUND', 'The pet does not exist.');
+      }
+      const snapshot = this.snapshot(state);
+      return { ok: true, snapshot, gallery: projectGallery(tx, query, snapshot.revision) };
     });
   }
 
@@ -519,6 +567,11 @@ export class AppService {
       if (!parsed.success) return respondError(failure('INVALID_REQUEST', 'Invalid application request.'));
       requestId = parsed.data.requestId;
       if (this.closed) return respondError(unavailable());
+      if (parsed.data.method === 'gallery/list') {
+        const outcome = this.getGallery(parsed.data.payload);
+        return outcome.ok ? { schemaVersion: CONTRACT_SCHEMA_VERSION, ok: true, requestId,
+          snapshot: outcome.snapshot, gallery: outcome.gallery } : respondError(outcome);
+      }
       const outcome = parsed.data.method === 'snapshot/get' ? { ok: true as const, snapshot: this.getSnapshot() }
         : this.dispatch(parsed.data.payload.command);
       return outcome.ok ? { schemaVersion: CONTRACT_SCHEMA_VERSION, ok: true, requestId, snapshot: outcome.snapshot }

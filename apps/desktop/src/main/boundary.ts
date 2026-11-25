@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { idSchema, ipcRequestSchema, ipcResultSchema } from '@pet-desktop/contracts';
+import { idSchema, ipcRequestSchema, ipcResultSchema, resultMatchesMethod } from '@pet-desktop/contracts';
 import type { IpcErrorCode, IpcRequest, IpcResult } from '@pet-desktop/contracts';
 import type { DesktopRole } from '../shared/protocol';
 
@@ -38,6 +38,7 @@ export function authorizeSender(
 
 export function authorizeRequest(binding: WindowBinding, request: IpcRequest, petCommandsAllowed: boolean): boolean {
   if (request.method === 'snapshot/get' || binding.role === 'control-center') return true;
+  if (request.method !== 'command/dispatch') return false;
   const { command } = request.payload;
   return petCommandsAllowed && (command.type === 'PET_INTERACT' || command.type === 'PET_SET_VISIBILITY')
     && command.payload.petId === binding.petId;
@@ -93,7 +94,7 @@ export async function routeRequest(
   try {
     const raw = await relay({ ...parsed.data, requestId: upstreamId });
     const result = ipcResultSchema.safeParse(raw);
-    if (!result.success) return failure(requestId, 'INTERNAL_ERROR');
+    if (!result.success || !resultMatchesMethod(parsed.data.method, result.data)) return failure(requestId, 'INTERNAL_ERROR');
     if (result.data.ok) {
       if (result.data.requestId !== upstreamId) return failure(requestId, 'INTERNAL_ERROR');
       return { ...result.data, requestId };

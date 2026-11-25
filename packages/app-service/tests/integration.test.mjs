@@ -3,8 +3,10 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { AppService } from '../src/app-service.ts';
-import { SQLiteRepository } from '../src/sqlite-repository.ts';
-import { advanceTrip, createTripCheckpoint, DEMO_ROUTE } from '@pet-desktop/domain';
+import { verifyMigrationBackup } from '../src/migration-backup.ts';
+import { MIGRATION_001, SQLiteRepository } from '../src/sqlite-repository.ts';
+import { advanceTrip, createTripCheckpoint, createTripSnapshot, DEMO_ROUTE } from '@pet-desktop/domain';
+import { findBuiltinCg } from '@pet-desktop/domain/cg-catalog';
 
 const initialTime = 1_800_000_000_000;
 const minutes = (n) => n * 60_000;
@@ -33,8 +35,11 @@ function fixture() {
     seed: () => 8,
     createId: (kind) => `${kind}-${++sequence}`,
   };
-  const open = (wrap = (repo) => repo) => {
-    const repo = new SQLiteRepository(new DatabaseSync(dbPath), { persistent: true });
+  const open = (wrap = (repo) => repo, options = {}) => {
+    const connection = new DatabaseSync(dbPath);
+    const { beforeMigration, ...rest } = options;
+    const repo = new SQLiteRepository(connection, { persistent: true, ...rest,
+      ...(beforeMigration ? { beforeMigration: (from, to) => beforeMigration(connection, from, to) } : {}) });
     openRepositories.add(repo);
     const service = new AppService(wrap(repo), runtime);
     return { repo, service, close: () => { service.close(); openRepositories.delete(repo); } };
@@ -59,6 +64,14 @@ function expectSuccess(result) {
   expect(result.ok).toBe(true);
   if (!result.ok) throw new Error(`Unexpected result: ${result.error.code}`);
   return result.snapshot;
+}
+
+function readGallery(service, query = {}) {
+  const result = service.handleRequest({ schemaVersion: 1, requestId: 'gallery-query', method: 'gallery/list',
+    payload: { filter: 'ALL', offset: 0, limit: 50, ...query } });
+  expect(result.ok).toBe(true);
+  expect(result.gallery.revision).toBe(result.snapshot.revision);
+  return result;
 }
 
 describe.skipIf(!supported)('application service + real SQLite persisted integration', () => {
@@ -268,6 +281,108 @@ describe.skipIf(!supported)('application service + real SQLite persisted integra
     const result = instance.service.handleRequest({ schemaVersion: 1, requestId: 'closed-writer', method: 'snapshot/get', payload: {} });
     expect(result).toMatchObject({ ok: false, error: { code: 'SERVICE_UNAVAILABLE', retryable: false, requestId: 'closed-writer' } });
     expect(JSON.stringify(result)).not.toContain('fixture details');
+    instance.close();
+  });
+
+  it('persists departure CG pins, exact first unlock, view/favorite, and no duplicate reward after restart', () => {
+    const f = fixture();
+    let instance = f.open();
+    const petId = 'pet-1';
+    const keys = { petId, cgId: 'morning-dew', variant: 'default' };
+    const locked = readGallery(instance.service, { petId });
+    expect(locked.gallery.rows[0]).toMatchObject({ unlockStatus: 'LOCKED' });
+    expect(locked.gallery.rows[0]).not.toHaveProperty('assetRef');
+    const started = expectSuccess(f.request(instance.service, f.command('TRIP_START', { petId, routeId: DEMO_ROUTE.routeId })));
+    const tripId = started.pets.find((pet) => pet.petId === petId).trip.tripId;
+    const pin = instance.repo.transaction((tx) => tx.listTripCgAssetPins(tripId))[0];
+    const entry = findBuiltinCg('star-singer', 'morning-dew');
+    expect(pin).toMatchObject({ ...keys, characterId: 'star-singer', eventDefId: 'dew-postcard', tripId,
+      assetRef: { state: 'PINNED', assetVersion: entry.assetVersion, assetHash: entry.assetHash } });
+    instance.close();
+
+    f.advance(initialTime + minutes(15));
+    instance = f.open();
+    expect(instance.repo.transaction((tx) => tx.listTripCgAssetPins(tripId))).toEqual([pin]);
+    const settled = readGallery(instance.service, { petId, filter: 'UNLOCKED' });
+    expect(settled.gallery.rows[0]).toMatchObject({ unlockStatus: 'UNLOCKED', assetRef: pin.assetRef, sourceTripId: tripId,
+      unlockedAt: initialTime + minutes(15), favorite: false, viewedAt: null });
+    const ledger = instance.repo.transaction((tx) => tx.listRewards(tripId));
+    f.advance(initialTime + minutes(16));
+    const { characterId, eventDefId, assetVersion, assetHash } = pin.assetRef;
+    const viewCommand = f.command('CG_MARK_VIEWED', { ...keys, characterId, eventDefId, assetVersion, assetHash }, 'view-cg-once');
+    const viewed = expectSuccess(f.request(instance.service, viewCommand));
+    const favoriteCommand = f.command('CG_SET_FAVORITE', { ...keys, favorite: true }, 'favorite-cg-once');
+    const favorited = expectSuccess(f.request(instance.service, favoriteCommand));
+    expect(viewed.revision).toBe(settled.snapshot.revision + 1);
+    expect(favorited.revision).toBe(viewed.revision + 1);
+    expect(favorited).toEqual({ ...settled.snapshot, revision: favorited.revision });
+    instance.close();
+
+    f.advance(initialTime + minutes(17));
+    instance = f.open();
+    const afterRestart = readGallery(instance.service, { petId, filter: 'FAVORITES' });
+    expect(afterRestart.gallery.rows[0]).toMatchObject({ favorite: true, viewedAt: initialTime + minutes(16), assetRef: pin.assetRef });
+    expect(expectSuccess(f.request(instance.service, viewCommand))).toEqual(viewed);
+    expect(expectSuccess(f.request(instance.service, favoriteCommand))).toEqual(favorited);
+    expect(instance.repo.transaction((tx) => tx.listRewards(tripId))).toEqual(ledger);
+    const second = expectSuccess(f.request(instance.service, f.command('TRIP_START', { petId, routeId: DEMO_ROUTE.routeId })));
+    const secondTripId = second.pets.find((pet) => pet.petId === petId).trip.tripId;
+    f.advance(initialTime + minutes(32));
+    const collectedAgain = readGallery(instance.service, { petId });
+    expect(collectedAgain.gallery.rows).toHaveLength(1);
+    expect(collectedAgain.gallery.rows[0]).toEqual(afterRestart.gallery.rows[0]);
+    expect(instance.repo.transaction((tx) => tx.listRewards(secondTripId).filter((line) => line.kind === 'CG'))).toHaveLength(1);
+    expect(instance.repo.transaction((tx) => tx.listOutbox(0, 100).filter((event) => event.event.type === 'CGUnlocked'))).toHaveLength(1);
+    instance.close();
+  });
+
+  it('settles a real v1 in-flight trip through migration without inventing the missing historical asset', () => {
+    const f = fixture();
+    const petId = 'pet-1';
+    const tripId = 'legacy-trip';
+    const snapshot = createTripSnapshot({ tripId, petId, startAt: initialTime, seed: 8, power: 30, route: DEMO_ROUTE });
+    const checkpoint = createTripCheckpoint(snapshot);
+    const db = new DatabaseSync(f.dbPath);
+    try {
+      // A synthetic historical database, independently constructed from the
+      // immutable migration 001 rather than downgrading a newer user save.
+      db.exec(MIGRATION_001);
+      db.prepare('INSERT INTO schema_migrations VALUES (?, ?, ?)').run(1, 'fnv1a32:9d3ced6f', initialTime);
+      db.exec('PRAGMA user_version = 1');
+      db.prepare('INSERT INTO pets VALUES (?, ?, ?, ?)').run(petId, 'star-singer', '星咏', 1);
+      db.prepare('INSERT INTO pet_states VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+        .run(petId, 'AWAY', null, 'CALM', 'NORMAL', 'VISIBLE', 500, 1000, 850, 0);
+      db.prepare('INSERT INTO pet_progression VALUES (?, ?, ?)').run(petId, 30, 0);
+      db.prepare('INSERT INTO preferences VALUES (?, ?, ?, ?, ?, ?)').run(1, 1, initialTime, petId, 0, 0);
+      db.prepare(`INSERT INTO trips (trip_id, pet_id, route_id, status, seed, snapshot_json, checkpoint_json, json_schema_version,
+        start_at, expected_return_at, actual_returned_at, next_due_at, rules_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+        .run(tripId, petId, snapshot.routeId, 'TRAVELING', snapshot.seed, JSON.stringify(snapshot), JSON.stringify(checkpoint),
+          1, snapshot.startAt, snapshot.expectedReturnAt, null, checkpoint.nextDueAt, snapshot.rulesVersion);
+    } finally { db.close(); }
+    let backupInvoked = false;
+    const beforeMigration = (source, from) => {
+      verifyMigrationBackup(source, `${f.dbPath}.v1-test-backup`, from, (filename) => new DatabaseSync(filename, { readOnly: true }));
+      backupInvoked = true;
+    };
+    f.advance(initialTime + minutes(15));
+    let instance = f.open((repo) => repo, { beforeMigration });
+    expect(backupInvoked).toBe(true);
+    expect(instance.repo.transaction((tx) => tx.listTripCgAssetPins(tripId))).toEqual([]);
+    const settled = readGallery(instance.service, { petId });
+    expect(settled.snapshot.walletCoins).toBe(8);
+    expect(settled.gallery.rows).toHaveLength(1);
+    expect(settled.gallery.rows[0]).toMatchObject({ petId, cgId: 'morning-dew', variant: 'default', title: '历史纪念画面',
+      sourceTripId: tripId, unlockStatus: 'UNLOCKED', assetRef: { state: 'LEGACY_UNVERSIONED' }, viewedAt: null });
+    const keys = { petId, cgId: 'morning-dew', variant: 'default' };
+    expectSuccess(f.request(instance.service, f.command('CG_SET_FAVORITE', { ...keys, favorite: true })));
+    const entry = findBuiltinCg('star-singer', 'morning-dew');
+    expect(f.request(instance.service, f.command('CG_MARK_VIEWED', { ...keys, characterId: entry.characterId,
+      eventDefId: entry.eventDefId, assetVersion: entry.assetVersion, assetHash: entry.assetHash })))
+      .toMatchObject({ ok: false, error: { code: 'BUSINESS_RULE' } });
+    instance.close();
+    instance = f.open();
+    expect(readGallery(instance.service, { petId, filter: 'FAVORITES' }).gallery.rows[0]).toMatchObject({ favorite: true,
+      assetRef: { state: 'LEGACY_UNVERSIONED' }, viewedAt: null });
     instance.close();
   });
 });

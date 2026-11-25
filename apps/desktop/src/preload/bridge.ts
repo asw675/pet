@@ -1,12 +1,16 @@
 import {
-  CONTRACT_SCHEMA_VERSION, appSnapshotSchema, ipcRequestSchema, ipcResultSchema,
+  CONTRACT_SCHEMA_VERSION, appSnapshotSchema, galleryIpcResultSchema, ipcRequestSchema,
+  resultMatchesMethod, snapshotIpcResultSchema,
 } from '@pet-desktop/contracts';
-import type { AppSnapshot, DomainCommand, IpcErrorCode, IpcRequest, IpcResult } from '@pet-desktop/contracts';
+import type {
+  AppSnapshot, DomainCommand, GalleryIpcResult, GalleryQuery, IpcErrorCode, IpcRequest,
+  IpcResult, SnapshotIpcResult,
+} from '@pet-desktop/contracts';
 import {
   DESKTOP_IPC, hostActionResultSchema, petVisualReadySchema, serviceStatusSchema,
 } from '../shared/protocol.js';
 import type {
-  ControlCenterBridge, HostActionResult, PetDesktopBridge, PetVisualReady, ServiceStatus,
+  ControlCenterBridge, DesktopBridgeBase, HostActionResult, PetDesktopBridge, PetVisualReady, ServiceStatus,
 } from '../shared/protocol.js';
 
 type InvokeChannel = typeof DESKTOP_IPC.request | typeof DESKTOP_IPC.getStatus
@@ -53,7 +57,7 @@ const publicMessages: Record<IpcErrorCode, string> = {
   INTERNAL_ERROR: 'The application could not complete the operation.',
 };
 
-function failure(requestId: string, code: IpcErrorCode, retryable: boolean): IpcResult {
+function failure(requestId: string, code: IpcErrorCode, retryable: boolean): Extract<IpcResult, { ok: false }> {
   return {
     schemaVersion: CONTRACT_SCHEMA_VERSION,
     ok: false,
@@ -82,35 +86,49 @@ function subscribe<T>(ipc: DesktopIpcPort, channel: PushChannel, schema: Parser<
   return unsubscribe;
 }
 
-function baseBridge(ipc: DesktopIpcPort, requestId: () => string): Omit<ControlCenterBridge, 'role'> {
+/** Request and reply shapes are correlated by both id and closed request method.
+ * In particular a gallery reply must not enter an ordinary snapshot/command API. */
+function sendRequest(ipc: DesktopIpcPort, requestId: () => string, method: 'gallery/list', payload: unknown): Promise<GalleryIpcResult>;
+function sendRequest(ipc: DesktopIpcPort, requestId: () => string, method: Exclude<IpcRequest['method'], 'gallery/list'>, payload: unknown): Promise<SnapshotIpcResult>;
+async function sendRequest(ipc: DesktopIpcPort, requestId: () => string, method: IpcRequest['method'], payload: unknown): Promise<IpcResult> {
+  const id = requestId();
+  const request = parse(ipcRequestSchema, {
+    schemaVersion: CONTRACT_SCHEMA_VERSION, requestId: id, method, payload,
+  });
+  if (request === undefined) return failure(id, 'INVALID_REQUEST', false);
+  try {
+    const response = await ipc.invoke(DESKTOP_IPC.request, request);
+    // Both parsers are strict; the gallery parser additionally checks that the
+    // gallery page and included snapshot use the same authority revision.
+    const result = parse<IpcResult>(method === 'gallery/list' ? galleryIpcResultSchema : snapshotIpcResultSchema, response);
+    if (result === undefined || (result.ok ? result.requestId : result.error.requestId) !== id
+      || !resultMatchesMethod(method, result)) {
+      return failure(id, 'INTERNAL_ERROR', true);
+    }
+    if (result.ok) {
+      if (request.method === 'gallery/list' && 'gallery' in result
+        && (result.gallery.offset !== request.payload.offset || result.gallery.limit !== request.payload.limit)) {
+        return failure(id, 'INTERNAL_ERROR', true);
+      }
+      return result;
+    }
+    // The error code and retryability are contractual; free-text errors are not trusted.
+    return failure(id, result.error.code, result.error.retryable);
+  } catch {
+    return failure(id, 'SERVICE_UNAVAILABLE', true);
+  }
+}
+
+function baseBridge(ipc: DesktopIpcPort, requestId: () => string): DesktopBridgeBase {
   let lastGeneration = 0;
   const observeStatus = (status: ServiceStatus): ServiceStatus => {
     lastGeneration = Math.max(lastGeneration, status.generation);
     return status;
   };
 
-  async function sendRequest(method: IpcRequest['method'], payload: unknown): Promise<IpcResult> {
-    const id = requestId();
-    const request = parse(ipcRequestSchema, {
-      schemaVersion: CONTRACT_SCHEMA_VERSION, requestId: id, method, payload,
-    });
-    if (request === undefined) return failure(id, 'INVALID_REQUEST', false);
-    try {
-      const result = parse(ipcResultSchema, await ipc.invoke(DESKTOP_IPC.request, request));
-      if (result === undefined || (result.ok ? result.requestId : result.error.requestId) !== id) {
-        return failure(id, 'INTERNAL_ERROR', true);
-      }
-      if (result.ok) return result;
-      // The error code and retryability are contractual; free-text errors are not trusted.
-      return failure(id, result.error.code, result.error.retryable);
-    } catch {
-      return failure(id, 'SERVICE_UNAVAILABLE', true);
-    }
-  }
-
   return {
-    getSnapshot: () => sendRequest('snapshot/get', {}),
-    dispatch: (command: DomainCommand) => sendRequest('command/dispatch', { command }),
+    getSnapshot: () => sendRequest(ipc, requestId, 'snapshot/get', {}),
+    dispatch: (command: DomainCommand) => sendRequest(ipc, requestId, 'command/dispatch', { command }),
     subscribeSnapshot: (listener: (snapshot: AppSnapshot) => void) =>
       subscribe(ipc, DESKTOP_IPC.snapshot, appSnapshotSchema, listener),
     async getServiceStatus() {
@@ -159,5 +177,9 @@ export function createPetBridge(ipc: DesktopIpcPort, requestId = newRequestId): 
 }
 
 export function createControlCenterBridge(ipc: DesktopIpcPort, requestId = newRequestId): ControlCenterBridge {
-  return Object.freeze({ role: 'control-center', ...baseBridge(ipc, requestId) });
+  return Object.freeze({
+    role: 'control-center',
+    ...baseBridge(ipc, requestId),
+    listGallery: (query: GalleryQuery) => sendRequest(ipc, requestId, 'gallery/list', query),
+  });
 }

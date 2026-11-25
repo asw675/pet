@@ -145,14 +145,21 @@ async function start() {
   try {
     // Dynamic imports let us report a sanitized fatal startup error even on a
     // Node runtime where the built-in SQLite driver is unavailable.
-    const [{ DatabaseSync }, { SQLiteRepository }, { AppService }] = await Promise.all([
+    const [{ DatabaseSync }, { SQLiteRepository }, { AppService }, { verifyMigrationBackup }] = await Promise.all([
       import('node:sqlite'),
       import('./sqlite-repository.ts'),
       import('./app-service.ts'),
+      import('./migration-backup.ts'),
     ]);
     if (phase !== 'booting') return; // Parent disconnected during module load.
     database = new DatabaseSync(filename, { allowExtension: false });
-    repository = new SQLiteRepository(database, { persistent: true });
+    repository = new SQLiteRepository(database, {
+      persistent: true,
+      beforeMigration: (fromVersion, toVersion) => {
+        const backup = `${filename}.pre-v${fromVersion}-to-v${toVersion}-${randomUUID()}.sqlite3`;
+        verifyMigrationBackup(database, backup, fromVersion, (path) => new DatabaseSync(path, { readOnly: true, allowExtension: false }));
+      },
+    });
     const { version: sqliteVersion } = database.prepare('SELECT sqlite_version() AS version').get();
     service = new AppService(repository, runtime);
     phase = 'ready';

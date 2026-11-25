@@ -45,6 +45,16 @@ describe('app-service utility transport', () => {
   beforeEach(() => { vi.useFakeTimers(); });
   afterEach(() => { vi.useRealTimers(); });
 
+  it('closes the service on a method-mismatched gallery response', () => {
+    const f = fixture();
+    const transport = startUtilityTransport(f.options);
+    transport.receive({ kind: 'request', request: { schemaVersion: 1, requestId: command.requestId,
+      method: 'gallery/list', payload: { filter: 'ALL', offset: 0, limit: 10 } } });
+    expect(f.outputs.at(-1)).toEqual({ kind: 'fatal', code: 'PROTOCOL_ERROR' });
+    expect(f.service.close).toHaveBeenCalledExactlyOnceWith();
+    expect(f.options.exit).toHaveBeenCalledExactlyOnceWith(1);
+  });
+
   it('advertises readiness only after initialization and publishes only changed revisions', () => {
     const f = fixture();
     startUtilityTransport(f.options);

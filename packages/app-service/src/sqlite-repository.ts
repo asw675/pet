@@ -1,19 +1,19 @@
 import {
-  activitySchema, appSnapshotSchema, domainCommandSchema, domainEventSchema, healthStatusSchema,
+  activitySchema, appSnapshotSchema, cgAssetRefSchema, domainCommandSchema, domainEventSchema, healthStatusSchema,
   idSchema, ipcErrorCodeSchema, moodSchema, presenceSchema, visibilitySchema,
 } from '@pet-desktop/contracts';
-import type { DomainEvent } from '@pet-desktop/contracts';
+import type { CgAssetRef, DomainEvent } from '@pet-desktop/contracts';
 import { advanceTrip, MAX_TRIP_FACTS, MAX_TRIP_NODES } from '@pet-desktop/domain';
 import type { RewardDraft, TripCheckpoint, TripFact, TripSnapshot } from '@pet-desktop/domain';
 import type {
-  AppRepository, AppTransaction, CgUnlock, CommandOutcome, CommandReceipt, InventoryItem, OutboxRecord,
-  PetRecord, PreferencesRecord, RewardLine, SettlementRecord, SqliteConnection, TripRecord,
+  AppRepository, AppTransaction, CgUnlock, CgUnlockInput, CommandOutcome, CommandReceipt, InventoryItem, OutboxRecord,
+  PetRecord, PreferencesRecord, RewardLine, SettlementRecord, SqliteConnection, TripCgAssetPin, TripRecord,
 } from './ports.js';
 
 const MAX_SAFE = Number.MAX_SAFE_INTEGER;
 const UINT32_MAX = 0xffff_ffff;
 const BUSY_TIMEOUT_MS = 5_000;
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 const JSON_SCHEMA_VERSION = 1;
 const MIGRATION_001_JSON_SCHEMA_VERSION = 1;
 const MIGRATION_001_MAX_TRIP_FACTS = 14;
@@ -26,7 +26,7 @@ const unsigned = (column: string) => `${column} BETWEEN 0 AND ${MAX_SAFE}`;
 const positive = (column: string) => `${column} BETWEEN 1 AND ${MAX_SAFE}`;
 const jsonObject = (column: string) => `json_valid(${column}) AND json_type(${column}) = 'object'`;
 
-const MIGRATION_001 = `
+export const MIGRATION_001 = `
 CREATE TABLE schema_migrations (
   version INTEGER PRIMARY KEY NOT NULL CHECK (version > 0),
   checksum TEXT NOT NULL,
@@ -172,6 +172,121 @@ CREATE TABLE outbox (
   payload_json TEXT NOT NULL CHECK (${jsonObject('payload_json')})
 ) STRICT;
 `;
+
+// SQL counterparts of the current stable version and digest constraints.
+// Keep these migration-local so future contract edits do not rewrite history.
+const migration002VersionCheck = (column: string): string => {
+  const firstDot = `instr(${column}, '.')`;
+  const suffix = `substr(${column}, ${firstDot} + 1)`;
+  const secondDot = `instr(${suffix}, '.')`;
+  const parts = [`substr(${column}, 1, ${firstDot} - 1)`, `substr(${suffix}, 1, ${secondDot} - 1)`, `substr(${suffix}, ${secondDot} + 1)`];
+  return `length(${column}) BETWEEN 5 AND 17 AND ${column} NOT GLOB '*[^0-9.]*'
+    AND length(${column}) - length(replace(${column}, '.', '')) = 2
+    AND ${parts.map(part => `length(${part}) BETWEEN 1 AND 5 AND CAST(${part} AS INTEGER) BETWEEN 0 AND 65535`).join(' AND ')}
+    AND ${column} = printf('%d.%d.%d', ${parts.map(part => `CAST(${part} AS INTEGER)`).join(', ')})`;
+};
+const migration002HashCheck = (column: string) => `length(${column}) = 64 AND ${column} NOT GLOB '*[^0-9a-f]*'`;
+
+// Existing trips never acquire invented departure metadata. Only newly
+// inserted v2 trips may receive pins; old v1 in-flight trips can complete with
+// an explicit legacy reference. Copy old unlock identities without guessing.
+const MIGRATION_002 = `
+ALTER TABLE trips ADD COLUMN cg_pin_schema INTEGER NOT NULL DEFAULT 1 CHECK (cg_pin_schema IN (1,2));
+CREATE TRIGGER freeze_trip_cg_pin_schema BEFORE UPDATE ON trips
+WHEN OLD.cg_pin_schema IS NOT NEW.cg_pin_schema
+BEGIN SELECT RAISE(ABORT, 'trip CG pin schema is immutable'); END;
+CREATE TRIGGER require_v2_trip_cg_pin_schema BEFORE INSERT ON trips
+WHEN NEW.cg_pin_schema <> 2
+BEGIN SELECT RAISE(ABORT, 'new trip must use CG pin schema 2'); END;
+CREATE TABLE trip_cg_asset_pins (
+  trip_id TEXT NOT NULL,
+  pet_id TEXT NOT NULL,
+  cg_id TEXT NOT NULL CHECK (${idCheck('cg_id')}),
+  variant TEXT NOT NULL CHECK (${idCheck('variant')}),
+  character_id TEXT NOT NULL CHECK (${idCheck('character_id')}),
+  event_def_id TEXT NOT NULL CHECK (${idCheck('event_def_id')}),
+  asset_state TEXT NOT NULL CHECK (asset_state IN ('PINNED','UNAVAILABLE_AT_DEPARTURE')),
+  asset_version TEXT CHECK (${migration002VersionCheck('asset_version')}),
+  asset_hash TEXT CHECK (${migration002HashCheck('asset_hash')}),
+  PRIMARY KEY (trip_id, cg_id, variant),
+  FOREIGN KEY (trip_id, pet_id) REFERENCES trips(trip_id, pet_id),
+  CHECK ((asset_state = 'PINNED' AND asset_version IS NOT NULL AND asset_hash IS NOT NULL)
+    OR (asset_state = 'UNAVAILABLE_AT_DEPARTURE' AND asset_version IS NULL AND asset_hash IS NULL))
+) STRICT;
+CREATE TRIGGER validate_trip_cg_pin BEFORE INSERT ON trip_cg_asset_pins
+WHEN EXISTS (SELECT 1 FROM trip_cg_asset_pins x WHERE x.trip_id=NEW.trip_id AND x.cg_id=NEW.cg_id AND x.variant=NEW.variant)
+  OR NOT EXISTS (
+    SELECT 1 FROM trips t JOIN pets p ON p.pet_id=t.pet_id
+    WHERE t.trip_id=NEW.trip_id AND t.pet_id=NEW.pet_id AND p.character_id=NEW.character_id AND t.cg_pin_schema=2
+      AND t.status='TRAVELING' AND json_extract(t.checkpoint_json,'$.phase')='OUTBOUND'
+      AND json_extract(t.checkpoint_json,'$.sequence')=0 AND json_extract(t.checkpoint_json,'$.logicalTime')=t.start_at
+      AND NOT EXISTS (SELECT 1 FROM trip_events e WHERE e.trip_id=t.trip_id)
+      AND NOT EXISTS (SELECT 1 FROM settlements s WHERE s.trip_id=t.trip_id)
+      AND EXISTS (SELECT 1 FROM json_each(t.snapshot_json,'$.nodes') n WHERE json_extract(n.value,'$.kind')='EVENT'
+        AND json_extract(n.value,'$.cgId')=NEW.cg_id AND json_extract(n.value,'$.eventDefId')=NEW.event_def_id)
+  )
+BEGIN SELECT RAISE(ABORT, 'invalid or duplicate departure CG pin'); END;
+CREATE TRIGGER freeze_trip_cg_pin BEFORE UPDATE ON trip_cg_asset_pins
+BEGIN SELECT RAISE(ABORT, 'departure CG pin is immutable'); END;
+CREATE TRIGGER preserve_trip_cg_pin BEFORE DELETE ON trip_cg_asset_pins
+BEGIN SELECT RAISE(ABORT, 'departure CG pin is immutable'); END;
+ALTER TABLE cg_unlocks RENAME TO cg_unlocks_v1;
+CREATE TABLE cg_unlocks (
+  pet_id TEXT NOT NULL,
+  cg_id TEXT NOT NULL CHECK (${idCheck('cg_id')}),
+  variant TEXT NOT NULL CHECK (${idCheck('variant')}),
+  source_trip_id TEXT NOT NULL REFERENCES settlements(trip_id),
+  unlocked_at INTEGER NOT NULL CHECK (${unsigned('unlocked_at')}),
+  asset_state TEXT NOT NULL CHECK (asset_state IN ('PINNED','LEGACY_UNVERSIONED','UNAVAILABLE_AT_DEPARTURE')),
+  historical_character_id TEXT CHECK (${idCheck('historical_character_id')}),
+  historical_event_def_id TEXT CHECK (${idCheck('historical_event_def_id')}),
+  asset_version TEXT CHECK (${migration002VersionCheck('asset_version')}),
+  asset_hash TEXT CHECK (${migration002HashCheck('asset_hash')}),
+  favorite INTEGER NOT NULL DEFAULT 0 CHECK (favorite IN (0,1)),
+  viewed_at INTEGER CHECK (${unsigned('viewed_at')} AND viewed_at >= unlocked_at),
+  PRIMARY KEY (pet_id, cg_id, variant),
+  FOREIGN KEY (source_trip_id, pet_id) REFERENCES trips(trip_id, pet_id),
+  CHECK ((asset_state='LEGACY_UNVERSIONED' AND historical_character_id IS NULL AND historical_event_def_id IS NULL
+      AND asset_version IS NULL AND asset_hash IS NULL AND viewed_at IS NULL)
+    OR (asset_state='UNAVAILABLE_AT_DEPARTURE' AND historical_character_id IS NOT NULL AND historical_event_def_id IS NOT NULL
+      AND asset_version IS NULL AND asset_hash IS NULL AND viewed_at IS NULL)
+    OR (asset_state='PINNED' AND historical_character_id IS NOT NULL AND historical_event_def_id IS NOT NULL
+      AND asset_version IS NOT NULL AND asset_hash IS NOT NULL))
+) STRICT;
+INSERT INTO cg_unlocks(pet_id,cg_id,variant,source_trip_id,unlocked_at,asset_state)
+SELECT pet_id,cg_id,variant,source_trip_id,unlocked_at,'LEGACY_UNVERSIONED' FROM cg_unlocks_v1;
+DROP TABLE cg_unlocks_v1;
+CREATE INDEX cg_unlock_pet_time ON cg_unlocks(pet_id, unlocked_at);
+CREATE TRIGGER validate_new_cg_unlock BEFORE INSERT ON cg_unlocks
+WHEN NEW.favorite <> 0 OR NEW.viewed_at IS NOT NULL
+  OR EXISTS (SELECT 1 FROM cg_unlocks u WHERE u.pet_id=NEW.pet_id AND u.cg_id=NEW.cg_id AND u.variant=NEW.variant)
+  OR NOT EXISTS (SELECT 1 FROM trips t JOIN settlements s USING(trip_id)
+    WHERE t.trip_id=NEW.source_trip_id AND t.pet_id=NEW.pet_id AND t.status='TRAVELING' AND s.settled_at=NEW.unlocked_at
+      AND EXISTS (SELECT 1 FROM json_each(s.rewards_json,'$.cgIds') c WHERE c.value=NEW.cg_id)
+      AND EXISTS (SELECT 1 FROM reward_ledger r WHERE r.source_type='TRIP' AND r.source_id=t.trip_id
+        AND r.pet_id=NEW.pet_id AND r.kind='CG' AND r.target_id=NEW.cg_id || ':' || NEW.variant AND r.amount=1))
+  OR (NEW.asset_state='LEGACY_UNVERSIONED' AND NOT EXISTS (SELECT 1 FROM trips t
+    WHERE t.trip_id=NEW.source_trip_id AND t.cg_pin_schema=1))
+  OR (NEW.asset_state<>'LEGACY_UNVERSIONED' AND NOT EXISTS (SELECT 1 FROM trip_cg_asset_pins p
+    WHERE p.trip_id=NEW.source_trip_id AND p.pet_id=NEW.pet_id AND p.cg_id=NEW.cg_id AND p.variant=NEW.variant
+      AND p.character_id=NEW.historical_character_id AND p.event_def_id=NEW.historical_event_def_id
+      AND p.asset_state=NEW.asset_state AND p.asset_version IS NEW.asset_version AND p.asset_hash IS NEW.asset_hash))
+BEGIN SELECT RAISE(ABORT, 'invalid CG unlock source or departure pin'); END;
+CREATE TRIGGER freeze_cg_unlock BEFORE UPDATE ON cg_unlocks
+WHEN OLD.pet_id IS NOT NEW.pet_id OR OLD.cg_id IS NOT NEW.cg_id OR OLD.variant IS NOT NEW.variant
+  OR OLD.source_trip_id IS NOT NEW.source_trip_id OR OLD.unlocked_at IS NOT NEW.unlocked_at
+  OR OLD.asset_state IS NOT NEW.asset_state OR OLD.historical_character_id IS NOT NEW.historical_character_id
+  OR OLD.historical_event_def_id IS NOT NEW.historical_event_def_id OR OLD.asset_version IS NOT NEW.asset_version
+  OR OLD.asset_hash IS NOT NEW.asset_hash OR (OLD.viewed_at IS NOT NULL AND OLD.viewed_at IS NOT NEW.viewed_at)
+BEGIN SELECT RAISE(ABORT, 'CG acquisition or first view is immutable'); END;
+CREATE TRIGGER preserve_cg_unlock BEFORE DELETE ON cg_unlocks
+BEGIN SELECT RAISE(ABORT, 'CG acquisition is immutable'); END;
+`;
+
+const MIGRATIONS = Object.freeze([
+  { version: 1, sql: MIGRATION_001 },
+  { version: 2, sql: MIGRATION_002 },
+]);
 
 /** FNV-1a is a migration-change detector, not a security signature. */
 function migrationChecksum(sql: string): string {
@@ -477,10 +592,60 @@ function validateRewardLine(line: RewardLine): RewardLine {
     targetId: string(line.targetId, 'reward target'), amount: integer(line.amount, 'reward amount', 1) };
 }
 
+function validateCgUnlockInput(value: CgUnlockInput): CgUnlockInput {
+  const input = closed(value, 'CG unlock input', ['petId', 'cgId', 'variant', 'sourceTripId', 'unlockedAt']);
+  return { petId: id(input.petId), cgId: id(input.cgId), variant: id(input.variant),
+    sourceTripId: id(input.sourceTripId), unlockedAt: integer(input.unlockedAt, 'unlock time') };
+}
+
+function cgRefFromColumns(row: ObjectMap, characterId: string | null, eventDefId: string | null): CgAssetRef {
+  const state = enumeration(row.asset_state, 'CG asset state', ['PINNED', 'LEGACY_UNVERSIONED', 'UNAVAILABLE_AT_DEPARTURE']);
+  if (state === 'PINNED') return cgAssetRefSchema.parse({ state, characterId, eventDefId,
+    assetVersion: row.asset_version, assetHash: row.asset_hash });
+  if (row.asset_version !== null || row.asset_hash !== null) throw new Error('Unversioned CG cannot carry an asset identity');
+  if (state === 'LEGACY_UNVERSIONED' ? characterId !== null || eventDefId !== null : characterId === null || eventDefId === null) {
+    throw new Error('CG historical identifiers contradict its asset state');
+  }
+  return cgAssetRefSchema.parse({ state });
+}
+
 function cgFromRow(value: unknown): CgUnlock {
   const row = object(value, 'CG unlock row');
-  return { petId: id(row.pet_id), cgId: id(row.cg_id), variant: id(row.variant),
-    sourceTripId: id(row.source_trip_id), unlockedAt: integer(row.unlocked_at, 'unlock time') };
+  const input = validateCgUnlockInput({ petId: id(row.pet_id), cgId: id(row.cg_id), variant: id(row.variant),
+    sourceTripId: id(row.source_trip_id), unlockedAt: integer(row.unlocked_at, 'unlock time') });
+  const historicalCharacterId = row.historical_character_id === null ? null : id(row.historical_character_id);
+  const historicalEventDefId = row.historical_event_def_id === null ? null : id(row.historical_event_def_id);
+  const assetRef = cgRefFromColumns(row, historicalCharacterId, historicalEventDefId);
+  const viewedAt = nullableInteger(row.viewed_at, 'CG first view time');
+  if (viewedAt !== null && (assetRef.state !== 'PINNED' || viewedAt < input.unlockedAt)) throw new Error('Invalid CG first view time');
+  return { ...input, assetRef, historicalCharacterId, historicalEventDefId,
+    favorite: sqlBoolean(row.favorite, 'CG favorite'), viewedAt };
+}
+
+function validateTripCgAssetPin(value: unknown): TripCgAssetPin {
+  const pin = closed(value, 'trip CG pin', ['tripId', 'petId', 'cgId', 'variant', 'characterId', 'eventDefId', 'assetRef']);
+  const characterId = id(pin.characterId), eventDefId = id(pin.eventDefId);
+  const assetRef = cgAssetRefSchema.parse(pin.assetRef);
+  if (assetRef.state === 'LEGACY_UNVERSIONED') throw new Error('A departure CG pin cannot be legacy');
+  if (assetRef.state === 'PINNED' && (assetRef.characterId !== characterId || assetRef.eventDefId !== eventDefId)) {
+    throw new Error('CG asset identity contradicts its departure character or event');
+  }
+  return { tripId: id(pin.tripId), petId: id(pin.petId), cgId: id(pin.cgId), variant: id(pin.variant), characterId, eventDefId, assetRef };
+}
+
+function tripCgAssetPinFromRow(value: unknown): TripCgAssetPin {
+  const row = object(value, 'trip CG pin row');
+  const characterId = id(row.character_id), eventDefId = id(row.event_def_id);
+  return validateTripCgAssetPin({ tripId: row.trip_id, petId: row.pet_id, cgId: row.cg_id, variant: row.variant,
+    characterId, eventDefId, assetRef: cgRefFromColumns(row, characterId, eventDefId) });
+}
+
+function cgVersionHash(ref: CgAssetRef): [string | null, string | null] {
+  return ref.state === 'PINNED' ? [ref.assetVersion, ref.assetHash] : [null, null];
+}
+
+function tripContainsCg(trip: TripRecord, cgId: string, eventDefId: string): boolean {
+  return trip.snapshot.nodes.some(node => node.kind === 'EVENT' && node.cgId === cgId && node.eventDefId === eventDefId);
 }
 
 function validateOutcome(value: unknown): CommandOutcome {
@@ -587,8 +752,8 @@ class SQLiteTransaction implements AppTransaction {
     const { snapshot: s, checkpoint: c, status } = validateTrip(record);
     if (status !== 'TRAVELING' || c.phase !== 'OUTBOUND' || c.sequence !== 0) throw new Error('New trip must begin outbound');
     db.prepare(`INSERT INTO trips (trip_id, pet_id, route_id, status, seed, snapshot_json, checkpoint_json,
-      json_schema_version, start_at, expected_return_at, actual_returned_at, next_due_at, rules_version)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      json_schema_version, start_at, expected_return_at, actual_returned_at, next_due_at, rules_version, cg_pin_schema)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 2)`)
       .run(s.tripId, s.petId, s.routeId, status, s.seed, canonicalJson(s), canonicalJson(c), JSON_SCHEMA_VERSION,
         s.startAt, s.expectedReturnAt, c.actualReturnedAt, c.nextDueAt, s.rulesVersion);
   }
@@ -729,25 +894,129 @@ class SQLiteTransaction implements AppTransaction {
     }
   }
 
-  listCgUnlocks(petId: string): CgUnlock[] {
-    return this.db.prepare('SELECT * FROM cg_unlocks WHERE pet_id=? ORDER BY cg_id, variant').all(id(petId)).map(cgFromRow);
+  private tripCgPinSchema(tripId: string): number {
+    const row = object(this.db.prepare('SELECT cg_pin_schema FROM trips WHERE trip_id=?').get(id(tripId)), 'trip CG pin schema row');
+    return integer(row.cg_pin_schema, 'trip CG pin schema', 1, 2);
   }
 
-  unlockCg(record: CgUnlock): boolean {
-    const db = this.db;
-    const unlock = { petId: id(record.petId), cgId: id(record.cgId), variant: id(record.variant),
-      sourceTripId: id(record.sourceTripId), unlockedAt: integer(record.unlockedAt, 'unlock time') };
-    const value = db.prepare('SELECT * FROM cg_unlocks WHERE pet_id=? AND cg_id=? AND variant=?')
-      .get(unlock.petId, unlock.cgId, unlock.variant);
-    if (value !== undefined && value !== null) {
-      // A later trip can earn the same CG. The original acquisition remains authoritative.
-      cgFromRow(value);
+  private checkedTripCgAssetPin(value: unknown): TripCgAssetPin {
+    const pin = tripCgAssetPinFromRow(value), trip = this.getTrip(pin.tripId);
+    if (trip === null || this.tripCgPinSchema(pin.tripId) !== 2 || trip.snapshot.petId !== pin.petId
+      || !tripContainsCg(trip, pin.cgId, pin.eventDefId)) throw new Error('Persisted CG pin contradicts its trip snapshot');
+    return pin;
+  }
+
+  private getTripCgAssetPin(tripId: string, cgId: string, variant: string): TripCgAssetPin | null {
+    const value = this.db.prepare('SELECT * FROM trip_cg_asset_pins WHERE trip_id=? AND cg_id=? AND variant=?')
+      .get(id(tripId), id(cgId), id(variant));
+    return value === undefined || value === null ? null : this.checkedTripCgAssetPin(value);
+  }
+
+  insertTripCgAssetPin(record: TripCgAssetPin): void {
+    const db = this.db, pin = validateTripCgAssetPin(record);
+    const existing = this.getTripCgAssetPin(pin.tripId, pin.cgId, pin.variant);
+    if (existing !== null) {
+      if (!sameJson(existing, pin)) throw new Error('Conflicting departure CG pin');
+      return;
+    }
+    const trip = this.getTrip(pin.tripId), pet = this.getPet(pin.petId);
+    if (trip === null || this.tripCgPinSchema(pin.tripId) !== 2 || trip.snapshot.petId !== pin.petId
+      || trip.status !== 'TRAVELING' || trip.checkpoint.phase !== 'OUTBOUND' || trip.checkpoint.sequence !== 0
+      || trip.checkpoint.logicalTime !== trip.snapshot.startAt
+      || this.listTripFacts(pin.tripId).length !== 0 || this.getSettlement(pin.tripId) !== null
+      || pet === null || pet.characterId !== pin.characterId || !tripContainsCg(trip, pin.cgId, pin.eventDefId)) {
+      throw new Error('CG pin requires a matching new trip at departure');
+    }
+    const [assetVersion, assetHash] = cgVersionHash(pin.assetRef);
+    db.prepare(`INSERT INTO trip_cg_asset_pins (trip_id,pet_id,cg_id,variant,character_id,event_def_id,asset_state,asset_version,asset_hash)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(pin.tripId, pin.petId, pin.cgId, pin.variant, pin.characterId,
+      pin.eventDefId, pin.assetRef.state, assetVersion, assetHash);
+  }
+
+  listTripCgAssetPins(tripId: string): TripCgAssetPin[] {
+    return this.db.prepare('SELECT * FROM trip_cg_asset_pins WHERE trip_id=? ORDER BY cg_id, variant').all(id(tripId))
+      .map(value => this.checkedTripCgAssetPin(value));
+  }
+
+  private checkedCgUnlock(value: unknown): CgUnlock {
+    const unlock = cgFromRow(value);
+    const pin = this.getTripCgAssetPin(unlock.sourceTripId, unlock.cgId, unlock.variant);
+    if (pin === null) {
+      if (unlock.assetRef.state !== 'LEGACY_UNVERSIONED' || this.tripCgPinSchema(unlock.sourceTripId) !== 1) {
+        throw new Error('Persisted CG unlock is missing its departure pin');
+      }
+    } else if (pin.petId !== unlock.petId || pin.characterId !== unlock.historicalCharacterId
+      || pin.eventDefId !== unlock.historicalEventDefId || !sameJson(pin.assetRef, unlock.assetRef)) {
+      throw new Error('Persisted CG unlock contradicts its departure pin');
+    }
+    return unlock;
+  }
+
+  getCgUnlock(petId: string, cgId: string, variant: string): CgUnlock | null {
+    const value = this.db.prepare('SELECT * FROM cg_unlocks WHERE pet_id=? AND cg_id=? AND variant=?')
+      .get(id(petId), id(cgId), id(variant));
+    return value === undefined || value === null ? null : this.checkedCgUnlock(value);
+  }
+
+  listCgUnlocks(petId: string): CgUnlock[] {
+    return this.db.prepare('SELECT * FROM cg_unlocks WHERE pet_id=? ORDER BY cg_id, variant').all(id(petId))
+      .map(value => this.checkedCgUnlock(value));
+  }
+
+  unlockCg(record: CgUnlockInput): boolean {
+    const db = this.db, unlock = validateCgUnlockInput(record);
+    const existing = this.getCgUnlock(unlock.petId, unlock.cgId, unlock.variant);
+    if (existing !== null && existing.sourceTripId === unlock.sourceTripId) {
+      if (existing.unlockedAt !== unlock.unlockedAt) throw new Error('Conflicting CG unlock from its first source');
       return false;
     }
     const trip = this.getTrip(unlock.sourceTripId);
     if (trip === null || trip.status !== 'TRAVELING' || trip.snapshot.petId !== unlock.petId) throw new Error('CG unlock requires its active trip');
-    db.prepare('INSERT INTO cg_unlocks VALUES (?, ?, ?, ?, ?)')
-      .run(unlock.petId, unlock.cgId, unlock.variant, unlock.sourceTripId, unlock.unlockedAt);
+    const settlement = this.getSettlement(unlock.sourceTripId);
+    if (settlement === null || settlement.settledAt !== unlock.unlockedAt || !settlement.rewards.cgIds.includes(unlock.cgId)) {
+      throw new Error('CG unlock contradicts its settlement');
+    }
+    if (!this.listRewards(unlock.sourceTripId).some(line => line.sourceType === 'TRIP' && line.sourceId === unlock.sourceTripId
+      && line.petId === unlock.petId && line.kind === 'CG' && line.targetId === `${unlock.cgId}:${unlock.variant}` && line.amount === 1)) {
+      throw new Error('CG unlock requires its exact reward ledger line');
+    }
+    const pin = this.getTripCgAssetPin(unlock.sourceTripId, unlock.cgId, unlock.variant);
+    if (pin === null && this.tripCgPinSchema(unlock.sourceTripId) !== 1) throw new Error('New trip CG unlock requires its frozen departure pin');
+    if (pin !== null && pin.petId !== unlock.petId) throw new Error('Departure pin belongs to another pet');
+    // A valid later acquisition cannot rewrite the first unlock, even if its
+    // newer content version or availability differs from the first pin.
+    if (existing !== null) return false;
+    const assetRef: CgAssetRef = pin?.assetRef ?? { state: 'LEGACY_UNVERSIONED' };
+    const [assetVersion, assetHash] = cgVersionHash(assetRef);
+    db.prepare(`INSERT INTO cg_unlocks (pet_id,cg_id,variant,source_trip_id,unlocked_at,asset_state,
+      historical_character_id,historical_event_def_id,asset_version,asset_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(unlock.petId, unlock.cgId, unlock.variant, unlock.sourceTripId, unlock.unlockedAt, assetRef.state,
+        pin?.characterId ?? null, pin?.eventDefId ?? null, assetVersion, assetHash);
+    return true;
+  }
+
+  setCgFavorite(petId: string, cgId: string, variant: string, favorite: boolean): boolean {
+    const unlock = this.getCgUnlock(petId, cgId, variant), next = boolean(favorite, 'CG favorite');
+    if (unlock === null) throw new Error('CG has not been unlocked');
+    if (unlock.favorite === next) return false;
+    const result = this.db.prepare('UPDATE cg_unlocks SET favorite=? WHERE pet_id=? AND cg_id=? AND variant=?')
+      .run(Number(next), unlock.petId, unlock.cgId, unlock.variant);
+    if (integer(result.changes, 'CG favorite change count') !== 1) throw new Error('CG favorite update failed');
+    return true;
+  }
+
+  markCgViewed(petId: string, cgId: string, variant: string, characterId: string, eventDefId: string,
+    assetVersion: string, assetHash: string, viewedAt: number): boolean {
+    const unlock = this.getCgUnlock(petId, cgId, variant);
+    const expectedRef = cgAssetRefSchema.parse({ state: 'PINNED', characterId, eventDefId, assetVersion, assetHash });
+    const timestamp = integer(viewedAt, 'CG first view time');
+    if (unlock === null) throw new Error('CG has not been unlocked');
+    if (unlock.assetRef.state !== 'PINNED' || !sameJson(unlock.assetRef, expectedRef)) throw new Error('CG view requires its exact pinned asset identity');
+    if (timestamp < unlock.unlockedAt) throw new Error('CG first view cannot precede unlock');
+    if (unlock.viewedAt !== null) return false;
+    const result = this.db.prepare('UPDATE cg_unlocks SET viewed_at=? WHERE pet_id=? AND cg_id=? AND variant=? AND viewed_at IS NULL')
+      .run(timestamp, unlock.petId, unlock.cgId, unlock.variant);
+    if (integer(result.changes, 'CG first view change count') !== 1) throw new Error('CG first view update failed');
     return true;
   }
 
@@ -832,35 +1101,78 @@ function configure(db: SqliteConnection, persistent: boolean): void {
   db.exec('DROP TABLE temp.__pet_desktop_fts5_probe');
 }
 
-function migrate(db: SqliteConnection): void {
-  db.exec('BEGIN IMMEDIATE');
-  try {
-    const version = integer(pragma(db, 'user_version'), 'database schema version');
-    if (version > SCHEMA_VERSION) throw new Error(`Unsupported future database schema ${version}`);
-    const checksum = migrationChecksum(MIGRATION_001);
-    if (version === 0) {
-      const existing = db.prepare("SELECT name FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' LIMIT 1").get();
-      if (existing !== undefined && existing !== null) throw new Error('Unrecognized nonempty database with schema version 0');
-      db.exec(MIGRATION_001);
-      db.prepare('INSERT INTO schema_migrations (version, checksum, applied_at) VALUES (?, ?, ?)')
-        .run(SCHEMA_VERSION, checksum, Date.now());
-      db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
-    } else {
-      const migrations = db.prepare('SELECT version, checksum, applied_at FROM schema_migrations ORDER BY version').all();
-      if (migrations.length !== 1) throw new Error('Database migration history is invalid');
-      const migration = object(migrations[0], 'migration row');
-      if (integer(migration.version, 'migration version') !== SCHEMA_VERSION || migration.checksum !== checksum) {
-        throw new Error('Database migration checksum mismatch');
-      }
-      integer(migration.applied_at, 'migration time');
+function verifyMigrationHistory(db: SqliteConnection, expectedVersion: number): void {
+  const version = integer(pragma(db, 'user_version'), 'database schema version');
+  if (version > SCHEMA_VERSION) throw new Error(`Unsupported future database schema ${version}`);
+  if (version !== expectedVersion) throw new Error('Database schema version changed before migration');
+  if (version === 0) {
+    const existing = db.prepare("SELECT name FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' LIMIT 1").get();
+    if (existing !== undefined && existing !== null) throw new Error('Unrecognized nonempty database with schema version 0');
+  } else {
+    const history = db.prepare('SELECT version, checksum, applied_at FROM schema_migrations ORDER BY version').all();
+    if (history.length !== version) throw new Error('Database migration history is invalid');
+    for (const [index, value] of history.entries()) {
+      const migration = MIGRATIONS[index], row = object(value, 'migration row');
+      if (migration === undefined || migration.version !== index + 1
+        || integer(row.version, 'migration version') !== migration.version) throw new Error('Database migration history is not contiguous');
+      if (row.checksum !== migrationChecksum(migration.sql)) throw new Error('Database migration checksum mismatch');
+      integer(row.applied_at, 'migration time');
     }
-    if (db.prepare('PRAGMA foreign_key_check').all().length > 0) throw new Error('Database contains foreign-key violations');
-    db.exec('COMMIT');
-  } catch (error) {
-    try { db.exec('ROLLBACK'); }
-    catch (rollbackError) { throw new AggregateError([error, rollbackError], 'Database migration rollback failed'); }
-    throw error;
   }
+  if (db.prepare('PRAGMA foreign_key_check').all().length > 0) throw new Error('Database contains foreign-key violations');
+}
+
+function rowCount(db: SqliteConnection, query: string): number {
+  return integer(object(db.prepare(query).get(), 'migration row count').count, 'migration row count');
+}
+
+function migrate(db: SqliteConnection, persistent: boolean, beforeMigration?: (fromVersion: number, toVersion: number) => void): void {
+  let version = integer(pragma(db, 'user_version'), 'database schema version');
+  // A corrupt source (including bad history and FKs) must not be backed up as
+  // a verified upgrade source, and the hook must execute outside a write tx.
+  verifyMigrationHistory(db, version);
+  if (version > 0 && version < SCHEMA_VERSION) {
+    if (persistent && beforeMigration === undefined) throw new Error('Persistent database upgrade requires a pre-migration backup callback');
+    if (beforeMigration !== undefined) {
+      const result: unknown = beforeMigration(version, SCHEMA_VERSION);
+      if (result !== null && (typeof result === 'object' || typeof result === 'function') && 'then' in result && typeof result.then === 'function') {
+        if (result instanceof Promise) void result.catch(() => undefined);
+        throw new Error('Pre-migration backup callback must be synchronous');
+      }
+    }
+  }
+  // Apply each numbered migration as its own atomic, ordered transition.
+  // Starting a failed v2 upgrade leaves the valid v1 archive unchanged.
+  for (const migration of MIGRATIONS) {
+    if (migration.version <= version) continue;
+    if (migration.version !== version + 1) throw new Error('Database migrations are not contiguous');
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      verifyMigrationHistory(db, version);
+      const oldCounts = migration.version === 2 ? {
+        trips: rowCount(db, 'SELECT count(*) AS count FROM trips'),
+        unlocks: rowCount(db, 'SELECT count(*) AS count FROM cg_unlocks'),
+      } : null;
+      db.exec(migration.sql);
+      if (oldCounts !== null && (oldCounts.trips !== rowCount(db, 'SELECT count(*) AS count FROM trips')
+        || oldCounts.unlocks !== rowCount(db, 'SELECT count(*) AS count FROM cg_unlocks')
+        || oldCounts.trips !== rowCount(db, 'SELECT count(*) AS count FROM trips WHERE cg_pin_schema=1')
+        || oldCounts.unlocks !== rowCount(db, `SELECT count(*) AS count FROM cg_unlocks WHERE asset_state='LEGACY_UNVERSIONED'
+          AND historical_character_id IS NULL AND historical_event_def_id IS NULL AND asset_version IS NULL AND asset_hash IS NULL
+          AND favorite=0 AND viewed_at IS NULL`))) throw new Error('CG migration changed legacy row count or invented historical metadata');
+      db.prepare('INSERT INTO schema_migrations (version, checksum, applied_at) VALUES (?, ?, ?)')
+        .run(migration.version, migrationChecksum(migration.sql), Date.now());
+      db.exec(`PRAGMA user_version = ${migration.version}`);
+      verifyMigrationHistory(db, migration.version);
+      db.exec('COMMIT');
+      version = migration.version;
+    } catch (error) {
+      try { db.exec('ROLLBACK'); }
+      catch (rollbackError) { throw new AggregateError([error, rollbackError], 'Database migration rollback failed'); }
+      throw error;
+    }
+  }
+  if (version !== SCHEMA_VERSION) throw new Error('Database migrations did not reach the current schema');
 }
 
 /** A synchronous UnitOfWork. The injected driver must be exclusively owned by app-service. */
@@ -870,14 +1182,15 @@ export class SQLiteRepository implements AppRepository {
   private broken = false;
   private readonly db: SqliteConnection;
 
-  constructor(db: SqliteConnection, options: { persistent: boolean }) {
+  constructor(db: SqliteConnection, options: { persistent: boolean; beforeMigration?: (fromVersion: number, toVersion: number) => void }) {
     this.db = db;
     requireEngine(db);
     // Reject newer archives before touching journal mode or migrating any tables.
     const version = integer(pragma(db, 'user_version'), 'database schema version');
     if (version > SCHEMA_VERSION) throw new Error(`Unsupported future database schema ${version}`);
-    configure(db, boolean(options.persistent, 'persistent mode'));
-    migrate(db);
+    const persistent = boolean(options.persistent, 'persistent mode');
+    configure(db, persistent);
+    migrate(db, persistent, options.beforeMigration);
   }
 
   transaction<T>(action: (tx: AppTransaction) => T): T {

@@ -1,5 +1,5 @@
 import type {
-  Activity, AppSnapshot, DomainEvent, HealthStatus, IpcErrorCode, Mood, Presence, Visibility,
+  Activity, AppSnapshot, CgAssetRef, DomainEvent, HealthStatus, IpcErrorCode, Mood, Presence, Visibility,
 } from '@pet-desktop/contracts';
 import type { RewardDraft, TripCheckpoint, TripFact, TripSnapshot } from '@pet-desktop/domain';
 
@@ -70,12 +70,32 @@ export interface InventoryItem {
   quantity: number;
 }
 
-export interface CgUnlock {
+export interface CgUnlockInput {
   petId: string;
   cgId: string;
   variant: string;
   sourceTripId: string;
   unlockedAt: number;
+}
+
+/** The first acquisition freezes its source event and asset identity forever. */
+export interface CgUnlock extends CgUnlockInput {
+  assetRef: CgAssetRef;
+  historicalCharacterId: string | null;
+  historicalEventDefId: string | null;
+  favorite: boolean;
+  viewedAt: number | null;
+}
+
+/** A potential CG and its content reference frozen at departure. */
+export interface TripCgAssetPin {
+  tripId: string;
+  petId: string;
+  cgId: string;
+  variant: string;
+  characterId: string;
+  eventDefId: string;
+  assetRef: Exclude<CgAssetRef, { state: 'LEGACY_UNVERSIONED' }>;
 }
 
 export interface OutboxRecord {
@@ -104,8 +124,14 @@ export interface AppTransaction {
   setWalletCoins(coins: number): void;
   listInventory(): InventoryItem[];
   addInventory(itemId: string, quantity: number): void;
+  insertTripCgAssetPin(pin: TripCgAssetPin): void;
+  listTripCgAssetPins(tripId: string): TripCgAssetPin[];
+  getCgUnlock(petId: string, cgId: string, variant: string): CgUnlock | null;
   listCgUnlocks(petId: string): CgUnlock[];
-  unlockCg(unlock: CgUnlock): boolean;
+  unlockCg(unlock: CgUnlockInput): boolean;
+  setCgFavorite(petId: string, cgId: string, variant: string, favorite: boolean): boolean;
+  markCgViewed(petId: string, cgId: string, variant: string, characterId: string, eventDefId: string,
+    assetVersion: string, assetHash: string, viewedAt: number): boolean;
   getCommandReceipt(commandId: string): CommandReceipt | null;
   hasCommandReceipts(): boolean;
   saveCommandReceipt(receipt: CommandReceipt): void;

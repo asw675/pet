@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { appSnapshotSchema, idSchema, ipcRequestSchema, ipcResultSchema, nonnegativeIntegerSchema } from '@pet-desktop/contracts';
-import type { AppBridge, AppSnapshot } from '@pet-desktop/contracts';
+import type { AppBridge, AppSnapshot, GalleryIpcResult, GalleryQuery } from '@pet-desktop/contracts';
 
 export const DESKTOP_IPC = Object.freeze({
   request: 'pet-desktop:request:v1',
@@ -34,7 +34,7 @@ export const petVisualReadySchema = z.strictObject({
 export type PetVisualReady = z.infer<typeof petVisualReadySchema>;
 
 export type DesktopRole = 'pet' | 'control-center';
-interface DesktopBridgeBase extends AppBridge {
+export interface DesktopBridgeBase extends AppBridge {
   getServiceStatus(): Promise<ServiceStatus>;
   subscribeServiceStatus(listener: (status: ServiceStatus) => void): () => void;
   openControlCenter(): Promise<HostActionResult>;
@@ -47,6 +47,7 @@ export interface PetDesktopBridge extends DesktopBridgeBase {
 }
 export interface ControlCenterBridge extends DesktopBridgeBase {
   readonly role: 'control-center';
+  listGallery(query: GalleryQuery): Promise<GalleryIpcResult>;
 }
 export type DesktopBridge = PetDesktopBridge | ControlCenterBridge;
 

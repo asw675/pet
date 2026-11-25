@@ -1,4 +1,5 @@
 import { isAbsolute } from 'node:path';
+import { resultMatchesMethod } from '@pet-desktop/contracts';
 import type { AppService } from '@pet-desktop/app-service';
 import { serviceInputSchema, serviceOutputSchema } from '../shared/protocol';
 import type { ServiceOutput } from '../shared/protocol';
@@ -85,7 +86,7 @@ export function startUtilityTransport(options: UtilityOptions): {
       if (service === undefined) throw new Error('Service not initialized');
       const result = service.handleRequest(parsed.data.request);
       const resultId = result.ok ? result.requestId : result.error.requestId;
-      if (resultId !== parsed.data.request.requestId) {
+      if (resultId !== parsed.data.request.requestId || !resultMatchesMethod(parsed.data.request.method, result)) {
         finish('PROTOCOL_ERROR');
         return;
       }

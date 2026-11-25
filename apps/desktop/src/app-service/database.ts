@@ -1,5 +1,5 @@
 import { randomInt, randomUUID } from 'node:crypto';
-import { AppService, SQLiteRepository } from '@pet-desktop/app-service';
+import { AppService, SQLiteRepository, verifyMigrationBackup } from '@pet-desktop/app-service';
 import type { SqliteConnection } from '@pet-desktop/app-service';
 
 function requireSupportedSQLite(connection: SqliteConnection): string {
@@ -16,7 +16,7 @@ function requireSupportedSQLite(connection: SqliteConnection): string {
 }
 
 /** Probe the actual loaded engine before even opening a user's save. */
-export function openPersistentService(databasePath: string, open: (filename: string) => SqliteConnection): {
+export function openPersistentService(databasePath: string, open: (filename: string, readOnly?: boolean) => SqliteConnection): {
   service: AppService; sqliteVersion: string;
 } {
   const probe = open(':memory:');
@@ -31,7 +31,13 @@ export function openPersistentService(databasePath: string, open: (filename: str
   // verifies the pragmas, migrates, and owns the connection after construction.
   const connection = open(databasePath);
   try {
-    const repository = new SQLiteRepository(connection, { persistent: true });
+    const repository = new SQLiteRepository(connection, {
+      persistent: true,
+      beforeMigration: (fromVersion, toVersion) => {
+        const backup = `${databasePath}.pre-v${fromVersion}-to-v${toVersion}-${randomUUID()}.sqlite3`;
+        verifyMigrationBackup(connection, backup, fromVersion, (filename) => open(filename, true));
+      },
+    });
     const service = new AppService(repository, {
       now: Date.now,
       createId: (kind) => `${kind}-${randomUUID()}`,

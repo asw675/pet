@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
-import { ipcRequestSchema, ipcResultSchema } from '@pet-desktop/contracts';
-import type { AppSnapshot, DomainCommand, IpcRequest, IpcResult } from '@pet-desktop/contracts';
+import { galleryIpcResultSchema, ipcRequestSchema, ipcResultSchema } from '@pet-desktop/contracts';
+import type { AppSnapshot, DomainCommand, GalleryIpcResult, GalleryQuery, IpcRequest, IpcResult } from '@pet-desktop/contracts';
 import { createControlCenterBridge, createPetBridge } from '../src/preload/bridge.js';
 import type { DesktopIpcPort } from '../src/preload/bridge.js';
 import { DESKTOP_IPC } from '../src/shared/protocol.js';
@@ -21,6 +21,14 @@ const command = {
   type: 'PET_INTERACT', commandId: 'command-42', issuedAt: 1234,
   payload: { petId: 'pet-1', interaction: 'PET' },
 } satisfies DomainCommand;
+const galleryQuery = { filter: 'UNLOCKED', petId: 'pet-1', offset: 20, limit: 10 } satisfies GalleryQuery;
+
+function gallerySuccess(requestId: string, query: GalleryQuery = galleryQuery) {
+  return {
+    schemaVersion: 1, ok: true, requestId, snapshot,
+    gallery: { revision: snapshot.revision, total: 0, rows: [], offset: query.offset, limit: query.limit },
+  } satisfies GalleryIpcResult;
+}
 
 const privateDetail = '/Users/test/private.sqlite: database error';
 
@@ -30,6 +38,7 @@ class FakeIpc implements DesktopIpcPort {
   handle: (channel: InvokeChannel, ...args: unknown[]) => unknown = (channel, raw) => {
     if (channel === DESKTOP_IPC.request) {
       const request = ipcRequestSchema.parse(raw);
+      if (request.method === 'gallery/list') return gallerySuccess(request.requestId, request.payload);
       return { schemaVersion: 1, ok: true, requestId: request.requestId, snapshot } satisfies IpcResult;
     }
     if (channel === DESKTOP_IPC.getStatus) return status;
@@ -72,8 +81,9 @@ describe('role-specific preload bridges', () => {
     const pet = createPetBridge(ipc);
     const center = createControlCenterBridge(ipc);
     expect(Object.keys(pet).sort()).toEqual([...commonKeys, 'setInteractive', 'reportVisualReady'].sort());
-    expect(Object.keys(center).sort()).toEqual(commonKeys.sort());
+    expect(Object.keys(center).sort()).toEqual([...commonKeys, 'listGallery'].sort());
     expect('reportVisualReady' in center).toBe(false);
+    expect('listGallery' in pet).toBe(false);
     expect(pet.role).toBe('pet');
     expect(center.role).toBe('control-center');
     expect(Object.isFrozen(pet)).toBe(true);
@@ -161,6 +171,105 @@ describe('role-specific preload bridges', () => {
     expect(result).toEqual({ ok: false, code: 'INVALID_REQUEST' });
     expect(ipc.calls).toEqual([]);
     expect(JSON.stringify(result)).not.toContain(privateDetail);
+  });
+});
+
+describe('control-center-only gallery requests', () => {
+  it('validates the closed query and returns its authority-coherent page on the existing correlated request channel', async () => {
+    const ipc = new FakeIpc();
+    const bridge = createControlCenterBridge(ipc, requestIds());
+    const snapshotReply = await bridge.getSnapshot();
+    const reply = await bridge.listGallery(galleryQuery);
+    expect(snapshotReply).toEqual({ schemaVersion: 1, ok: true, requestId: 'request-1', snapshot });
+    expect(reply).toEqual(gallerySuccess('request-2'));
+    expect(galleryIpcResultSchema.safeParse(reply).success).toBe(true);
+    expect(ipc.calls).toEqual([
+      [DESKTOP_IPC.request, { schemaVersion: 1, requestId: 'request-1', method: 'snapshot/get', payload: {} }],
+      [DESKTOP_IPC.request, { schemaVersion: 1, requestId: 'request-2', method: 'gallery/list', payload: galleryQuery }],
+    ]);
+  });
+
+  it.each([
+    undefined, null, '', [], {}, { ...galleryQuery, filter: 'UNKNOWN' }, { ...galleryQuery, rarity: 'UNKNOWN' },
+    { ...galleryQuery, petId: '../private' }, { ...galleryQuery, characterId: 123 },
+    { ...galleryQuery, offset: -1 }, { ...galleryQuery, offset: 10_001 }, { ...galleryQuery, offset: 1.1 },
+    { ...galleryQuery, limit: 0 }, { ...galleryQuery, limit: 51 }, { ...galleryQuery, limit: '10' },
+    { ...galleryQuery, path: privateDetail }, { ...galleryQuery, method: 'snapshot/get' },
+  ])('rejects invalid gallery arguments before IPC: case %#', async (input) => {
+    const ipc = new FakeIpc();
+    const result = await createControlCenterBridge(ipc, requestIds()).listGallery(input as GalleryQuery);
+    expect(result).toMatchObject({ schemaVersion: 1, ok: false, error: { code: 'INVALID_REQUEST', requestId: 'request-1', retryable: false } });
+    expect(galleryIpcResultSchema.safeParse(result).success).toBe(true);
+    expect(ipc.calls).toEqual([]);
+    expect(JSON.stringify(result)).not.toContain(privateDetail);
+  });
+
+  it('allows closed gallery preference commands through the ordinary command method without returning gallery data', async () => {
+    const ipc = new FakeIpc();
+    const bridge = createControlCenterBridge(ipc, requestIds());
+    const favorite: DomainCommand = {
+      type: 'CG_SET_FAVORITE', commandId: 'favorite-1', issuedAt: 1234,
+      payload: { petId: 'pet-1', cgId: 'cg-1', variant: 'default', favorite: true },
+    };
+    const viewed: DomainCommand = {
+      type: 'CG_MARK_VIEWED', commandId: 'viewed-1', issuedAt: 1234,
+      payload: { petId: 'pet-1', cgId: 'cg-1', variant: 'default', characterId: 'star-singer',
+        eventDefId: 'def-1', assetVersion: '1.0.0', assetHash: 'a'.repeat(64) },
+    };
+    expect(await bridge.dispatch(favorite)).toEqual({ schemaVersion: 1, ok: true, requestId: 'request-1', snapshot });
+    expect(await bridge.dispatch(viewed)).toEqual({ schemaVersion: 1, ok: true, requestId: 'request-2', snapshot });
+    expect(ipc.calls).toEqual([
+      [DESKTOP_IPC.request, { schemaVersion: 1, requestId: 'request-1', method: 'command/dispatch', payload: { command: favorite } }],
+      [DESKTOP_IPC.request, { schemaVersion: 1, requestId: 'request-2', method: 'command/dispatch', payload: { command: viewed } }],
+    ]);
+  });
+
+  it('rejects gallery success replies through ordinary snapshot and dispatch methods even with a valid request ID', async () => {
+    for (const role of ['pet', 'control-center'] as const) {
+      const ipc = new FakeIpc();
+      const bridge = role === 'pet' ? createPetBridge(ipc, requestIds()) : createControlCenterBridge(ipc, requestIds());
+      ipc.handle = (_channel, raw) => {
+        const reply = gallerySuccess(ipcRequestSchema.parse(raw).requestId);
+        expect(ipcResultSchema.safeParse(reply).success).toBe(true);
+        return reply;
+      };
+      expect(await bridge.getSnapshot()).toMatchObject({ ok: false, error: { requestId: 'request-1', code: 'INTERNAL_ERROR' } });
+      expect(await bridge.dispatch(command)).toMatchObject({ ok: false, error: { requestId: 'request-2', code: 'INTERNAL_ERROR' } });
+    }
+  });
+
+  it.each([
+    { schemaVersion: 1, ok: true, requestId: 'request-1', snapshot }, // snapshot-only success
+    gallerySuccess('other-id'),
+    { ...gallerySuccess('request-1'), gallery: { ...gallerySuccess('request-1').gallery, revision: snapshot.revision + 1 } },
+    { ...gallerySuccess('request-1'), gallery: { ...gallerySuccess('request-1').gallery, offset: 0 } },
+    { ...gallerySuccess('request-1'), gallery: { ...gallerySuccess('request-1').gallery, limit: 50 } },
+    { ...gallerySuccess('request-1'), gallery: { ...gallerySuccess('request-1').gallery, path: privateDetail } },
+  ])('rejects invalid or mismatched gallery replies: case %#', async (reply) => {
+    const ipc = new FakeIpc();
+    ipc.handle = () => reply;
+    const result = await createControlCenterBridge(ipc, requestIds()).listGallery(galleryQuery);
+    expect(result).toMatchObject({ ok: false, error: { requestId: 'request-1', code: 'INTERNAL_ERROR', retryable: true } });
+    expect(galleryIpcResultSchema.safeParse(result).success).toBe(true);
+    expect(JSON.stringify(result)).not.toContain(privateDetail);
+  });
+
+  it('sanitizes gallery transport failures and correlates legitimate errors', async () => {
+    const ipc = new FakeIpc();
+    const bridge = createControlCenterBridge(ipc, requestIds());
+    ipc.handle = () => ({ schemaVersion: 1, ok: false, error: {
+      requestId: 'request-1', code: 'NOT_FOUND', retryable: false, message: privateDetail,
+    } });
+    const first = await bridge.listGallery(galleryQuery);
+    expect(first).toMatchObject({ ok: false, error: { requestId: 'request-1', code: 'NOT_FOUND', retryable: false } });
+    expect(JSON.stringify(first)).not.toContain(privateDetail);
+    const mismatched = await bridge.listGallery(galleryQuery);
+    expect(mismatched).toMatchObject({ ok: false, error: { requestId: 'request-2', code: 'INTERNAL_ERROR', retryable: true } });
+    expect(JSON.stringify(mismatched)).not.toContain(privateDetail);
+    ipc.handle = () => { throw new Error(privateDetail); };
+    const rejected = await bridge.listGallery(galleryQuery);
+    expect(rejected).toMatchObject({ ok: false, error: { requestId: 'request-3', code: 'SERVICE_UNAVAILABLE', retryable: true } });
+    expect(JSON.stringify(rejected)).not.toContain(privateDetail);
   });
 });
 

@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { CONTRACT_SCHEMA_VERSION, idSchema, ipcRequestSchema } from '@pet-desktop/contracts';
+import { CONTRACT_SCHEMA_VERSION, idSchema, ipcRequestSchema, resultMatchesMethod } from '@pet-desktop/contracts';
 import type { AppSnapshot, IpcErrorCode, IpcRequest, IpcResult } from '@pet-desktop/contracts';
 import { serviceInputSchema, serviceOutputSchema } from '../shared/protocol.js';
 import type { ServiceInput, ServiceStatus, SnapshotListener, StatusListener } from '../shared/protocol.js';
@@ -26,6 +26,7 @@ type Phase = 'handshake' | 'bootstrap' | 'online' | 'closing';
 
 interface Pending {
   timer: Timer;
+  method: IpcRequest['method'];
   resolve(result: IpcResult): void;
 }
 
@@ -134,7 +135,7 @@ export class ServiceClient {
         if (!session.pending.delete(requestId)) return;
         resolve(errorResult(requestId, 'TIMEOUT', 'The application request timed out.', true));
       }, this.requestTimeoutMs);
-      session.pending.set(requestId, { timer, resolve });
+      session.pending.set(requestId, { timer, resolve, method: parsed.data.method });
       try {
         this.post(session, { kind: 'request', request: parsed.data });
       } catch {
@@ -249,7 +250,7 @@ export class ServiceClient {
   private onResult(session: Session, result: IpcResult): void {
     const requestId = requestIdOf(result);
     if (session.phase === 'bootstrap' && requestId === session.bootstrapId) {
-      if (!result.ok) {
+      if (!result.ok || !resultMatchesMethod('snapshot/get', result)) {
         this.failSession(session);
         return;
       }
@@ -263,6 +264,10 @@ export class ServiceClient {
     if (session.phase !== 'online') return;
     const pending = session.pending.get(requestId);
     if (!pending) return; // Unknown, duplicate, or timed-out result: no side effects.
+    if (!resultMatchesMethod(pending.method, result)) {
+      this.failSession(session);
+      return;
+    }
     session.pending.delete(requestId);
     clearTimeout(pending.timer);
     if (!result.ok && result.error.code === 'SERVICE_UNAVAILABLE' && !result.error.retryable) {

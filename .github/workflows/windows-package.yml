@@ -47,9 +47,13 @@ jobs:
           pnpm test 2>&1 | Tee-Object -FilePath $testLog
           $testExit = $LASTEXITCODE
           if ($testExit -ne 0) {
-            $details = (Get-Content -LiteralPath $testLog -Tail 80) -join "`n"
-            $message = $details.Replace('%','%25').Replace("`r",'%0D').Replace("`n",'%0A')
-            Write-Output "::error title=Windows verification log::$message"
+            $failures = Select-String -LiteralPath $testLog -SimpleMatch ' FAIL ' -Context 0,8 | Select-Object -First 12
+            foreach ($failure in $failures) {
+              $details = (@($failure.Line) + @($failure.Context.PostContext)) -join "`n"
+              $message = $details.Replace('%','%25').Replace("`r",'%0D').Replace("`n",'%0A')
+              Write-Output "::error title=Windows verification log::$message"
+            }
+            if (-not $failures) { Get-Content -LiteralPath $testLog -Tail 30 | Write-Output }
           }
           exit $testExit
       - name: Build Windows native helpers

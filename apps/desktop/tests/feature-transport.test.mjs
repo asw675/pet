@@ -59,7 +59,7 @@ describe('feature transport over the single durable utility writer',()=>{
         values: { scalePercent: 125, reducedMotion: true, hotkeysEnabled: true } } } });
       expect(await client.requestHost({ kind: 'save', edit: { expectedRevision: 0, scalePercent: 150, reducedMotion: false } }))
         .toEqual({ kind: 'preferences', result: { ok: false, code: 'REVISION_CONFLICT' } });
-      expect(await client.requestHost({ kind: 'backup', destination: join(realpathSync(dir), 'synthetic-export.sqlite3') }))
+      expect(await client.requestHost({ kind: 'backup', destination: join(realpathSync.native(dir), 'synthetic-export.sqlite3') }))
         .toEqual({ kind: 'backup', result: { ok: true, schemaVersion: 11 } });
       detach();await client.stop();client=create();client.start();await vi.waitFor(()=>expect(client.getStatus().stage).toBe('READY'),{timeout:5000});
       expect(await client.requestAi(request('read-new-gen','messages/list',{petId,conversationId,offset:0,limit:10}))).toEqual({...messages,requestId:'read-new-gen'});

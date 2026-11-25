@@ -11,7 +11,7 @@ const settings={hotkeysEnabled:false,scalePercent:150,reducedMotion:true};
 function fixture(action){
   // realpath prevents the platform's tmpdir alias from itself being a
   // symlink; the selected test folder is a real, private directory.
-  const root=realpathSync(mkdtempSync(join(tmpdir(),'pet-export-test-'))),source=join(root,'source.sqlite3');
+  const root=realpathSync.native(mkdtempSync(join(tmpdir(),'pet-export-test-'))),source=join(root,'source.sqlite3');
   const db=new DatabaseSync(source),repo=new SQLiteRepository(db,{persistent:true});
   repo.transaction(tx=>{tx.setWalletCoins(42);tx.hostPreferences().savePreferences(settings,0,1000);});
   try{return action({root,source,db,repo,io:createBackupExportIo(openReadOnly)});}

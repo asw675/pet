@@ -28,7 +28,7 @@ afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: 
 
 /** Synthetic bytes and mock children only. No real PE or process execution. */
 function syntheticHelper() {
-  const root = realpathSync(mkdtempSync(join(tmpdir(), 'pet-launch-test-')));
+  const root = realpathSync.native(mkdtempSync(join(tmpdir(), 'pet-launch-test-')));
   roots.push(root);
   const dir = join(root, 'native', 'launch-inspect');
   mkdirSync(dir, { recursive: true });

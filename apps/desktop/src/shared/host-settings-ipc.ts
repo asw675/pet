@@ -59,6 +59,8 @@ export const hostSettingsToggleSchema = z.boolean();
 export const hostScalePercents = Object.freeze([50, 75, 100, 125, 150, 200] as const);
 const hostScaleSchema = z.union([z.literal(50), z.literal(75), z.literal(100), z.literal(125), z.literal(150), z.literal(200)]);
 export type HostScale = z.infer<typeof hostScaleSchema>;
+export const petScaleDirectionSchema = z.enum(['increase', 'decrease']);
+export type PetScaleDirection = z.infer<typeof petScaleDirectionSchema>;
 const revision = z.number().int().min(0).max(Number.MAX_SAFE_INTEGER);
 const errorCode = z.string().regex(/^[A-Z][A-Z0-9_]{0,63}$/u);
 export const hostShortcutBindingsViewSchema = z.strictObject({ revision, bindings: hostShortcutBindingsSchema });
@@ -106,7 +108,7 @@ export const hostPreferenceSaveSchema = preferenceEditSchema.extend({ expectedRe
 export type HostPreferenceSave = z.infer<typeof hostPreferenceSaveSchema>;
 export type HostPreferencesViewResult = z.infer<typeof hostPreferencesViewResultSchema>;
 export type BackupViewResult = z.infer<typeof backupViewResultSchema>;
-export const hostRenderPreferencesSchema = z.strictObject({ reducedMotion: z.boolean() });
+export const hostRenderPreferencesSchema = z.strictObject({ reducedMotion: z.boolean(), scalePercent: hostScaleSchema });
 export type HostRenderPreferences = z.infer<typeof hostRenderPreferencesSchema>;
 
 const coordinate = z.number().int().min(-1_000_000).max(1_000_000);

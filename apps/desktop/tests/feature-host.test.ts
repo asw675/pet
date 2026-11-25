@@ -1,4 +1,4 @@
-import type { HostAuthorityRequest, HostAuthorityResult } from '../src/shared/host-settings-ipc';
+import type { HostAuthorityRequest, HostAuthorityResult, HostPreferencesView } from '../src/shared/host-settings-ipc';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { EventEmitter } from 'node:events';
@@ -206,6 +206,63 @@ describe('actual Main feature IPC and lifecycle (mocked Electron)', () => {
     f = fixture();
   });
   afterEach(async () => { await f?.host.stop(); vi.useRealTimers(); });
+
+  it('steps scale only for the current visible desktop pet and resizes without drifting', async () => {
+    const channel = DESKTOP_IPC.changePetScale;
+    let preferences: HostPreferencesView = { revision: 8, updatedAt: null,
+      values: { hotkeysEnabled: false, reducedMotion: true, scalePercent: 100 } };
+    f.service.requestHost.mockImplementation(async request => {
+      if (request.kind === 'save') {
+        expect(request.edit.expectedRevision).toBe(preferences.revision);
+        expect(request.edit.reducedMotion).toBe(true);
+        preferences = { ...preferences, revision: preferences.revision + 1,
+          values: { ...preferences.values, scalePercent: request.edit.scalePercent } };
+      }
+      return { kind: 'preferences', result: { ok: true, preferences } };
+    });
+    f.pet.setPosition(900, 500);
+    const originalBounds = f.pet.getBounds();
+    expect(await f.call(channel, 'increase')).toEqual({ ok: false, code: 'FORBIDDEN' });
+    expect(await f.callFrom(f.pet, channel, { scalePercent: 200 })).toEqual({ ok: false, code: 'INVALID_REQUEST' });
+    expect(await electronMock.handlers.get(channel)!(f.event(f.pet, { url: f.pet.webContents.url }), 'increase'))
+      .toEqual({ ok: false, code: 'FORBIDDEN' });
+    expect(f.service.requestHost).not.toHaveBeenCalled();
+
+    f.snapshot({ ...snapshot(), revision: 1, pausedRender: true });
+    expect(await f.callFrom(f.pet, channel, 'increase')).toEqual({ ok: true });
+    expect(f.pet.getBounds()).toEqual({ x: 868, y: 463, width: 325, height: 369 });
+    expect(f.pet.webContents.sent).toContainEqual({
+      channel: DESKTOP_IPC.hostRenderPreferences, value: { reducedMotion: true, scalePercent: 125 },
+    });
+    expect(await f.callFrom(f.pet, channel, 'decrease')).toEqual({ ok: true });
+    expect(f.pet.getBounds()).toEqual(originalBounds);
+    expect(preferences.values.hotkeysEnabled).toBe(false);
+
+    f.snapshot({ ...snapshot(), revision: 2, doNotDisturb: true });
+    const writes = f.service.requestHost.mock.calls.length;
+    expect(await f.callFrom(f.pet, channel, 'increase')).toEqual({ ok: false, code: 'FORBIDDEN' });
+    expect(f.service.requestHost.mock.calls).toHaveLength(writes);
+  });
+
+  it('refreshes a conflicted scale write and does not save past a scale limit', async () => {
+    let preferences: HostPreferencesView = { revision: 1, updatedAt: null,
+      values: { hotkeysEnabled: true, reducedMotion: false, scalePercent: 150 } };
+    f.service.requestHost.mockImplementation(async request => {
+      if (request.kind === 'save') {
+        expect(request.edit).toEqual({ expectedRevision: 1, reducedMotion: false, scalePercent: 200 });
+        preferences = { revision: 2, updatedAt: null,
+          values: { hotkeysEnabled: false, reducedMotion: true, scalePercent: 200 } };
+        return { kind: 'preferences', result: { ok: false, code: 'REVISION_CONFLICT' } };
+      }
+      return { kind: 'preferences', result: { ok: true, preferences } };
+    });
+    expect(await f.callFrom(f.pet, DESKTOP_IPC.changePetScale, 'increase')).toEqual({ ok: false, code: 'SERVICE_UNAVAILABLE' });
+    expect(f.pet.webContents.sent).toContainEqual({
+      channel: DESKTOP_IPC.hostRenderPreferences, value: { reducedMotion: true, scalePercent: 200 },
+    });
+    expect(await f.callFrom(f.pet, DESKTOP_IPC.changePetScale, 'increase')).toEqual({ ok: true });
+    expect(f.service.requestHost.mock.calls.filter(([request]) => request.kind === 'save')).toHaveLength(1);
+  });
 
   it('quiets only the fullscreen display, cancels active voice and restores the same pet surface without focus', async () => {
     await vi.advanceTimersByTimeAsync(0);

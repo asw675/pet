@@ -35,14 +35,14 @@ import type {
 import {
   backupViewResultSchema, hostPreferencesViewResultSchema, hostRendererRequestSchema, hostRenderPreferencesSchema, hostSettingsResultSchema,
   hostShortcutBindingsResultSchema,
-  periodicBackupStatusSchema, restoreBackupResultSchema, restoreBackupStatusSchema,
+  periodicBackupStatusSchema, petScaleDirectionSchema, restoreBackupResultSchema, restoreBackupStatusSchema,
 } from '../shared/host-settings-ipc';
-import type { HostPreferenceSave, HostRenderPreferences, HostShortcutBindingsEdit } from '../shared/host-settings-ipc';
+import type { HostPreferenceSave, HostRenderPreferences, HostShortcutBindingsEdit, PetScaleDirection } from '../shared/host-settings-ipc';
 import { diagnosticsExportResultSchema } from '../shared/diagnostics-ipc';
 import type { DiagnosticsExportResult } from '../shared/diagnostics-ipc';
 
 type InvokeChannel = typeof DESKTOP_IPC.characterPackRequest | typeof DESKTOP_IPC.hostRequest | typeof DESKTOP_IPC.request | typeof DESKTOP_IPC.getStatus
-  | typeof DESKTOP_IPC.openControlCenter | typeof DESKTOP_IPC.petInteractive
+  | typeof DESKTOP_IPC.openControlCenter | typeof DESKTOP_IPC.petInteractive | typeof DESKTOP_IPC.changePetScale
   | typeof DESKTOP_IPC.petVisualReady | typeof DESKTOP_IPC.aiRequest | typeof DESKTOP_IPC.credentialSave | typeof DESKTOP_IPC.credentialRevoke
   | typeof DESKTOP_IPC.voiceRequest | typeof DESKTOP_IPC.micAuthorize | typeof DESKTOP_IPC.micRequest | typeof DESKTOP_IPC.micRevoke
   | typeof DESKTOP_IPC.proactiveRequest
@@ -218,6 +218,7 @@ function baseBridge(ipc: DesktopIpcPort, requestId: () => string): DesktopBridge
 type HostActionInvoke =
   | [channel: typeof DESKTOP_IPC.openControlCenter]
   | [channel: typeof DESKTOP_IPC.petInteractive, interactive: boolean]
+  | [channel: typeof DESKTOP_IPC.changePetScale, direction: PetScaleDirection]
   | [channel: typeof DESKTOP_IPC.petVisualReady, report: PetVisualReady]
   | [channel:typeof DESKTOP_IPC.micAuthorize]
   | [channel:typeof DESKTOP_IPC.credentialSave,payload:CredentialSave]
@@ -269,6 +270,11 @@ export function createPetBridge(ipc: DesktopIpcPort, requestId = newRequestId): 
     async setInteractive(interactive: boolean): Promise<HostActionResult> {
       if (typeof interactive !== 'boolean') return { ok: false, code: 'INVALID_REQUEST' };
       return hostAction(ipc, DESKTOP_IPC.petInteractive, interactive);
+    },
+    async changePetScale(...args: [direction: PetScaleDirection]): Promise<HostActionResult> {
+      const direction = parse(petScaleDirectionSchema, args[0]);
+      if (args.length !== 1 || direction === undefined) return { ok: false, code: 'INVALID_REQUEST' };
+      return hostAction(ipc, DESKTOP_IPC.changePetScale, direction);
     },
     async reportVisualReady(report: PetVisualReady): Promise<HostActionResult> {
       const parsed = parse(petVisualReadySchema, report);

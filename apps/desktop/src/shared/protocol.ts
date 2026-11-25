@@ -15,7 +15,7 @@ import type {WorkspaceIntent,WorkspaceResult} from './workspace-ipc';
 import type { ProactiveDesktopBubble, ProactiveIntent, ProactiveNoticeReady, ProactiveResult } from './proactive-ipc';
 
 import type { BackupViewResult, HostPreferenceSave, HostPreferencesViewResult, HostRenderPreferences, HostSettingsResult, PeriodicBackupStatus, RestoreBackupResult, RestoreBackupStatus } from './host-settings-ipc';
-import type { HostShortcutBindingsEdit, HostShortcutBindingsResult } from './host-settings-ipc';
+import type { HostShortcutBindingsEdit, HostShortcutBindingsResult, PetScaleDirection } from './host-settings-ipc';
 
 export const DESKTOP_IPC = Object.freeze({
   exportDiagnostics: 'pet-desktop:export-diagnostics:v1',
@@ -29,6 +29,7 @@ export const DESKTOP_IPC = Object.freeze({
   status: 'pet-desktop:status:v1',
   openControlCenter: 'pet-desktop:open-control-center:v1',
   petInteractive: 'pet-desktop:pet-interactive:v1',
+  changePetScale: 'pet-desktop:change-pet-scale:v1',
   petVisualReady: 'pet-desktop:pet-visual-ready:v1',
   aiRequest:'pet-desktop:ai-request:v1',chatEvent:'pet-desktop:chat-event:v1',credentialSave:'pet-desktop:credential-save:v1',credentialRevoke:'pet-desktop:credential-revoke:v1',
   voiceRequest:'pet-desktop:voice-request:v1',micAuthorize:'pet-desktop:mic-authorize:v1',micRequest:'pet-desktop:mic-request:v1',micRevoke:'pet-desktop:mic-revoke:v1',
@@ -72,6 +73,7 @@ export interface PetDesktopBridge extends DesktopBridgeBase {
   readCharacterPack(characterId: string): Promise<CharacterPackResult>;
   subscribeCharacterPackChanged(listener: (change: CharacterPackChanged) => void): () => void;
   setInteractive(interactive: boolean): Promise<HostActionResult>;
+  changePetScale(direction: PetScaleDirection): Promise<HostActionResult>;
   reportVisualReady(report: PetVisualReady): Promise<HostActionResult>;
   subscribeHostRenderPreferences(listener: (value: HostRenderPreferences) => void): () => void;
   subscribeVoiceMouth(listener:(event:VoiceMouthNotification)=>void):()=>void;

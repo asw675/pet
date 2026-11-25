@@ -5,6 +5,8 @@ import { useAppStore } from '../shared/store';
 import { petStatus, serviceStatusLabel } from '../shared/presentation';
 import PetCanvas from './PetCanvas.vue';
 import { createInteractionLease } from '../shared/interaction-lease';
+import { hostScalePercents } from '../../shared/host-settings-ipc';
+import type { HostScale } from '../../shared/host-settings-ipc';
 import type { PetVisualReady } from '../../shared/protocol';
 import type { VoiceMouthNotification } from '../../shared/voice-ipc';
 import type { ProactiveDesktopBubble } from '../../shared/proactive-ipc';
@@ -17,11 +19,20 @@ const petId = new URL(window.location.href).searchParams.get('petId');
 const pet = computed(() => store.snapshot?.pets.find((entry) => entry.petId === petId));
 const canAct = computed(() => store.ready && !store.busy && !store.loading && pet.value?.presence === 'HOME' && pet.value.visibility === 'VISIBLE');
 const petCanvas = ref<InstanceType<typeof PetCanvas> | null>(null);
+const portraitSurface = ref<HTMLDivElement | null>(null);
 const quietMotion = computed(() => !store.ready || !store.snapshot || store.snapshot.pausedRender || store.snapshot.doNotDisturb || pet.value?.visibility !== 'VISIBLE');
 const reducedMotion = ref(false);
 const hostError = ref<string | null>(null);
 const openingCenter = ref(false);
 const canHit = computed(() => !quietMotion.value && pet.value?.presence === 'HOME' && pet.value.visibility === 'VISIBLE');
+const canUseMenu = computed(() => store.ready && !store.snapshot?.doNotDisturb
+  && pet.value?.presence === 'HOME' && pet.value.visibility === 'VISIBLE');
+const menuVisible = ref(false);
+const scalePercent = ref<HostScale | null>(null);
+const changingScale = ref(false);
+const canChangeScale = computed(() => !!bridge && canUseMenu.value && scalePercent.value !== null && !changingScale.value);
+const minScale = hostScalePercents[0];
+const maxScale = hostScalePercents[hostScalePercents.length - 1];
 const proactiveBubble = ref<string | null>(null);
 let unsubscribeProactive: (() => void) | undefined;
 let proactiveTimeout: number | undefined;
@@ -124,26 +135,57 @@ watch(visualReportKey, () => {
 // The window is click-through by default. Mouse moves forwarded by Electron
 // enable it only over the visible portrait, drag chip or explicit buttons.
 const lease = bridge ? createInteractionLease((enabled) => bridge.setInteractive(enabled), (ok) => {
-  if (!ok && canHit.value && document.visibilityState === 'visible') hostError.value = '桌面命中切换暂不可用，可使用托盘';
+  if (!ok && canUseMenu.value && document.visibilityState === 'visible') hostError.value = '桌面命中切换暂不可用，可使用托盘';
   else if (ok && hostError.value === '桌面命中切换暂不可用，可使用托盘') hostError.value = null;
 }) : undefined;
 let latestMouse: { x: number; y: number } | null = null;
 let leaseTimer: number | undefined;
+let menuHideTimer: number | undefined;
+
+function clearMenuTimer(): void {
+  if (menuHideTimer !== undefined) window.clearTimeout(menuHideTimer);
+  menuHideTimer = undefined;
+}
+
+function hideMenu(): void {
+  clearMenuTimer();
+  menuVisible.value = false;
+}
+
+function updateMenu(hovered: boolean): void {
+  if (hovered) {
+    clearMenuTimer();
+    menuVisible.value = true;
+  } else if (menuVisible.value && menuHideTimer === undefined) {
+    // Keep the menu available while crossing the gap from the portrait to a button.
+    menuHideTimer = window.setTimeout(hideMenu, 260);
+  }
+}
+
+function contains(rect: DOMRect | undefined, x: number, y: number): boolean {
+  return !!rect && x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom;
+}
 
 function hitTest(renew = false): void {
-  if (!latestMouse || !canHit.value || document.visibilityState !== 'visible') {
+  if (!canUseMenu.value || document.visibilityState !== 'visible') {
+    hideMenu();
+    lease?.set(false);
+    return;
+  }
+  if (!latestMouse) {
+    updateMenu(false);
     lease?.set(false);
     return;
   }
   const { x, y } = latestMouse;
-  // The adapter transforms canvas-local CSS coordinates into the declared
-  // character regions, not the entire transparent canvas rectangle. Explicit drag
-  // handle geometry is also accepted because native drag regions may consume
-  // move events instead of exposing a regular DOM element target.
   const element = document.elementFromPoint(x, y);
-  const dragHandle = document.querySelector('[data-drag]')?.getBoundingClientRect();
-  const onDragHandle = dragHandle !== undefined && x >= dragHandle.left && x < dragHandle.right
-    && y >= dragHandle.top && y < dragHandle.bottom;
+  const dragHandle = menuVisible.value ? document.querySelector('[data-drag]')?.getBoundingClientRect() : undefined;
+  const onDragHandle = contains(dragHandle, x, y);
+  const overMenu = menuVisible.value && (onDragHandle || !!element?.closest('[data-menu-hit]'));
+  const overPortrait = contains(portraitSurface.value?.getBoundingClientRect(), x, y);
+  updateMenu(overPortrait || overMenu);
+  // The portrait box only reveals the menu. A native input lease still requires
+  // a model hit or a visible control so transparent space stays click-through.
   const interactive = Boolean(element?.closest('[data-hit]') || onDragHandle || petCanvas.value?.hitTestClient(x, y));
   lease?.set(interactive, renew);
 }
@@ -156,19 +198,33 @@ function onMouseMove(event: MouseEvent): void {
 
 function leave(): void {
   latestMouse = null;
+  updateMenu(false);
   lease?.reset();
 }
 
-watch(canHit, (enabled) => enabled ? hitTest() : leave(), { flush: 'sync' });
+function onPointerVisibility(): void {
+  leave();
+  hideMenu();
+}
+
+watch([canUseMenu, canHit], ([canUse]) => {
+  if (canUse) hitTest();
+  else onPointerVisibility();
+}, { flush: 'post' });
+
+watch(() => store.serviceStatus?.generation, () => { scalePercent.value = null; }, { flush: 'sync' });
 
 onMounted(() => {
-  unsubscribeRenderPreferences = bridge?.subscribeHostRenderPreferences(value => { reducedMotion.value = value.reducedMotion; });
+  unsubscribeRenderPreferences = bridge?.subscribeHostRenderPreferences(value => {
+    reducedMotion.value = value.reducedMotion;
+    scalePercent.value = value.scalePercent;
+  });
   unsubscribeMouth = bridge?.subscribeVoiceMouth(onVoiceMouth);
   unsubscribeProactive = bridge?.subscribeProactiveBubble(showProactive);
   document.addEventListener('visibilitychange', onVoiceVisibility);
   document.addEventListener('mousemove', onMouseMove);
   document.documentElement.addEventListener('mouseleave', leave);
-  document.addEventListener('visibilitychange', leave);
+  document.addEventListener('visibilitychange', onPointerVisibility);
   // A stationary pointer over the portrait should retain interaction, but
   // Main expires input if these rechecks stop or the cursor exits the window.
   leaseTimer = window.setInterval(() => hitTest(true), 500);
@@ -185,9 +241,23 @@ onBeforeUnmount(() => {
   if (leaseTimer !== undefined) window.clearInterval(leaseTimer);
   document.removeEventListener('mousemove', onMouseMove);
   document.documentElement.removeEventListener('mouseleave', leave);
-  document.removeEventListener('visibilitychange', leave);
-  leave();
+  document.removeEventListener('visibilitychange', onPointerVisibility);
+  onPointerVisibility();
 });
+
+async function changeScale(direction: 'decrease' | 'increase'): Promise<void> {
+  if (!bridge || !canChangeScale.value || !menuVisible.value) return;
+  changingScale.value = true;
+  hostError.value = null;
+  try {
+    const result = await bridge.changePetScale(direction);
+    if (!result.ok) hostError.value = '暂时无法调整桌宠大小';
+  } catch {
+    hostError.value = '暂时无法调整桌宠大小';
+  } finally {
+    changingScale.value = false;
+  }
+}
 
 async function openControlCenter(): Promise<void> {
   if (openingCenter.value) return;
@@ -219,31 +289,40 @@ function interact(interaction: Interaction): void {
 </script>
 
 <template>
-  <main class="pet-shell" @contextmenu.prevent="openControlCenter">
+  <main class="pet-shell" :data-pet-menu="menuVisible ? 'visible' : 'hidden'" @contextmenu.prevent="openControlCenter">
     <template v-if="pet">
-      <div class="plate" data-hit>
+      <div v-show="menuVisible" class="plate" data-hit data-menu-hit>
         <div class="drag-handle" data-drag title="拖动桌宠窗口">⠿ <span>{{ pet.nickname }}</span></div>
         <span class="level">Lv.{{ pet.level }}</span>
+        <div class="scale-controls" role="group" aria-label="桌宠大小">
+          <button class="scale-button" type="button" data-pet-scale="decrease" aria-label="缩小桌宠" title="缩小桌宠"
+            :disabled="!canChangeScale || scalePercent === minScale" @click="changeScale('decrease')">−</button>
+          <span v-if="scalePercent !== null" class="scale-value">{{ scalePercent }}%</span>
+          <button class="scale-button" type="button" data-pet-scale="increase" aria-label="放大桌宠" title="放大桌宠"
+            :disabled="!canChangeScale || scalePercent === maxScale" @click="changeScale('increase')">+</button>
+        </div>
         <button class="more" aria-label="打开控制中心" title="控制中心" :disabled="openingCenter" @click="openControlCenter">···</button>
       </div>
-      <div class="portrait-surface">
+      <div ref="portraitSurface" class="portrait-surface">
         <PetCanvas ref="petCanvas" :character-id="pet.characterId" :activity="pet.activity" :paused="quietMotion" :reduced-motion="reducedMotion" :interactive="canAct && canHit" @touch="interact('PET')" @visual="visual = $event" />
       </div>
       <p v-if="proactiveBubble" class="proactive-bubble" role="status">{{ proactiveBubble }}</p>
-      <div class="state" data-hit>
-        <span class="dot" :class="{ muted: !store.ready }"></span>
-        {{ store.ready ? petStatus(pet) : serviceStatusLabel(store.serviceStatus) }}
-        <span class="divider"></span>
-        <span title="精力">精力 {{ pet.energy }}</span>
-        <span v-if="store.snapshot?.pausedRender" class="tag">已停动画</span>
-        <span v-if="store.snapshot?.doNotDisturb" class="tag">免打扰</span>
-      </div>
-      <div class="actions" data-hit>
-        <button :disabled="!canAct" @click="interact('PET')">摸头</button>
-        <button v-if="pet.activity === 'REST' || pet.activity === 'SLEEP'" :disabled="!canAct" @click="interact('WAKE')">唤醒</button>
-        <button v-else :disabled="!canAct" @click="interact('REST')">休息</button>
-        <button v-if="store.ready" :disabled="openingCenter" title="在控制中心选择路线并出发" @click="openControlCenter">旅行…</button>
-        <button v-else :disabled="store.loading" title="重新查询本地宠物状态" @click="store.refresh()">刷新</button>
+      <div v-show="menuVisible" class="bottom-menu">
+        <div class="state" data-hit data-menu-hit>
+          <span class="dot" :class="{ muted: !store.ready }"></span>
+          <span>{{ store.ready ? petStatus(pet) : serviceStatusLabel(store.serviceStatus) }}</span>
+          <span class="divider"></span>
+          <span title="精力">精力 {{ pet.energy }}</span>
+          <span v-if="store.snapshot?.pausedRender" class="tag">已停动画</span>
+          <span v-if="store.snapshot?.doNotDisturb" class="tag">免打扰</span>
+        </div>
+        <div class="actions">
+          <button data-hit data-menu-hit :disabled="!canAct" @click="interact('PET')">摸头</button>
+          <button v-if="pet.activity === 'REST' || pet.activity === 'SLEEP'" data-hit data-menu-hit :disabled="!canAct" @click="interact('WAKE')">唤醒</button>
+          <button v-else data-hit data-menu-hit :disabled="!canAct" @click="interact('REST')">休息</button>
+          <button v-if="store.ready" data-hit data-menu-hit :disabled="openingCenter" title="在控制中心选择路线并出发" @click="openControlCenter">旅行…</button>
+          <button v-else data-hit data-menu-hit :disabled="store.loading" title="重新查询本地宠物状态" @click="store.refresh()">刷新</button>
+        </div>
       </div>
     </template>
     <div v-else class="waiting" data-hit>
@@ -252,7 +331,7 @@ function interact(interaction: Interaction): void {
       <button v-if="bridge && !store.ready" :disabled="store.loading" @click="store.refresh()">刷新状态</button>
       <button :disabled="openingCenter" @click="openControlCenter">打开控制中心</button>
     </div>
-    <div v-if="hostError || store.error || (store.notice && !store.snapshot?.doNotDisturb)" class="feedback" :class="{ error: hostError || store.error }" role="status" data-hit>
+    <div v-if="hostError || store.error || (menuVisible && store.notice)" class="feedback" :class="{ error: hostError || store.error }" role="status" data-hit>
       {{ hostError || store.error || store.notice }}
     </div>
   </main>
@@ -263,29 +342,40 @@ function interact(interaction: Interaction): void {
 * { box-sizing: border-box; }
 html, body, #app { width: 100%; height: 100%; margin: 0; background: transparent; overflow: hidden; }
 body { user-select: none; }
-.pet-shell { position: relative; width: 100%; height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 5px; gap: 5px; pointer-events: none; }
-.proactive-bubble { position: absolute; z-index: 1; top: 44px; left: 12px; right: 12px; max-height: 5.7em; margin: 0; padding: 7px 9px; overflow: hidden; overflow-wrap: anywhere; background: #352b43f2; border: 1px solid #b4a4d199; border-radius: 10px; color: #fff3df; font-size: 12px; line-height: 1.45; pointer-events: none; }
+.pet-shell { --edge: clamp(4px, 2.5vw, 9px); position: relative; width: 100%; height: 100%; display: grid; place-items: center; pointer-events: none; }
+.proactive-bubble { position: absolute; z-index: 1; top: calc(var(--edge) + 34px); left: 12px; right: 12px; max-height: 5.7em; margin: 0; padding: 7px 9px; overflow: hidden; overflow-wrap: anywhere; background: #352b43f2; border: 1px solid #b4a4d199; border-radius: 10px; color: #fff3df; font-size: 12px; line-height: 1.45; pointer-events: none; }
 [data-hit] { pointer-events: auto; }
-.plate { display: inline-flex; align-items: center; gap: 6px; min-height: 27px; padding: 1px 3px 1px 7px; background: #352b43eb; border: 1px solid #b4a4d16b; border-radius: 11px; box-shadow: 0 2px 8px #1b172149; max-width: 100%; }
-.drag-handle { -webkit-app-region: drag; app-region: drag; padding: 4px 2px 4px 0; font-size: 12px; font-weight: 700; cursor: move; white-space: nowrap; text-overflow: ellipsis; overflow: hidden; max-width: 130px; }
+.plate { position: absolute; z-index: 2; top: var(--edge); left: 50%; transform: translateX(-50%); display: inline-flex; align-items: center; gap: 5px; min-height: 26px; padding: 1px 3px 1px 6px; background: #352b43eb; border: 1px solid #b4a4d16b; border-radius: 11px; box-shadow: 0 2px 8px #1b172149; width: max-content; max-width: calc(100% - 2 * var(--edge)); }
+.drag-handle { -webkit-app-region: drag; app-region: drag; min-width: 16px; padding: 4px 2px 4px 0; font-size: 12px; font-weight: 700; cursor: move; white-space: nowrap; text-overflow: ellipsis; overflow: hidden; max-width: 130px; }
 .drag-handle span { color: #fff3df; }
 .level { font-size: 10px; color: #e7cc9f; white-space: nowrap; }
 button { -webkit-app-region: no-drag; app-region: no-drag; border: 1px solid #b4a4d16b; font: inherit; color: #fff3df; background: #352b43ed; cursor: pointer; transition: background .16s ease, border-color .16s ease; }
 button:not(:disabled):hover, button:focus-visible { border-color: #efd2a0; background: #51415c; outline: none; }
 button:disabled { opacity: .62; cursor: default; }
-.more { display: grid; place-items: center; width: 25px; height: 21px; border: 0; border-radius: 7px; font-size: 16px; line-height: 1; }
-.portrait-surface { display: block; flex: 1; min-height: 100px; width: min(172px, 74vw); max-height: 166px; padding: 0; margin: 0; }
-.state { display: flex; align-items: center; gap: 6px; background: #352b43ed; padding: 4px 8px; border-radius: 10px; font-size: 10px; border: 1px solid #b4a4d145; white-space: nowrap; }
+.scale-controls { display: flex; align-items: center; gap: 3px; flex: none; }
+.scale-value { min-width: 2.8em; color: #e7cc9f; font-size: 10px; font-variant-numeric: tabular-nums; text-align: center; white-space: nowrap; }
+.scale-button, .more { display: grid; flex: none; place-items: center; width: 22px; height: 21px; padding: 0; border-radius: 7px; font-size: 16px; line-height: 1; }
+.more { border: 0; }
+.portrait-surface { width: 82%; height: 76%; min-height: 0; }
+.portrait-surface .pet-visual { min-height: 0; }
+.bottom-menu { position: absolute; z-index: 2; bottom: var(--edge); left: var(--edge); right: var(--edge); display: grid; justify-items: center; gap: 4px; }
+.state { display: flex; align-items: center; gap: 5px; max-width: 100%; background: #352b43ed; padding: 3px 7px; border-radius: 10px; font-size: 10px; border: 1px solid #b4a4d145; white-space: nowrap; }
 .dot { width: 6px; height: 6px; border-radius: 50%; background: #98daa3; }
 .dot.muted { background: #e3b67d; }
 .divider { height: 8px; width: 1px; background: #ae9ec46b; }
 .tag { color: #e3bf8a; }
 .actions { display: flex; gap: 4px; }
-.actions button { min-height: 26px; min-width: 48px; padding: 4px 11px; border-radius: 9px; font-size: 11px; box-shadow: 0 2px 8px #1b172135; }
-.feedback { max-width: 210px; padding: 4px 7px; border-radius: 8px; background: #352b43f2; border: 1px solid #9dca9e75; font-size: 10px; line-height: 1.3; text-align: center; max-height: 45px; overflow: auto; }
+.actions button { min-height: 24px; padding: 3px clamp(4px, 4vw, 10px); border-radius: 9px; font-size: 11px; white-space: nowrap; box-shadow: 0 2px 8px #1b172135; }
+.feedback { position: absolute; z-index: 3; bottom: calc(var(--edge) + 52px); width: max-content; max-width: min(210px, calc(100% - 2 * var(--edge))); padding: 4px 7px; border-radius: 8px; background: #352b43f2; border: 1px solid #9dca9e75; font-size: 10px; line-height: 1.3; text-align: center; max-height: 45px; overflow: auto; }
 .feedback.error { color: #ffd8cd; border-color: #d88c80; }
 .waiting { display: flex; flex-direction: column; gap: 9px; align-items: center; padding: 13px; border-radius: 13px; text-align: center; background: #352b43ed; border: 1px solid #b4a4d16b; font-size: 13px; }
 .waiting small { max-width: 160px; color: #d2c4dd; font-size: 11px; }
 .waiting button { border-radius: 8px; padding: 5px 7px; font-size: 11px; }
+@media (max-width: 180px) {
+  .plate { gap: 3px; padding-left: 4px; }
+  .level, .scale-value, .state .tag { display: none; }
+  .state { gap: 3px; padding: 2px 5px; }
+  .scale-button, .more { width: 20px; }
+}
 @media (prefers-reduced-motion: reduce) { button { transition: none; } }
 </style>

@@ -45,7 +45,7 @@ import { voiceSettingsRequestSchema, voiceSettingsResultSchema, voiceSettingsRes
 import type { VoiceSettingsResult } from '../shared/voice-settings-ipc';
 
 import { HostShortcutController } from './host-shortcuts';
-import { hostRendererRequestSchema, hostWindowAnchorSchema, managedBackupDirectory } from '../shared/host-settings-ipc';
+import { hostRendererRequestSchema, hostScalePercents, hostWindowAnchorSchema, managedBackupDirectory, petScaleDirectionSchema } from '../shared/host-settings-ipc';
 import type { BackupViewResult, HostPreferencesView, HostPreferencesViewResult, HostSettingsResult, PeriodicBackupStatus, RestoreBackupResult, RestoreBackupStatus } from '../shared/host-settings-ipc';
 import type { HostShortcutBindingsResult, HostShortcutBindingsView, HostWindowAnchor } from '../shared/host-settings-ipc';
 import type { DiagnosticsExportResult } from '../shared/diagnostics-ipc';
@@ -177,6 +177,7 @@ export class DesktopHost {
   private voiceOwner: VoiceOwner | undefined;
   private mouthRun: MouthRun | undefined;
   private hostPreferences: HostPreferencesView | undefined;
+  private changingPetScale = false;
   private shortcutBindings: HostShortcutBindingsView | undefined;
   private changingShortcutBindings = false;
   private shortcuts: HostShortcutController | undefined;
@@ -365,6 +366,7 @@ export class DesktopHost {
         return { ok: false, code: 'SERVICE_UNAVAILABLE' };
       }
     });
+    ipcMain.handle(DESKTOP_IPC.changePetScale, (event, ...args: unknown[]) => this.changePetScale(event, args));
     ipcMain.handle(DESKTOP_IPC.petVisualReady, (event, ...args: unknown[]): HostActionResult => {
       const { record, sender } = this.senderOf(event);
       if (!record?.pet || !authorizeSender(record.binding, sender, 'pet')) return { ok: false, code: 'FORBIDDEN' };
@@ -561,6 +563,43 @@ export class DesktopHost {
     return { width: Math.round(PET_SIZE.width * scale), height: Math.round(PET_SIZE.height * scale) };
   }
 
+  private async changePetScale(event: IpcMainInvokeEvent, args: unknown[]): Promise<HostActionResult> {
+    const { record, sender } = this.senderOf(event);
+    const forbidden = { ok: false, code: 'FORBIDDEN' } as const;
+    const unavailable = { ok: false, code: 'SERVICE_UNAVAILABLE' } as const;
+    if (!record || !authorizeSender(record.binding, sender, 'pet') || !this.isActivePet(record) || !record.window.isVisible()) return forbidden;
+    const direction = petScaleDirectionSchema.safeParse(args[0]);
+    if (args.length !== 1 || !direction.success) return { ok: false, code: 'INVALID_REQUEST' };
+    if (this.changingPetScale) return unavailable;
+
+    const stamp = this.featureStamp(record);
+    const currentPet = () => this.sameFeature(stamp, this.featureStamp(record)) && this.isActivePet(record) && record.window.isVisible();
+    this.changingPetScale = true;
+    try {
+      if (!this.hostPreferences) await this.refreshHostPreferences(stamp.serviceGeneration);
+      if (!currentPet()) return forbidden;
+      const previous = this.hostPreferences;
+      if (!previous) return unavailable;
+      const step = direction.data === 'increase' ? 1 : -1;
+      const scalePercent = hostScalePercents[hostScalePercents.indexOf(previous.values.scalePercent) + step];
+      if (scalePercent === undefined) return { ok: true };
+
+      const reply = await this.service.requestHost({ kind: 'save', edit: {
+        expectedRevision: previous.revision, reducedMotion: previous.values.reducedMotion, scalePercent,
+      } });
+      if (this.stopping || this.status.stage !== 'READY' || this.status.generation !== stamp.serviceGeneration
+        || reply.kind !== 'preferences') return unavailable;
+      if (!reply.result.ok) {
+        if (reply.result.code === 'REVISION_CONFLICT') await this.refreshHostPreferences(stamp.serviceGeneration);
+        return unavailable;
+      }
+      // A confirmed global preference also belongs to a newly selected pet.
+      this.applyHostPreferences(reply.result.preferences);
+      return currentPet() ? { ok: true } : forbidden;
+    } catch { return unavailable; }
+    finally { this.changingPetScale = false; }
+  }
+
   private applyHostPreferences(preferences: HostPreferencesView): void {
     const previous = this.hostPreferences;
     if (previous && preferences.revision < previous.revision) return;
@@ -580,15 +619,20 @@ export class DesktopHost {
       this.shortcuts?.setHostShortcutEnabled(preferences.values.hotkeysEnabled);
     }
     if (previous?.revision === preferences.revision) return;
-    if (previous?.values.scalePercent !== preferences.values.scalePercent) this.stopWalkMotion();
+    const { scalePercent, reducedMotion } = preferences.values;
+    const scaleChanged = previous?.values.scalePercent !== scalePercent;
+    if (scaleChanged) this.stopWalkMotion();
     for (const record of this.windows.values()) {
       if (!record.pet || !this.isCurrent(record)) continue;
-      if (previous?.values.scalePercent !== preferences.values.scalePercent) {
+      if (scaleChanged) {
         const bounds = record.window.getBounds();
         const area = screen.getDisplayMatching(bounds).workArea;
-        record.window.setBounds(clampBounds({ ...bounds, ...this.petSize() }, area));
+        const size = this.petSize();
+        const x = previous ? bounds.x + Math.floor(bounds.width / 2) - Math.floor(size.width / 2) : bounds.x;
+        const y = previous ? bounds.y + Math.floor(bounds.height / 2) - Math.floor(size.height / 2) : bounds.y;
+        record.window.setBounds(clampBounds({ x, y, ...size }, area));
       }
-      this.send(record, DESKTOP_IPC.hostRenderPreferences, { reducedMotion: preferences.values.reducedMotion });
+      this.send(record, DESKTOP_IPC.hostRenderPreferences, { reducedMotion, scalePercent });
     }
   }
 
@@ -1456,7 +1500,8 @@ export class DesktopHost {
       if (record.pet) record.pet.documentReady = true;
       this.send(record, DESKTOP_IPC.status, this.status);
       if (record.pet && this.hostPreferences) {
-        this.send(record, DESKTOP_IPC.hostRenderPreferences, { reducedMotion: this.hostPreferences.values.reducedMotion });
+        const { reducedMotion, scalePercent } = this.hostPreferences.values;
+        this.send(record, DESKTOP_IPC.hostRenderPreferences, { reducedMotion, scalePercent });
       }
       if (this.status.stage === 'READY' && this.snapshot) this.send(record, DESKTOP_IPC.snapshot, this.snapshot);
       if (record.pet) this.reconcilePets();

@@ -106,7 +106,7 @@ describe('role-specific preload bridges', () => {
     ];
     const pet = createPetBridge(ipc);
     const center = createControlCenterBridge(ipc);
-    expect(Object.keys(pet).sort()).toEqual([...commonKeys, 'setInteractive', 'reportVisualReady','subscribeVoiceMouth','subscribeHostRenderPreferences','subscribeProactiveBubble',
+    expect(Object.keys(pet).sort()).toEqual([...commonKeys, 'setInteractive', 'changePetScale', 'reportVisualReady','subscribeVoiceMouth','subscribeHostRenderPreferences','subscribeProactiveBubble',
       'readCharacterPack', 'subscribeCharacterPackChanged'].sort());
     expect(Object.keys(center).sort()).toEqual([...commonKeys, 'listGallery', 'listCharacters', 'listInventory', 'listActiveTravel', 'listTravelCatalog', 'previewTravel', 'listTravelReports', 'listEvents',
       'getHostSettings','setHostShortcutEnabled','getHostShortcutBindings','saveHostShortcutBindings','setLoginStart','getHostPreferences','saveHostPreferences','exportBackup','exportDiagnostics','restoreBackup','getRestoreBackupStatus','getPeriodicBackupStatus',
@@ -306,6 +306,28 @@ describe('role-specific preload bridges', () => {
     expect(await pet.reportVisualReady(ready)).toEqual({ ok: true });
     expect(await pet.reportVisualReady(fallback)).toEqual({ ok: true });
     expect(ipc.calls).toEqual([[DESKTOP_IPC.petVisualReady, ready], [DESKTOP_IPC.petVisualReady, fallback]]);
+  });
+
+  it('exposes a pet-only zoom step and projects only supported host scales', async () => {
+    const ipc = new FakeIpc();
+    const pet = createPetBridge(ipc);
+    const changeScale = pet.changePetScale as (...args: unknown[]) => ReturnType<typeof pet.changePetScale>;
+    expect(await changeScale('increase')).toEqual({ ok: true });
+    expect(await changeScale('decrease')).toEqual({ ok: true });
+    expect(await changeScale('increase', 200)).toEqual({ ok: false, code: 'INVALID_REQUEST' });
+    expect(await changeScale(125)).toEqual({ ok: false, code: 'INVALID_REQUEST' });
+    expect(ipc.calls).toEqual([[DESKTOP_IPC.changePetScale, 'increase'], [DESKTOP_IPC.changePetScale, 'decrease']]);
+
+    const listener = vi.fn();
+    const unsubscribe = pet.subscribeHostRenderPreferences(listener);
+    ipc.emit(DESKTOP_IPC.hostRenderPreferences, { reducedMotion: true, scalePercent: 125 });
+    ipc.emit(DESKTOP_IPC.hostRenderPreferences, { reducedMotion: true, scalePercent: 999 });
+    ipc.emit(DESKTOP_IPC.hostRenderPreferences, { reducedMotion: true });
+    ipc.emit(DESKTOP_IPC.hostRenderPreferences, { reducedMotion: true, scalePercent: 150, hotkeysEnabled: true });
+    expect(listener).toHaveBeenCalledExactlyOnceWith({ reducedMotion: true, scalePercent: 125 });
+    unsubscribe();
+    ipc.emit(DESKTOP_IPC.hostRenderPreferences, { reducedMotion: true, scalePercent: 75 });
+    expect(listener).toHaveBeenCalledTimes(1);
   });
 
   it.each([

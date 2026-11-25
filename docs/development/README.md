@@ -90,5 +90,6 @@
 | 010O | 全局热键改键、冲突回滚和恢复默认 | 桌面和 SQLite 专项通过，真实第三方热键冲突待验 | [010o-editable-hotkeys](010o-editable-hotkeys.md) |
 | 010P | 免打扰期间旅行结算汇总 | 宿主和投影专项通过，Windows 外壳通知待验 | [010p-travel-return-summary](010p-travel-return-summary.md) |
 | 010Q | 修复页内导航撤销 IPC 权限及 Windows x64 测试包复验 | 设置页、实际热键注册、双窗口、日志及 SAPI 中文合成通过 | [010q-windows-host-preview](010q-windows-host-preview.md) |
+| 010R | 桌宠直接缩放和悬停菜单 | Windows 隔离运行验证缩放、菜单收放及重启记忆 | [010r-pet-controls](010r-pet-controls.md) |
 
 每份记录包含：日期、范围、设计依据、具体变更、测试命令与真实结果、已知限制、下一步。完整验收状态见 [POC 矩阵](../qa/poc-matrix.md)。

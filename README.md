@@ -29,7 +29,7 @@ mise exec node@26.12.1 -- pnpm test
 
 ### 桌面原型
 
-003 已建立 Electron Main、独立本地服务进程、两套受限 preload、两个 Vue renderer。首页、宠物馆、旅行地图、报告、设置使用真实服务投影，其余功能入口明确标记待开发。SVG 角色只用于工程原型，正式渲染与素材包见 004。
+003 已建立 Electron Main、独立本地服务进程、两套受限 preload、两个 Vue renderer。004 加入人形二次元少女内置资源/Canvas2D 序列帧降级、跨窗交接及实际历史 CG 图鉴。首页、宠物馆、旅行地图、报告、图鉴、设置使用真实服务数据；其余功能入口仍明确标记待开发。正式 Pixi WebGL、精细美术、Live2D 与 Windows 真机验证尚未完成。
 
 ```sh
 mise exec node@26.12.1 -- pnpm --filter @pet-desktop/desktop exec install-electron

@@ -1,9 +1,9 @@
 import {
-  CONTRACT_SCHEMA_VERSION, appSnapshotSchema, charactersIpcResultSchema, galleryIpcResultSchema, inventoryIpcResultSchema, ipcRequestSchema,
+  activeTravelIpcResultSchema, CONTRACT_SCHEMA_VERSION, appSnapshotSchema, charactersIpcResultSchema, galleryIpcResultSchema, inventoryIpcResultSchema, ipcRequestSchema,
   resultMatchesMethod, snapshotIpcResultSchema, travelCatalogIpcResultSchema, travelPreviewIpcResultSchema, travelReportsIpcResultSchema, eventsIpcResultSchema,
 } from '@pet-desktop/contracts';
 import type {
-  AppSnapshot, CharactersIpcResult, DomainCommand, GalleryIpcResult, GalleryQuery, IpcErrorCode, IpcRequest,
+  ActiveTravelIpcResult, AppSnapshot, CharactersIpcResult, DomainCommand, GalleryIpcResult, GalleryQuery, IpcErrorCode, IpcRequest,
   IpcResult, SnapshotIpcResult, InventoryIpcResult, TravelCatalogIpcResult, TravelPreviewIpcResult, TravelReportsIpcResult, EventsIpcResult,
 } from '@pet-desktop/contracts';
 import type { EventListQuery } from '@pet-desktop/contracts/events';
@@ -114,6 +114,7 @@ const requestResultParsers = {
   'gallery/list': galleryIpcResultSchema,
   'characters/list': charactersIpcResultSchema,
   'inventory/list': inventoryIpcResultSchema,
+  'travel/active': activeTravelIpcResultSchema,
   'travel/catalog': travelCatalogIpcResultSchema,
   'travel/preview': travelPreviewIpcResultSchema,
   'travel/reports': travelReportsIpcResultSchema,
@@ -125,6 +126,7 @@ const requestResultParsers = {
 function sendRequest(ipc: DesktopIpcPort, requestId: () => string, method: 'gallery/list', payload: unknown): Promise<GalleryIpcResult>;
 function sendRequest(ipc: DesktopIpcPort, requestId: () => string, method: 'characters/list', payload: unknown): Promise<CharactersIpcResult>;
 function sendRequest(ipc: DesktopIpcPort, requestId: () => string, method: 'inventory/list', payload: unknown): Promise<InventoryIpcResult>;
+function sendRequest(ipc: DesktopIpcPort, requestId: () => string, method: 'travel/active', payload: unknown): Promise<ActiveTravelIpcResult>;
 function sendRequest(ipc: DesktopIpcPort, requestId: () => string, method: 'travel/catalog', payload: unknown): Promise<TravelCatalogIpcResult>;
 function sendRequest(ipc: DesktopIpcPort, requestId: () => string, method: 'travel/preview', payload: unknown): Promise<TravelPreviewIpcResult>;
 function sendRequest(ipc: DesktopIpcPort, requestId: () => string, method: 'travel/reports', payload: unknown): Promise<TravelReportsIpcResult>;
@@ -269,6 +271,7 @@ export function createControlCenterBridge(ipc: DesktopIpcPort, requestId = newRe
       if (args.length > 1 || (args.length === 1 && typeof args[0] !== 'number')) return failure(requestId(), 'INVALID_REQUEST', false);
       return sendRequest(ipc, requestId, 'inventory/list', args.length === 0 ? {} : { legacyOffset: args[0] });
     },
+    listActiveTravel: () => sendRequest(ipc, requestId, 'travel/active', {}),
     async listTravelCatalog(...args: unknown[]): Promise<TravelCatalogIpcResult> {
       if (args.length !== 0) return failure(requestId(), 'INVALID_REQUEST', false);
       return sendRequest(ipc, requestId, 'travel/catalog', {});

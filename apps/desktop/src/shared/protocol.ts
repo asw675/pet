@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { appSnapshotSchema, idSchema, ipcRequestSchema, ipcResultSchema, nonnegativeIntegerSchema } from '@pet-desktop/contracts';
-import type { AppBridge, AppSnapshot, CharactersIpcResult, GalleryIpcResult, GalleryQuery, InventoryIpcResult,
+import type { ActiveTravelIpcResult, AppBridge, AppSnapshot, CharactersIpcResult, GalleryIpcResult, GalleryQuery, InventoryIpcResult,
   TravelCatalogIpcResult, TravelPreviewIpcResult, TravelReportsIpcResult, EventsIpcResult } from '@pet-desktop/contracts';
 import type { EventListQuery } from '@pet-desktop/contracts/events';
 import type { TripPreparationPayload, TravelReportsQuery } from '@pet-desktop/contracts/travel';
@@ -75,6 +75,7 @@ export interface ControlCenterBridge extends DesktopBridgeBase {
   listGallery(query: GalleryQuery): Promise<GalleryIpcResult>;
   listCharacters(): Promise<CharactersIpcResult>;
   listInventory(legacyOffset?: number): Promise<InventoryIpcResult>;
+  listActiveTravel(): Promise<ActiveTravelIpcResult>;
   listTravelCatalog(): Promise<TravelCatalogIpcResult>;
   previewTravel(input: TripPreparationPayload): Promise<TravelPreviewIpcResult>;
   listTravelReports(query: TravelReportsQuery): Promise<TravelReportsIpcResult>;

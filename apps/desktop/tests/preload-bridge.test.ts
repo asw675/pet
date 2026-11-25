@@ -106,7 +106,7 @@ describe('role-specific preload bridges', () => {
     const pet = createPetBridge(ipc);
     const center = createControlCenterBridge(ipc);
     expect(Object.keys(pet).sort()).toEqual([...commonKeys, 'setInteractive', 'reportVisualReady','subscribeVoiceMouth','subscribeHostRenderPreferences'].sort());
-    expect(Object.keys(center).sort()).toEqual([...commonKeys, 'listGallery', 'listCharacters', 'listInventory', 'listTravelCatalog', 'previewTravel', 'listTravelReports', 'listEvents',
+    expect(Object.keys(center).sort()).toEqual([...commonKeys, 'listGallery', 'listCharacters', 'listInventory', 'listActiveTravel', 'listTravelCatalog', 'previewTravel', 'listTravelReports', 'listEvents',
       'getHostSettings','setHostShortcutEnabled','setLoginStart','getHostPreferences','saveHostPreferences','exportBackup',
       'aiRequest','subscribeChatEvents','saveProviderCredential','revokeProviderCredential','voiceRequest','voiceSettingsRequest','workspaceRequest','authorizeMicrophone','requestMic','revokeMic','cancelVoiceChat','publishMouth','subscribeSuspend'].sort());
     expect('reportVisualReady' in center).toBe(false);

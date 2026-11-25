@@ -1,7 +1,7 @@
-import { travelCatalogSchema, travelPreviewSchema, travelReportsPageSchema, tripDepartureLoadoutSchema, tripReportSchema } from '@pet-desktop/contracts/travel';
+import { activeTravelPageSchema, travelCatalogSchema, travelPreviewSchema, travelReportsPageSchema, tripDepartureLoadoutSchema, tripReportSchema } from '@pet-desktop/contracts/travel';
 import type {
   RouteMetadata, TravelCatalog, TravelPreview, TravelReportsPage, TravelReportsQuery, TripDepartureLoadout, TripPreparationPayload,
-  TravelPreparationReason,
+  TravelPreparationReason, ActiveTravelPage,
 } from '@pet-desktop/contracts/travel';
 import { EQUIPMENT_SLOTS, equipmentBonus } from '@pet-desktop/domain/equipment-rules';
 import { findItemDefinition, ITEM_CATALOG_VERSION } from '@pet-desktop/domain/item-catalog';
@@ -13,6 +13,24 @@ import type { AppTransaction, PetRecord, TripRecord } from './ports.js';
 import { battleProjection } from '#economy-service';
 
 const compareIds = (a: string, b: string): number => a < b ? -1 : a > b ? 1 : 0;
+
+/** Read only after AppService.advanceAll has audited/replayed persisted active
+ * checkpoints and applied all due facts in this transaction. The renderer
+ * receives the frozen authored plan and committed traversal facts, never its
+ * seed/RNG cursor or the latest route in place of the historic plan. */
+export function projectActiveTravel(tx: AppTransaction, revision: number): ActiveTravelPage {
+  const rows = tx.listTrips().filter(trip => trip.status === 'TRAVELING')
+    .sort((a,b) => compareIds(a.snapshot.petId,b.snapshot.petId) || compareIds(a.snapshot.tripId,b.snapshot.tripId))
+    .map(trip => {
+      const { snapshot, checkpoint } = trip;
+      if (checkpoint.phase === 'COMPLETE' || checkpoint.nextDueAt === null) throw new Error('Active trip has terminal checkpoint');
+      return { tripId: snapshot.tripId, petId: snapshot.petId, routeId: snapshot.routeId, contentVersion: snapshot.contentVersion,
+        rulesVersion: snapshot.rulesVersion, departurePower: snapshot.power, startAt: snapshot.startAt, expectedReturnAt: snapshot.expectedReturnAt,
+        phase: checkpoint.phase, nextDueAt: checkpoint.nextDueAt, returnReason: checkpoint.returnReason, nodeIndex: checkpoint.nodeIndex,
+        returnDurationMs: snapshot.returnDurationMs, nodes: snapshot.nodes, facts: tx.listTripFacts(snapshot.tripId) };
+    });
+  return activeTravelPageSchema.parse({ revision, rows });
+}
 
 function metadata(entry: RouteCatalogEntry): RouteMetadata {
   // The simulator's route definition, power, seed and checkpoint never leave

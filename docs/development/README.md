@@ -37,6 +37,7 @@
 | 006E-1 | 三路线目录与出发前置纯规则 | 领域74项通过 | [006e1-travel-preparation](006e1-travel-preparation.md) |
 | 006E-2A | 旅行准备、冻结出发与完整历史投影契约 | 11项专项通过，权威接入待完成 | [006e2a-travel-contract](006e2a-travel-contract.md) |
 | 006E-2B/C/D | v6三路线真实出发、物资与装备冻结、历史战报 | 数据库、专项、生产构建通过 | [006e2-travel-authority](006e2-travel-authority.md) |
+| 006E-3 | 在途地图读取冻结路线和实际节点进度 | 真实 SQLite 联合验证通过 | [006e3-active-travel-map](006e3-active-travel-map.md) |
 | 006F-1 | 随机剧情、分支冻结及六项原创事件 | 领域64项通过 | [006f1-event-engine](006f1-event-engine.md) |
 | 006F-2A | 事件待选、已提交效果与历史查询契约 | 5项专项通过，持久业务待接入 | [006f2a-event-projection](006f2a-event-projection.md) |
 | 006F-2B | 新增2个剧情CG、事件源图鉴、精确版本读取 | 实际PNG与专项测试通过，解锁事务待接入 | [006f2b-narrative-cg-assets](006f2b-narrative-cg-assets.md) |

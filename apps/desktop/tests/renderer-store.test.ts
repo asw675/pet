@@ -49,6 +49,7 @@ function testBridge() {
   const listTravelReports = vi.fn<ControlCenterBridge['listTravelReports']>();
   const listEvents = vi.fn<ControlCenterBridge['listEvents']>();
   const bridge: ControlCenterBridge = {
+    listActiveTravel: vi.fn<ControlCenterBridge['listActiveTravel']>(),
     getHostSettings: vi.fn<ControlCenterBridge['getHostSettings']>(),
     setHostShortcutEnabled: vi.fn<ControlCenterBridge['setHostShortcutEnabled']>(),
     setLoginStart: vi.fn<ControlCenterBridge['setLoginStart']>(),

@@ -1,8 +1,8 @@
 import { computed, onBeforeUnmount, ref, shallowRef, watch } from 'vue';
 import type { ComputedRef } from 'vue';
-import { travelCatalogIpcResultSchema, travelPreviewIpcResultSchema, travelReportsIpcResultSchema } from '@pet-desktop/contracts';
-import { travelReportsQuerySchema } from '@pet-desktop/contracts/travel';
-import type { TravelReportsQuery, TripPreparationPayload } from '@pet-desktop/contracts/travel';
+import { activeTravelIpcResultSchema, travelCatalogIpcResultSchema, travelPreviewIpcResultSchema, travelReportsIpcResultSchema } from '@pet-desktop/contracts';
+import { activeTravelMatchesSnapshot, travelReportsQuerySchema } from '@pet-desktop/contracts/travel';
+import type { ActiveTravelPage, TravelReportsQuery, TripPreparationPayload } from '@pet-desktop/contracts/travel';
 import { useAppStore } from '../shared/store';
 import {
   previewMatchesPreparation, reportsMatchQuery, reportsQueryKey, travelQueryCanAccept, travelReasonText,
@@ -16,6 +16,40 @@ function travelContext() {
   const generation = computed(() => store.ready && store.serviceStatus?.stage === 'READY' ? store.serviceStatus.generation : null);
   const revision = computed(() => generation.value === null ? null : store.snapshot?.revision ?? null);
   return { store, bridge, generation, revision };
+}
+
+export function useActiveTravelProjection() {
+  const { store, bridge, generation, revision } = travelContext();
+  const hasTrips = computed(() => store.snapshot?.pets.some(pet => pet.trip?.status === 'TRAVELING') === true);
+  const stamp = shallowRef<{ generation: number; page: ActiveTravelPage } | null>(null);
+  const failed = ref(false);
+  const page = computed(() => {
+    const current = stamp.value;
+    return current && current.generation === generation.value && store.snapshot
+      && activeTravelMatchesSnapshot(current.page, store.snapshot) ? current.page : null;
+  });
+  watch([generation, revision, hasTrips], async ([gen, base, active], _, onCleanup) => {
+    let stale = false;
+    onCleanup(() => { stale = true; });
+    failed.value = false;
+    if (!bridge || gen === null || base === null || !active) {
+      stamp.value = null;
+      return;
+    }
+    try {
+      const result = activeTravelIpcResultSchema.safeParse(await bridge.listActiveTravel());
+      if (stale || gen !== generation.value) return;
+      if (!result.success || !result.data.ok || !travelQueryCanAccept(result.data.activeTravel.revision, result.data.snapshot, store.snapshot, base)) {
+        failed.value = true;
+        return;
+      }
+      stamp.value = { generation: gen, page: result.data.activeTravel };
+      if (revision.value !== null && result.data.activeTravel.revision > revision.value) await store.refresh();
+    } catch {
+      if (!stale) failed.value = true;
+    }
+  }, { immediate: true });
+  return { activeTravel: page, activeTravelFailed: failed };
 }
 
 export function useTravelCatalogProjection() {

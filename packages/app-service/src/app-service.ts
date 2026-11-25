@@ -20,7 +20,7 @@ import { findAnyCgUnlock, freezeTripCgAssets, projectGallery, TRIP_CG_VARIANT as
 import { characterAcquisitionContext, createCharacterPet, createStarterPets, projectCharacterCatalog } from '#character-service';
 import { applyHomeState, hasVisibleHomeChange, initialHomeState, readHomeState, scheduleFromHome, transitionHomeState } from '#home-state-service';
 import { executeEconomyCommand, projectInventory } from '#economy-service';
-import { freezeDepartureLoadout, prepareTravel, projectTravelCatalog, projectTravelReports } from '#travel-service';
+import { freezeDepartureLoadout, prepareTravel, projectActiveTravel, projectTravelCatalog, projectTravelReports } from '#travel-service';
 import { chooseEvent, DEFAULT_EVENT_POLICY, expireEvent, projectEvents, triggerBondMilestones, triggerDaily, triggerEvent } from '#event-service';
 import type { EventMutation, EventPolicy } from '#event-service';
 
@@ -838,6 +838,13 @@ export class AppService {
         const outcome = this.getInventory(parsed.data.payload.legacyOffset ?? 0);
         return { schemaVersion: CONTRACT_SCHEMA_VERSION, ok: true, requestId,
           snapshot: outcome.snapshot, inventory: outcome.inventory };
+      }
+      if (parsed.data.method === 'travel/active') {
+        return this.withFeatureTransaction((tx, getSnapshot) => {
+          const snapshot = getSnapshot();
+          return { schemaVersion: CONTRACT_SCHEMA_VERSION, ok: true, requestId,
+            snapshot, activeTravel: projectActiveTravel(tx, snapshot.revision) };
+        });
       }
       if (parsed.data.method === 'travel/catalog') {
         const outcome = this.getTravelCatalog();

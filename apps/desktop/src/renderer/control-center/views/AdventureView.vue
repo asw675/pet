@@ -7,13 +7,15 @@ import {
   suppliesText, travelDuration, travelItemLabel, travelReasonText, travelRiskLabel, travelSupplyCount,
 } from '../../shared/travel-view-policy';
 import type { DepartureConfirmation } from '../../shared/travel-view-policy';
-import { useDeparturePreview, useTravelCatalogProjection } from '../useTravelProjection';
+import { useActiveTravelProjection, useDeparturePreview, useTravelCatalogProjection } from '../useTravelProjection';
 import { useNow } from '../useNow';
 import Icon from '../components/Icon.vue';
 import TripCard from '../components/TripCard.vue';
 import PetPortrait from '../../shared/PetPortrait.vue';
 
 const context = useTravelCatalogProjection();
+const { activeTravel, activeTravelFailed } = useActiveTravelProjection();
+const travelNodeLabels = { GATHER: '采集', BATTLE: '战斗', EVENT: '事件' } as const;
 const { store, generation, catalog, pending: catalogPending, queryError: catalogError, available, reload } = context;
 const pets = computed(() => store.snapshot?.pets ?? []);
 const activeTrips = computed(() => pets.value.filter(pet => pet.trip?.status === 'TRAVELING'));
@@ -192,7 +194,22 @@ onBeforeUnmount(() => { disposed = true; closeConfirmation(true); });
   </template>
   <section aria-labelledby="active-heading" class="page-section">
     <header class="section-heading"><div><span class="eyebrow">归家倒计时</span><h2 id="active-heading">当前旅行</h2></div><RouterLink to="/adventure/reports" class="panel-link">旅行报告 <Icon name="arrow" /></RouterLink></header>
-    <div class="panel trip-list" v-if="activeTrips.length"><TripCard v-for="pet in activeTrips" :key="pet.petId" :pet="pet" :now="now" /></div>
+    <div v-if="activeTrips.length" class="panel trip-list">
+      <div v-for="pet in activeTrips" :key="pet.petId">
+        <TripCard :pet="pet" :now="now" />
+        <template v-for="trip in activeTravel?.rows.filter(row => row.petId === pet.petId)" :key="trip.tripId">
+          <ol class="journey-steps" :aria-label="`${pet.nickname}的旅行路线`">
+            <li v-for="(node, index) in trip.nodes" :key="node.nodeId"
+              :aria-current="trip.phase === 'OUTBOUND' && index === trip.nodeIndex ? 'step' : undefined">
+              {{ travelNodeLabels[node.kind] }} · {{ index < trip.nodeIndex ? '已结算'
+                : trip.phase === 'RETURNING' ? '未到达' : index === trip.nodeIndex ? '进行中' : '待经过' }}
+            </li>
+          </ol>
+          <small v-if="trip.phase === 'RETURNING'" class="muted">已踏上归途</small>
+        </template>
+      </div>
+      <small v-if="activeTravelFailed" class="muted" role="status">暂时无法读取路线节点，仍可查看归家时间。</small>
+    </div>
     <div v-else class="panel empty-state compact-empty"><Icon name="map" /><h3>{{ store.snapshot ? '此刻没有进行中的旅行' : '等待旅行快照' }}</h3><p>出发后会显示服务确认的预计归家时间；到达该时间后仍需等待服务确认结算。</p></div>
   </section>
   <dialog ref="dialog" class="departure-dialog" aria-labelledby="departure-title" @cancel="cancelDialog" @close="onDialogClosed">
@@ -219,6 +236,8 @@ onBeforeUnmount(() => { disposed = true; closeConfirmation(true); });
 </template>
 
 <style scoped>
+.journey-steps { display: flex; flex-wrap: wrap; gap: 6px 18px; margin: 8px 0 12px; padding-inline-start: 24px; font-size: .85rem; }
+.journey-steps [aria-current='step'] { font-weight: 650; }
 .route-selection-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 230px), 1fr)); gap: 14px; align-items: stretch; }
 .route-option { overflow: hidden; display: flex; flex-direction: column; border-color: var(--border); }
 .route-option.chosen { border-color: #a6805e; box-shadow: 0 4px 22px #a6805e24; }

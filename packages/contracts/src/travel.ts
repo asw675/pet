@@ -101,6 +101,92 @@ export const tripReportFactSchema = z.discriminatedUnion('type', [
   z.strictObject({ ...factFields, type: z.literal('TRIP_RETURNED'), payload: z.strictObject({ reason: returnReason, actualReturnedAt: integer }) }),
 ]);
 export type TripReportFact = z.infer<typeof tripReportFactSchema>;
+
+/** Public, exact frozen route plan for an active journey. These authored
+ * settings are not future outcomes; no seed, RNG cursor, pending roll or
+ * cumulative uncommitted reward draft is exposed. */
+const mapNodeFields = { nodeId: id, durationMs: duration };
+const mapReward = integer.max(1_000_000), mapQuantity = positive.max(1_000_000);
+export const travelMapNodeSchema = z.discriminatedUnion('kind', [
+  z.strictObject({ ...mapNodeFields, kind: z.literal('GATHER'), itemId: id, minQuantity: mapQuantity, maxQuantity: mapQuantity, xp: mapReward })
+    .refine(node => node.minQuantity <= node.maxQuantity),
+  z.strictObject({ ...mapNodeFields, kind: z.literal('BATTLE'), enemyId: id, enemyPower: positive.max(1000), winXp: mapReward,
+    winCoins: mapReward, lossXp: mapReward, drop: z.strictObject({ itemId: id, quantity: mapQuantity, chanceBps: integer.max(10_000) }).nullable() })
+    .refine(node => node.lossXp <= node.winXp),
+  z.strictObject({ ...mapNodeFields, kind: z.literal('EVENT'), eventDefId: id, cgId: id, chanceBps: integer.max(10_000) }),
+]);
+export type TravelMapNode = z.infer<typeof travelMapNodeSchema>;
+
+export const activeTravelTripSchema = z.strictObject({
+  tripId: id, petId: id, routeId: id, contentVersion: positive, rulesVersion: id, departurePower: positive.max(1000),
+  startAt: integer, expectedReturnAt: integer, phase: z.enum(['OUTBOUND','RETURNING']), nextDueAt: integer,
+  returnReason: returnReason.nullable(), nodeIndex: integer.max(12), returnDurationMs: duration,
+  nodes: z.array(travelMapNodeSchema).min(2).max(12), facts: z.array(tripReportFactSchema).max(13),
+}).superRefine((trip, ctx) => {
+  const reject = (message: string) => ctx.addIssue({ code: 'custom', message });
+  const nodeIds = new Set(trip.nodes.map(node => node.nodeId));
+  const nominalDuration = trip.nodes.reduce((sum,node) => sum + node.durationMs, trip.returnDurationMs);
+  if (nodeIds.size !== trip.nodes.length || nominalDuration > 7 * 24 * 60 * 60_000
+    || !Number.isSafeInteger(trip.startAt + nominalDuration) || trip.expectedReturnAt !== trip.startAt + nominalDuration
+    || trip.nodeIndex > trip.nodes.length || trip.facts.length !== trip.nodeIndex + (trip.phase === 'RETURNING' ? 1 : 0)) {
+    reject('Active journey plan, cursor or fact count inconsistent'); return;
+  }
+  let at = trip.startAt, defeated = false;
+  for (let i = 0; i < trip.nodeIndex; i++) {
+    const node = trip.nodes[i]!, fact = trip.facts[i]!; at += node.durationMs;
+    if (fact.tripId !== trip.tripId || fact.petId !== trip.petId || fact.sequence !== i+1 || fact.eventId !== `${trip.tripId}:${i+1}`
+      || fact.scheduledAt !== at || defeated) reject('Active node fact is out of order or belongs to a different frozen trip');
+    if (fact.type === 'GATHER_RESOLVED' && node.kind === 'GATHER') {
+      if (fact.payload.nodeId !== node.nodeId || fact.payload.itemId !== node.itemId || fact.payload.quantity < node.minQuantity
+        || fact.payload.quantity > node.maxQuantity || fact.payload.xp !== node.xp) reject('Gather fact contradicts its frozen plan');
+    } else if (fact.type === 'BATTLE_RESOLVED' && node.kind === 'BATTLE') {
+      const { payload } = fact, won = payload.outcome === 'WIN';
+      if (payload.nodeId !== node.nodeId || payload.enemyId !== node.enemyId || payload.xp !== (won ? node.winXp : node.lossXp)
+        || payload.coins !== (won ? node.winCoins : 0) || (payload.drop !== null && (!won || !node.drop
+          || payload.drop.itemId !== node.drop.itemId || payload.drop.quantity !== node.drop.quantity))) reject('Battle fact contradicts its frozen plan');
+      defeated = !won;
+    } else if (fact.type === 'EVENT_RESOLVED' && node.kind === 'EVENT') {
+      if (fact.payload.nodeId !== node.nodeId || fact.payload.eventDefId !== node.eventDefId
+        || (fact.payload.cgId !== null && fact.payload.cgId !== node.cgId)) reject('Event fact contradicts its frozen plan');
+    } else reject('Active node fact kind differs from its frozen plan');
+  }
+  if (trip.phase === 'OUTBOUND') {
+    const next = trip.nodes[trip.nodeIndex];
+    if (!next || defeated || trip.returnReason !== null || trip.nextDueAt !== at + next.durationMs) reject('Outbound journey cursor inconsistent');
+  } else {
+    const last = trip.facts[trip.nodeIndex];
+    if (!last || last.type !== 'RETURNING' || last.tripId !== trip.tripId || last.petId !== trip.petId || last.sequence !== trip.nodeIndex+1
+      || last.eventId !== `${trip.tripId}:${trip.nodeIndex+1}` || last.scheduledAt < at || trip.returnReason !== last.payload.reason
+      || last.payload.dueAt !== trip.nextDueAt || last.scheduledAt + trip.returnDurationMs !== trip.nextDueAt) {
+      reject('Active return transition inconsistent'); return;
+    }
+    if (trip.returnReason === 'COMPLETED' ? defeated || trip.nodeIndex !== trip.nodes.length || last.scheduledAt !== at
+      : trip.returnReason === 'DEFEATED' ? !defeated || last.scheduledAt !== at
+        : trip.returnReason !== 'RECALLED' || defeated || trip.nodeIndex >= trip.nodes.length
+          || last.scheduledAt >= at + trip.nodes[trip.nodeIndex]!.durationMs) reject('Return reason contradicts committed node history');
+  }
+});
+export type ActiveTravelTrip = z.infer<typeof activeTravelTripSchema>;
+export const activeTravelPageSchema = z.strictObject({ revision: integer, rows: z.array(activeTravelTripSchema).max(100) })
+  .refine(page => new Set(page.rows.map(row => row.tripId)).size === page.rows.length
+    && new Set(page.rows.map(row => row.petId)).size === page.rows.length
+    && page.rows.every((row,index) => index === 0 || page.rows[index-1]!.petId < row.petId), 'Duplicate or unordered active trip identities');
+export type ActiveTravelPage = z.infer<typeof activeTravelPageSchema>;
+
+/** Correlate the active projection to the same authoritative game snapshot.
+ * Structural type avoids a runtime dependency back into the root contract. */
+export function activeTravelMatchesSnapshot(page: ActiveTravelPage, snapshot: { revision: number; pets: readonly {
+  petId: string; presence: string; trip?: { tripId: string; routeId: string; status: string; expectedReturnAt: number } | undefined;
+}[] }): boolean {
+  if (page.revision !== snapshot.revision) return false;
+  const active = snapshot.pets.filter(pet => pet.trip?.status === 'TRAVELING');
+  return active.length === page.rows.length && page.rows.every(row => {
+    const pet = active.find(candidate => candidate.petId === row.petId);
+    return !!pet && pet.trip?.tripId === row.tripId && pet.trip.routeId === row.routeId
+      && (row.phase === 'OUTBOUND' ? pet.presence === 'AWAY' && pet.trip.expectedReturnAt === row.expectedReturnAt
+        : pet.presence === 'RETURNING' && pet.trip.expectedReturnAt === row.nextDueAt);
+  });
+}
 const rewardLine = z.strictObject({ kind: z.enum(['XP', 'COIN', 'ITEM', 'CG']), targetId: z.string().min(1).max(256), amount: positive });
 
 /** Read-only settled history. Rewards are committed ledger facts, not

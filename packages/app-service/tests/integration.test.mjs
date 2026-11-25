@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { activeTravelIpcResultSchema, resultMatchesMethod } from '@pet-desktop/contracts';
 import { AppService } from '../src/app-service.ts';
 import { verifyMigrationBackup } from '../src/migration-backup.ts';
 import { MIGRATION_001, MIGRATION_002, MIGRATION_003, MIGRATION_004, SQLiteRepository, SCHEMA_VERSION } from '../src/sqlite-repository.ts';
@@ -93,6 +94,40 @@ function readEvents(service, query = {}) {
 const allEventChances = Object.freeze({ HOME_DAILY: 10000, AFTER_INTERACTION: 10000, TRIP_RETURNED: 10000, BOND_MILESTONE: 10000 });
 const DAY = 86_400_000;
 const triggerKey = (kind, petId, source) => JSON.stringify([kind, petId, source]);
+
+describe.skipIf(!supported)('active travel map over real SQLite', () => {
+  it('shows only frozen nodes and committed facts through advance, recall and restart', () => {
+    const f = fixture();
+    let instance = f.open();
+    const readMap = () => {
+      const value = instance.service.handleRequest({ schemaVersion: 1, requestId: 'active-query', method: 'travel/active', payload: {} });
+      const result = activeTravelIpcResultSchema.parse(value);
+      expect(result.ok).toBe(true);
+      expect(resultMatchesMethod('snapshot/get', result)).toBe(false);
+      return result;
+    };
+    expect(readMap().activeTravel.rows).toEqual([]);
+    const petId = 'pet-1';
+    const departed = expectSuccess(f.request(instance.service, f.command('TRIP_START', { petId, routeId: DEMO_ROUTE.routeId })));
+    const tripId = departed.pets.find(pet => pet.petId === petId).trip.tripId;
+    const initial = readMap().activeTravel.rows[0];
+    expect(initial).toMatchObject({ tripId, petId, phase: 'OUTBOUND', nodeIndex: 0, facts: [] });
+    expect(initial.nodes).toEqual(DEMO_ROUTE.nodes);
+    expect(initial).not.toHaveProperty('seed');
+    f.advance(initial.nextDueAt);
+    const progressed = readMap();
+    expect(progressed.activeTravel.rows[0]).toMatchObject({ nodeIndex: 1, facts: [expect.objectContaining({ tripId, sequence: 1 })] });
+    expect(activeTravelIpcResultSchema.safeParse({ ...progressed, activeTravel: { ...progressed.activeTravel, rows: [] } }).success).toBe(false);
+    expectSuccess(f.request(instance.service, f.command('TRIP_RECALL', { petId, tripId })));
+    const returning = readMap();
+    expect(returning.activeTravel.rows[0]).toMatchObject({ phase: 'RETURNING', returnReason: 'RECALLED', nodeIndex: 1 });
+    instance.close();
+    instance = f.open();
+    expect(readMap()).toEqual(returning);
+    f.advance(returning.activeTravel.rows[0].nextDueAt);
+    expect(readMap().activeTravel.rows).toEqual([]);
+  });
+});
 
 describe.skipIf(!supported)('narrative events + real SQLite authority', () => {
   it('uses the production policy, persists chance/no-event, hides effects, and commits a chosen branch once across restart', () => {

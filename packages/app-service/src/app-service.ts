@@ -2,7 +2,7 @@ import {
   appSnapshotSchema, CONTRACT_SCHEMA_VERSION, domainCommandSchema, domainEventSchema,
   idSchema, ipcRequestSchema, timestampSchema,
 } from '@pet-desktop/contracts';
-import type { AppSnapshot, CharacterCatalogPage, DomainCommand, DomainEvent, GalleryPage, GalleryQuery, IpcErrorCode, IpcResult, PetSnapshot } from '@pet-desktop/contracts';
+import type { AppSnapshot, CharacterCatalogPage, DomainCommand, DomainEvent, GalleryPage, GalleryQuery, InventoryPage, IpcErrorCode, IpcResult, PetSnapshot } from '@pet-desktop/contracts';
 import {
   advanceTrip, createTripCheckpoint, createTripSnapshot, DEMO_ROUTE, recallTrip,
 } from '@pet-desktop/domain';
@@ -16,12 +16,14 @@ import type {
 import { freezeTripCgAssets, projectGallery, TRIP_CG_VARIANT as CG_VARIANT } from '#gallery-service';
 import { characterAcquisitionContext, createCharacterPet, createStarterPets, projectCharacterCatalog } from '#character-service';
 import { applyHomeState, hasVisibleHomeChange, initialHomeState, readHomeState, scheduleFromHome, transitionHomeState } from '#home-state-service';
+import { battleProjection, executeEconomyCommand, projectInventory } from '#economy-service';
 
 const DEPARTURE_ENERGY10 = 150;
 
 type Failure = Extract<CommandOutcome, { ok: false }>;
 type GalleryOutcome = { ok: true; snapshot: AppSnapshot; gallery: GalleryPage } | Failure;
 type CharactersOutcome = { ok: true; snapshot: AppSnapshot; characters: CharacterCatalogPage };
+type InventoryOutcome = { ok: true; snapshot: AppSnapshot; inventory: InventoryPage };
 
 function failure(code: IpcErrorCode, message: string, retryable = false): Failure {
   return { ok: false, error: { code, message, retryable } };
@@ -150,7 +152,7 @@ export class AppService {
         return;
       }
       if (tx.listPets().length !== 0 || tx.listTrips().length !== 0 || tx.getWalletCoins() !== 0
-        || tx.listInventory().length !== 0 || tx.hasCommandReceipts() || tx.listOutbox(0, 1).length !== 0) {
+        || tx.listInventory().length !== 0 || tx.listItemInstances().length !== 0 || tx.hasCommandReceipts() || tx.listOutbox(0, 1).length !== 0) {
         // A partially initialized or damaged database is not an empty save.
         throw new Error('Cannot initialize over existing game data');
       }
@@ -432,6 +434,19 @@ export class AppService {
       }
       return;
     }
+    if (command.type === 'SHOP_PURCHASE' || command.type === 'EQUIPMENT_EQUIP' || command.type === 'EQUIPMENT_UNEQUIP'
+      || command.type === 'EQUIPMENT_UPGRADE' || command.type === 'EQUIPMENT_SALVAGE' || command.type === 'ITEM_USE') {
+      const result = executeEconomyCommand(tx, command, at, () => this.runtime.createId('item'));
+      if (!result.ok) return result;
+      for (const affectedPetId of new Set(result.affectedPetIds)) {
+        const affected = tx.getPet(affectedPetId);
+        if (!affected) throw new Error('Economy mutation refers to an absent pet');
+        tx.savePet({ ...affected, revision: addNonnegative(affected.revision, 1) });
+      }
+      this.revise(state);
+      this.event(state, result.eventType, result.aggregateId, command.commandId, at, result.payload);
+      return;
+    }
     // Acquiring creates an instance and therefore has no existing petId to
     // look up. Every check and the debit happen in this command transaction.
     if (command.type === 'PET_ACQUIRE') {
@@ -533,8 +548,10 @@ export class AppService {
         // The visible projection is already current; recompute any fractions
         // not yet durably saved by its preceding read-only tick before leaving.
         const beforeDeparture = advanceHomeState(readHomeState(tx, pet, at), at);
+        // New trips freeze the current progression/equipment-derived power;
+        // replay continues to use the exact immutable power in old snapshots.
         const snapshot = createTripSnapshot({ tripId: this.runtime.createId('trip'), petId: pet.petId,
-          power: pet.power, seed: this.runtime.seed(), startAt: at, route: DEMO_ROUTE });
+          power: battleProjection(tx, pet).battlePower, seed: this.runtime.seed(), startAt: at, route: DEMO_ROUTE });
         tx.insertTrip({ snapshot, checkpoint: createTripCheckpoint(snapshot), status: 'TRAVELING', reportReadAt: null });
         // Freeze the CG content identity in the same transaction as departure.
         // The trip snapshot and reward keys intentionally retain their existing
@@ -637,6 +654,15 @@ export class AppService {
     });
   }
 
+  private getInventory(legacyOffset = 0): InventoryOutcome {
+    return this.repository.transaction((tx) => {
+      const state = this.state(tx);
+      this.advanceAll(state);
+      const snapshot = this.snapshot(state);
+      return { ok: true, snapshot, inventory: projectInventory(tx, snapshot.revision, legacyOffset) };
+    });
+  }
+
   dispatch(command: DomainCommand): CommandOutcome {
     if (this.closed) return unavailable();
     const parsed = domainCommandSchema.safeParse(command);
@@ -687,6 +713,11 @@ export class AppService {
         const outcome = this.getCharacters();
         return { schemaVersion: CONTRACT_SCHEMA_VERSION, ok: true, requestId,
           snapshot: outcome.snapshot, characters: outcome.characters };
+      }
+      if (parsed.data.method === 'inventory/list') {
+        const outcome = this.getInventory(parsed.data.payload.legacyOffset ?? 0);
+        return { schemaVersion: CONTRACT_SCHEMA_VERSION, ok: true, requestId,
+          snapshot: outcome.snapshot, inventory: outcome.inventory };
       }
       const outcome = parsed.data.method === 'snapshot/get' ? { ok: true as const, snapshot: this.getSnapshot() }
         : this.dispatch(parsed.data.payload.command);

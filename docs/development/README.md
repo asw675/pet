@@ -32,11 +32,12 @@
 | 006C-1 | 职业成长与装备纯规则 | 领域 72 项通过 | [006c1-progression-rules](006c1-progression-rules.md) |
 | 006D-1 | 物品目录及商城纯报价 | 领域93项通过 | [006d1-item-catalog](006d1-item-catalog.md) |
 | 006D-2A | 背包、装备、成长、商城闭合契约 | 专项87项通过 | [006d2a-inventory-contract](006d2a-inventory-contract.md) |
+| 006D-2B/C/D | v5真实装备经济、成长属性、背包商城与历史库存兼容 | 数据库、业务、页面专项通过 | [006d2-inventory-authority](006d2-inventory-authority.md) |
 | 006E-1 | 三路线目录与出发前置纯规则 | 领域74项通过 | [006e1-travel-preparation](006e1-travel-preparation.md) |
 | 006E-2A | 旅行准备、冻结出发与完整历史投影契约 | 11项专项通过，权威接入待完成 | [006e2a-travel-contract](006e2a-travel-contract.md) |
 | 006F-1 | 随机剧情、分支冻结及六项原创事件 | 领域64项通过 | [006f1-event-engine](006f1-event-engine.md) |
 | 006-Q | 中间代码与功能核对（固定5b6f4dc） | 开发覆盖41.3% | [006-progress-checkpoint](006-progress-checkpoint.md) |
-| 006C-2/D-2/E-2/F | 成长投影、装备经济、旅行、随机事件 | 分模块开发中 | — |
+| 006E-2B/C/D、006F-2 | 旅行持久化与完整历史、随机事件业务接入 | 分模块开发中 | — |
 | 007A-1 | AI 人格/Provider/逐宠会话及记忆契约 | 专项136项通过 | [007a1-ai-contract](007a1-ai-contract.md) |
 | 007A-2 | OpenAI-compatible Provider、受限流、人格 prompt | Fake fetch 61项通过，真实服务待配置 | [007a2-provider-adapter](007a2-provider-adapter.md) |
 | 007A-3 | 逐宠异步会话、取消、持久终态 port 与授权候选 | 33项专项通过；实际存储接入待完成 | [007a3-chat-coordinator](007a3-chat-coordinator.md) |

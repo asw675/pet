@@ -4,11 +4,12 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { AppService } from '../src/app-service.ts';
 import { verifyMigrationBackup } from '../src/migration-backup.ts';
-import { MIGRATION_001, MIGRATION_002, MIGRATION_003, SQLiteRepository } from '../src/sqlite-repository.ts';
+import { MIGRATION_001, MIGRATION_002, MIGRATION_003, MIGRATION_004, SQLiteRepository } from '../src/sqlite-repository.ts';
 import { advanceTrip, createTripCheckpoint, createTripSnapshot, DEMO_ROUTE } from '@pet-desktop/domain';
 import { findBuiltinCg } from '@pet-desktop/domain/cg-catalog';
 import { CHARACTER_CATALOG_VERSION } from '@pet-desktop/domain/character-catalog';
 import { HOME_RULES, advanceHomeState } from '@pet-desktop/domain/home-simulation';
+import { ITEM_CATALOG_VERSION } from '@pet-desktop/domain/item-catalog';
 
 const initialTime = 1_800_000_000_000;
 const minutes = (n) => n * 60_000;
@@ -81,6 +82,15 @@ function readCharacters(service) {
   expect(result.ok).toBe(true);
   expect(result.characters.revision).toBe(result.snapshot.revision);
   expect(result.characters.walletCoins).toBe(result.snapshot.walletCoins);
+  return result;
+}
+
+function readInventory(service, legacyOffset) {
+  const result = service.handleRequest({ schemaVersion: 1, requestId: 'inventory-query', method: 'inventory/list',
+    payload: legacyOffset === undefined ? {} : { legacyOffset } });
+  expect(result.ok).toBe(true);
+  expect(result.inventory.revision).toBe(result.snapshot.revision);
+  expect(result.inventory.walletCoins).toBe(result.snapshot.walletCoins);
   return result;
 }
 
@@ -645,7 +655,7 @@ describe.skipIf(!supported)('persisted HOME recovery and bounded interactions', 
     instance.close();
     const upgraded = new DatabaseSync(f.dbPath, { readOnly: true });
     try {
-      expect(upgraded.prepare('PRAGMA user_version').get().user_version).toBe(4);
+      expect(upgraded.prepare('PRAGMA user_version').get().user_version).toBe(5);
       expect(upgraded.prepare('SELECT fingerprint,outcome_json,created_at FROM commands WHERE command_id=?').get(oldCommand.commandId))
         .toEqual({ fingerprint, outcome_json: outcome, created_at: initialTime });
       expect(upgraded.prepare('SELECT acquired_at FROM pet_acquisitions WHERE pet_id=?').get(petId).acquired_at)
@@ -669,5 +679,222 @@ describe.skipIf(!supported)('persisted HOME recovery and bounded interactions', 
       }
       expect(() => f.open()).toThrow();
     }
+  });
+});
+
+describe.skipIf(!supported)('shared equipment economy in actual SQLite', () => {
+  const version = ITEM_CATALOG_VERSION;
+
+  it('earns actual trip coins, purchases/assigns/upgrades/uses/retires items, and recovers exact receipts without rewriting a frozen trip', () => {
+    const f = fixture();
+    let failEvent = false;
+    let instance = f.open(repo => ({
+      close: () => repo.close(),
+      transaction: action => repo.transaction(tx => action(new Proxy(tx, {
+        get(target, key) {
+          if (key === 'appendOutbox' && failEvent) return event => {
+            if (event.type === 'ShopPurchased') throw new Error('injected commerce failure');
+            return target.appendOutbox(event);
+          };
+          const value = Reflect.get(target, key);
+          return typeof value === 'function' ? value.bind(target) : value;
+        },
+      }))),
+    }));
+    const originalTrips = [];
+    for (let i = 0; i < 5; i++) {
+      const dispatch = expectSuccess(f.request(instance.service, f.command('TRIP_START', { petId: 'pet-1', routeId: DEMO_ROUTE.routeId })));
+      const tripId = dispatch.pets[0].trip.tripId;
+      f.advance(initialTime + minutes((i + 1) * 15));
+      instance.service.getSnapshot();
+      originalTrips.push(instance.repo.transaction(tx => ({ trip: tx.getTrip(tripId), ledger: tx.listRewards(tripId), settlement: tx.getSettlement(tripId) })));
+    }
+    const beforeBuy = readInventory(instance.service);
+    expect(beforeBuy.snapshot.walletCoins).toBe(40);
+    expect(beforeBuy.snapshot.pets[0].level).toBe(2);
+    const command = (type, payload, id) => f.command(type, { ...payload, catalogVersion: version }, id, instance.service.getSnapshot().revision);
+    const snapshot = () => instance.repo.transaction(tx => ({ coins: tx.getWalletCoins(), items: tx.listItemInstances(),
+      stacks: tx.listInventory(), equipment: tx.listPetEquipment(), preferences: tx.getPreferences(), outbox: tx.listOutbox(0, 200) }));
+    const purchase = command('SHOP_PURCHASE', { offerId: 'shop-apprentice-staff', quantity: 2 }, 'earned-staff-pair');
+    const beforeFailure = snapshot();
+    failEvent = true;
+    expect(f.request(instance.service, purchase)).toMatchObject({ ok: false, error: { code: 'INTERNAL_ERROR' } });
+    expect(snapshot()).toEqual(beforeFailure);
+    expect(instance.repo.transaction(tx => [tx.getCommerceOperation(purchase.commandId), tx.getCommandReceipt(purchase.commandId)])).toEqual([null, null]);
+    failEvent = false;
+    const purchased = expectSuccess(f.request(instance.service, purchase));
+    expect(purchased.walletCoins).toBe(16);
+    const [one, two] = instance.repo.transaction(tx => tx.getCommerceOperation(purchase.commandId).instanceIds);
+    expect(one).not.toBe(two);
+    expect(instance.repo.transaction(tx => tx.listItemInstances())).toHaveLength(2);
+
+    expectSuccess(f.request(instance.service, command('SHOP_PURCHASE', { offerId: 'shop-iron-ore', quantity: 1 }, 'earned-ore')));
+    expectSuccess(f.request(instance.service, command('EQUIPMENT_EQUIP', { petId: 'pet-1', instanceId: one, slot: 'WEAPON' }, 'assign-first')));
+    expect(f.request(instance.service, command('EQUIPMENT_EQUIP', { petId: 'pet-2', instanceId: one, slot: 'WEAPON' }, 'reject-theft')))
+      .toMatchObject({ ok: false, error: { code: 'BUSINESS_RULE' } });
+    expectSuccess(f.request(instance.service, command('EQUIPMENT_EQUIP', { petId: 'pet-1', instanceId: two, slot: 'WEAPON' }, 'replace-owned')));
+    expect(instance.repo.transaction(tx => tx.getCommerceOperation('replace-owned'))).toMatchObject({ previousInstanceId: one, instanceId: two });
+    expectSuccess(f.request(instance.service, command('EQUIPMENT_EQUIP', { petId: 'pet-2', instanceId: one, slot: 'WEAPON' }, 'assign-other')));
+    const gearBefore = readInventory(instance.service).inventory;
+    const quoted = gearBefore.instances.find(item => item.instanceId === two).upgrade;
+    expect(quoted).toMatchObject({ ok: true, affordable: true, cost: { coins: 10, materials: [{ itemId: 'iron-ore', quantity: 1 }] } });
+    const upgrade = command('EQUIPMENT_UPGRADE', { instanceId: two, expectedEnhancement: 0 }, 'upgrade-paid');
+    const upgraded = expectSuccess(f.request(instance.service, upgrade));
+    expect(upgraded.walletCoins).toBe(3);
+    expect(instance.repo.transaction(tx => tx.getItemInstance(two).enhancement)).toBe(1);
+    expect(instance.repo.transaction(tx => tx.listInventory().find(row => row.itemId === 'iron-ore').quantity)).toBe(0);
+    const gearAfter = readInventory(instance.service).inventory;
+    expect(gearAfter.pets[0].battlePower).toBeGreaterThan(gearBefore.pets[0].battlePower);
+    expect(gearAfter.pets[1]).toEqual(gearBefore.pets[1]);
+    expect(f.request(instance.service, command('EQUIPMENT_SALVAGE', { instanceId: two, expectedEnhancement: 1 }, 'reject-equipped-salvage')))
+      .toMatchObject({ ok: false, error: { code: 'BUSINESS_RULE' } });
+
+    expectSuccess(f.request(instance.service, command('SHOP_PURCHASE', { offerId: 'shop-ration', quantity: 1 }, 'paid-ration')));
+    const feed = command('ITEM_USE', { petId: 'pet-1', itemId: 'ration' }, 'consume-once');
+    const fed = expectSuccess(f.request(instance.service, feed));
+    expect(fed.walletCoins).toBe(1);
+    expect(fed.pets[0]).toMatchObject({ energy: 45, activity: 'EAT' });
+    const power = readInventory(instance.service).inventory.pets[0].battlePower;
+    const departed = expectSuccess(f.request(instance.service, f.command('TRIP_START', { petId: 'pet-1', routeId: DEMO_ROUTE.routeId })));
+    const travel = departed.pets[0].trip.tripId;
+    const frozen = instance.repo.transaction(tx => tx.getTrip(travel).snapshot);
+    expect(frozen.power).toBe(power);
+    expectSuccess(f.request(instance.service, command('EQUIPMENT_UNEQUIP', { petId: 'pet-1', slot: 'WEAPON' }, 'release-during-travel')));
+    const salvage = command('EQUIPMENT_SALVAGE', { instanceId: two, expectedEnhancement: 1 }, 'salvage-once');
+    const salvaged = expectSuccess(f.request(instance.service, salvage));
+    expect(salvaged.pets[0].presence).toBe('AWAY');
+    expect(salvaged.walletCoins).toBe(1);
+    expect(instance.repo.transaction(tx => tx.getItemInstance(two))).toBeNull();
+    expect(instance.repo.transaction(tx => tx.listInventory().find(row => row.itemId === 'iron-scrap').quantity)).toBe(1);
+    expect(instance.repo.transaction(tx => tx.getTrip(travel).snapshot)).toEqual(frozen);
+    const operationIds = [purchase.commandId, 'earned-ore', 'assign-first', 'replace-owned', 'assign-other', upgrade.commandId,
+      'paid-ration', feed.commandId, 'release-during-travel', salvage.commandId];
+    const operations = instance.repo.transaction(tx => operationIds.map(id => tx.getCommerceOperation(id)));
+    expect(operations.every(Boolean)).toBe(true);
+    const durable = snapshot();
+    instance.close();
+    instance = f.open();
+    expect(expectSuccess(f.request(instance.service, purchase))).toEqual(purchased);
+    expect(expectSuccess(f.request(instance.service, upgrade))).toEqual(upgraded);
+    expect(expectSuccess(f.request(instance.service, feed))).toEqual(fed);
+    expect(expectSuccess(f.request(instance.service, salvage))).toEqual(salvaged);
+    expect(snapshot()).toEqual(durable);
+    expect(instance.repo.transaction(tx => operationIds.map(id => tx.getCommerceOperation(id)))).toEqual(operations);
+    f.advance(initialTime + minutes(90));
+    instance.service.getSnapshot();
+    expect(instance.repo.transaction(tx => tx.getTrip(travel).snapshot)).toEqual(frozen);
+    expect(instance.repo.transaction(tx => originalTrips.map(record => ({ trip: tx.getTrip(record.trip.snapshot.tripId),
+      ledger: tx.listRewards(record.trip.snapshot.tripId), settlement: tx.getSettlement(record.trip.snapshot.tripId) })))).toEqual(originalTrips);
+    expect(instance.repo.transaction(tx => tx.listItemInstances())).toEqual([expect.objectContaining({ instanceId: one, enhancement: 0 })]);
+    instance.close();
+  });
+
+  it('rolls back operands, operation record and receipt together if final receipt persistence fails', () => {
+    const f = fixture();
+    let failReceipt = false;
+    let instance = f.open(repo => ({
+      close: () => repo.close(),
+      transaction: action => repo.transaction(tx => action(new Proxy(tx, {
+        get(target, key) {
+          if (key === 'saveCommandReceipt' && failReceipt) return receipt => {
+            target.saveCommandReceipt(receipt);
+            if (receipt.commandId === 'receipt-failure') throw new Error('injected receipt rollback');
+          };
+          const value = Reflect.get(target, key);
+          return typeof value === 'function' ? value.bind(target) : value;
+        },
+      }))),
+    }));
+    instance.repo.transaction(tx => tx.setWalletCoins(12));
+    const purchase = f.command('SHOP_PURCHASE', { offerId: 'shop-apprentice-staff', quantity: 1, catalogVersion: version },
+      'receipt-failure', instance.service.getSnapshot().revision);
+    failReceipt = true;
+    expect(f.request(instance.service, purchase)).toMatchObject({ ok: false, error: { code: 'INTERNAL_ERROR' } });
+    expect(instance.repo.transaction(tx => [tx.getWalletCoins(), tx.listItemInstances(), tx.getCommerceOperation(purchase.commandId),
+      tx.getCommandReceipt(purchase.commandId)])).toEqual([12, [], null, null]);
+    failReceipt = false;
+    const result = expectSuccess(f.request(instance.service, purchase));
+    expect(result.walletCoins).toBe(0);
+    instance.close();
+    instance = f.open();
+    expect(expectSuccess(f.request(instance.service, purchase))).toEqual(result);
+    expect(instance.repo.transaction(tx => tx.listItemInstances())).toHaveLength(1);
+    instance.close();
+  });
+
+  it('preserves and paginates 257+ historical v4 stacks, including a current gear-ID collision, without blocking real trip rewards', () => {
+    const f = fixture();
+    const petId = 'pet-1';
+    const db = new DatabaseSync(f.dbPath);
+    try {
+      for (const [versionNumber, sql, checksum] of [
+        [1, MIGRATION_001, 'fnv1a32:9d3ced6f'], [2, MIGRATION_002, 'fnv1a32:a0036d79'], [3, MIGRATION_003, 'fnv1a32:519a9ef3'],
+        [4, MIGRATION_004, 'fnv1a32:0f3c0f0e'],
+      ]) {
+        db.exec(sql);
+        db.prepare('INSERT INTO schema_migrations VALUES (?, ?, ?)').run(versionNumber, checksum, initialTime);
+        db.exec(`PRAGMA user_version=${versionNumber}`);
+      }
+      db.prepare('INSERT INTO pets VALUES (?, ?, ?, ?)').run(petId, 'star-singer', '星咏', 0);
+      db.prepare('INSERT INTO pet_states VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+        .run(petId, 'HOME', 'IDLE', 'CALM', 'NORMAL', 'VISIBLE', 500, 1000, 1000, 0);
+      db.prepare('INSERT INTO pet_progression VALUES (?, ?, ?)').run(petId, 30, 0);
+      db.prepare('INSERT INTO preferences VALUES (?, ?, ?, ?, ?, ?)').run(1, 0, initialTime, petId, 0, 0);
+      db.prepare('INSERT INTO pet_home_schedules VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+        .run(petId, initialTime, null, 0, 0, 0, Math.floor(initialTime / HOME_RULES.dayMs), 0, null);
+      db.prepare('UPDATE wallet SET balance=? WHERE currency=?').run(20, 'coin');
+      const stack = db.prepare('INSERT INTO inventory(item_id,quantity) VALUES (?,?)');
+      // Old valid stack identity collides with a gear definition introduced
+      // by v5. This row remains history; it must never turn into a +0 staff.
+      stack.run('apprentice-staff', 7);
+      for (let i = 0; i < 260; i++) stack.run(`legacy-${String(i).padStart(3,'0')}`, i % 5);
+      stack.run('ration', 2);
+    } finally { db.close(); }
+
+    const beforeMigration = (source, from) => {
+      expect(from).toBe(4);
+      verifyMigrationBackup(source, `${f.dbPath}.v4-legacy-backup`, from, filename => new DatabaseSync(filename, { readOnly: true }));
+    };
+    const instance = f.open(repo => repo, { beforeMigration });
+    const first = readInventory(instance.service).inventory;
+    expect(first).toMatchObject({ legacyStackOffset: 0, legacyStackTotal: 261 });
+    expect(first.stacks[0]).toEqual({ itemId: 'ration', quantity: 2, definitionState: 'AVAILABLE' });
+    expect(first.stacks[1]).toEqual({ itemId: 'apprentice-staff', quantity: 7, definitionState: 'LEGACY_UNKNOWN' });
+    expect(first.instances).toEqual([]);
+    const historical = [];
+    for (const offset of [0,128,256,10_000]) {
+      const page = readInventory(instance.service, offset).inventory;
+      expect(page.legacyStackOffset).toBe(offset);
+      expect(page.legacyStackTotal).toBe(261);
+      expect(page.stacks.filter(row => row.definitionState === 'AVAILABLE')).toEqual([first.stacks[0]]);
+      historical.push(...page.stacks.filter(row => row.definitionState === 'LEGACY_UNKNOWN'));
+    }
+    expect(historical).toHaveLength(261);
+    expect(new Set(historical.map(row => row.itemId)).size).toBe(261);
+    expect(historical.map(row => row.itemId)).toEqual(historical.map(row => row.itemId).sort());
+
+    const trip = expectSuccess(f.request(instance.service, f.command('TRIP_START', { petId, routeId: DEMO_ROUTE.routeId }))).pets[0].trip.tripId;
+    f.advance(initialTime + minutes(15));
+    const afterTrip = readInventory(instance.service, 128);
+    expect(afterTrip.snapshot.walletCoins).toBe(28);
+    expect(afterTrip.snapshot.pets[0]).toMatchObject({ presence: 'HOME', xp: 24 });
+    expect(afterTrip.inventory.stacks.filter(row => row.definitionState === 'AVAILABLE')).toEqual([
+      { itemId: 'herb', quantity: 1, definitionState: 'AVAILABLE' }, { itemId: 'ration', quantity: 2, definitionState: 'AVAILABLE' },
+      { itemId: 'slime-gel', quantity: 1, definitionState: 'AVAILABLE' },
+    ]);
+    expect(instance.repo.transaction(tx => tx.getSettlement(trip))).not.toBeNull();
+    const command = (type, payload, id) => f.command(type, { ...payload, catalogVersion: version }, id, instance.service.getSnapshot().revision);
+    expect(f.request(instance.service, command('ITEM_USE', { petId, itemId: 'apprentice-staff' }, 'deny-historical-gear-stack-use')))
+      .toMatchObject({ ok: false, error: { code: 'BUSINESS_RULE' } });
+    expectSuccess(f.request(instance.service, command('SHOP_PURCHASE', { offerId: 'shop-apprentice-staff', quantity: 1 }, 'new-staff-not-conversion')));
+    expectSuccess(f.request(instance.service, command('SHOP_PURCHASE', { offerId: 'shop-healing-potion', quantity: 1 }, 'new-compatible-stack')));
+    const afterPurchases = readInventory(instance.service, 0).inventory;
+    expect(afterPurchases.walletCoins).toBe(12);
+    expect(afterPurchases.instances).toEqual([expect.objectContaining({ definitionId: 'apprentice-staff', enhancement: 0 })]);
+    expect(afterPurchases.stacks.find(row => row.itemId === 'apprentice-staff')).toEqual({ itemId: 'apprentice-staff', quantity: 7, definitionState: 'LEGACY_UNKNOWN' });
+    expect(afterPurchases.stacks.find(row => row.itemId === 'healing-potion')).toEqual({ itemId: 'healing-potion', quantity: 1, definitionState: 'AVAILABLE' });
+    expect(afterPurchases.legacyStackTotal).toBe(261);
+    expect(instance.repo.transaction(tx => tx.listInventory().length)).toBe(265); // all 261 + four compatible stacks, no truncation
+    instance.close();
   });
 });

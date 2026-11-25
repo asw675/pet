@@ -7,7 +7,7 @@ const positive = nonnegative.min(1);
 /** V1 wire limits; changing these/cap semantics requires a coordinated
  * domain + repository + contract revision, not client-side truncation. */
 export const inventoryLimits = Object.freeze({
-  definitions: 256, stacks: 256, instances: 500, offers: 256, pets: 100,
+  definitions: 256, stacks: 384, stackCapacity: 256, legacyStackPage: 128, instances: 500, offers: 256, pets: 100,
   purchaseQuantity: 100, equipmentEnhancement: 5, maxLevel: 20,
   battleStat: 1_000_000, battlePower: 1_000, materialAmounts: 16,
 });
@@ -186,6 +186,7 @@ function matchesBonus(actual: BattleStats | null, def: EquipmentDefinition, enha
  * every version, ownership, affordability and gameplay restriction at commit. */
 export const inventoryPageSchema = z.strictObject({
   revision: nonnegative, catalogVersion: itemCatalogVersionSchema, walletCoins: nonnegative,
+  legacyStackOffset: nonnegative.max(1_000_000), legacyStackTotal: nonnegative,
   definitions: z.array(itemDefinitionSchema).max(inventoryLimits.definitions),
   stacks: z.array(inventoryStackSchema).max(inventoryLimits.stacks),
   instances: z.array(inventoryEquipmentInstanceSchema).max(inventoryLimits.instances),
@@ -209,9 +210,17 @@ export const inventoryPageSchema = z.strictObject({
     if (stacks.has(stack.itemId)) issue(['stacks', index], 'Duplicate held stack');
     stacks.set(stack.itemId, stack.quantity);
     const def = definitions.get(stack.itemId);
-    if (def?.kind === 'EQUIPMENT' || stack.definitionState !== (def ? 'AVAILABLE' : 'LEGACY_UNKNOWN')) {
+    // Earlier saves could hold a stack whose ID was later assigned to a
+    // unique gear definition. Keep it historical; never transform it to gear.
+    if (stack.definitionState !== (def && def.kind !== 'EQUIPMENT' ? 'AVAILABLE' : 'LEGACY_UNKNOWN')) {
       issue(['stacks', index], 'Stack identity contradicts the item definition or legacy state');
     }
+  }
+  const legacyRows = page.stacks.filter((stack) => stack.definitionState === 'LEGACY_UNKNOWN');
+  if (legacyRows.length !== Math.min(inventoryLimits.legacyStackPage, Math.max(0, page.legacyStackTotal - page.legacyStackOffset))
+    || page.stacks.length - legacyRows.length > inventoryLimits.stackCapacity) issue(['stacks'], 'Historical stack page length or active stack capacity is invalid');
+  for (let index = 1; index < legacyRows.length; index++) {
+    if (legacyRows[index - 1]!.itemId >= legacyRows[index]!.itemId) issue(['stacks'], 'Historical stacks must be ordered by stable ID');
   }
   const offerIds = new Set<string>(), offeredItems = new Set<string>();
   for (const [index, offer] of page.offers.entries()) {
@@ -279,6 +288,8 @@ export const inventoryPageSchema = z.strictObject({
   }
 });
 export type InventoryPage = z.infer<typeof inventoryPageSchema>;
+export const inventoryQuerySchema = z.strictObject({ legacyOffset: nonnegative.max(1_000_000).optional() });
+export type InventoryQuery = z.infer<typeof inventoryQuerySchema>;
 
 /** A renderer states only intent + expected catalog/instance version. No
  * prices, generated IDs, grants, material costs, stat bonuses or file paths. */

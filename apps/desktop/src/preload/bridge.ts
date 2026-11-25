@@ -1,10 +1,10 @@
 import {
-  CONTRACT_SCHEMA_VERSION, appSnapshotSchema, charactersIpcResultSchema, galleryIpcResultSchema, ipcRequestSchema,
+  CONTRACT_SCHEMA_VERSION, appSnapshotSchema, charactersIpcResultSchema, galleryIpcResultSchema, inventoryIpcResultSchema, ipcRequestSchema,
   resultMatchesMethod, snapshotIpcResultSchema,
 } from '@pet-desktop/contracts';
 import type {
   AppSnapshot, CharactersIpcResult, DomainCommand, GalleryIpcResult, GalleryQuery, IpcErrorCode, IpcRequest,
-  IpcResult, SnapshotIpcResult,
+  IpcResult, SnapshotIpcResult, InventoryIpcResult,
 } from '@pet-desktop/contracts';
 import {
   DESKTOP_IPC, hostActionResultSchema, petVisualReadySchema, serviceStatusSchema,
@@ -93,12 +93,14 @@ const requestResultParsers = {
   'command/dispatch': snapshotIpcResultSchema,
   'gallery/list': galleryIpcResultSchema,
   'characters/list': charactersIpcResultSchema,
+  'inventory/list': inventoryIpcResultSchema,
 } satisfies Record<IpcRequest['method'], Parser<IpcResult>>;
 
 /** Request and reply shapes are correlated by both id and closed request method.
  * Catalog replies must not enter a different catalog or ordinary snapshot/command API. */
 function sendRequest(ipc: DesktopIpcPort, requestId: () => string, method: 'gallery/list', payload: unknown): Promise<GalleryIpcResult>;
 function sendRequest(ipc: DesktopIpcPort, requestId: () => string, method: 'characters/list', payload: unknown): Promise<CharactersIpcResult>;
+function sendRequest(ipc: DesktopIpcPort, requestId: () => string, method: 'inventory/list', payload: unknown): Promise<InventoryIpcResult>;
 function sendRequest(ipc: DesktopIpcPort, requestId: () => string, method: 'snapshot/get' | 'command/dispatch', payload: unknown): Promise<SnapshotIpcResult>;
 async function sendRequest(ipc: DesktopIpcPort, requestId: () => string, method: IpcRequest['method'], payload: unknown): Promise<IpcResult> {
   const id = requestId();
@@ -120,6 +122,8 @@ async function sendRequest(ipc: DesktopIpcPort, requestId: () => string, method:
         && (result.gallery.offset !== request.payload.offset || result.gallery.limit !== request.payload.limit)) {
         return failure(id, 'INTERNAL_ERROR', true);
       }
+      if (request.method === 'inventory/list' && 'inventory' in result
+        && result.inventory.legacyStackOffset !== (request.payload.legacyOffset ?? 0)) return failure(id, 'INTERNAL_ERROR', true);
       return result;
     }
     // The error code and retryability are contractual; free-text errors are not trusted.
@@ -196,6 +200,10 @@ export function createControlCenterBridge(ipc: DesktopIpcPort, requestId = newRe
       // trying to supply their own data even when bypassing TypeScript.
       if (args.length !== 0) return failure(requestId(), 'INVALID_REQUEST', false);
       return sendRequest(ipc, requestId, 'characters/list', {});
+    },
+    async listInventory(...args: unknown[]): Promise<InventoryIpcResult> {
+      if (args.length > 1 || (args.length === 1 && typeof args[0] !== 'number')) return failure(requestId(), 'INVALID_REQUEST', false);
+      return sendRequest(ipc, requestId, 'inventory/list', args.length === 0 ? {} : { legacyOffset: args[0] });
     },
   });
 }

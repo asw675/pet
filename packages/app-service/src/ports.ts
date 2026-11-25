@@ -1,6 +1,7 @@
 import type {
   Activity, AppSnapshot, CgAssetRef, DomainEvent, HealthStatus, IpcErrorCode, Mood, Presence, Visibility,
 } from '@pet-desktop/contracts';
+import type { EquipmentSlot } from '@pet-desktop/contracts/inventory';
 import type { RewardDraft, TripCheckpoint, TripFact, TripSnapshot } from '@pet-desktop/domain';
 
 /** Storage numbers are fixed-point tenths. Renderer DTOs use 0–100. */
@@ -95,6 +96,38 @@ export interface InventoryItem {
   quantity: number;
 }
 
+/** Active equipment instance. The repository retains a private tombstone
+ * when salvaged so that a previously granted ID can never be reused. */
+export interface ItemInstanceRecord {
+  instanceId: string;
+  definitionId: string;
+  definitionVersion: number;
+  enhancement: number;
+  acquiredAt: number;
+}
+
+export interface PetEquipmentRecord {
+  petId: string;
+  slot: EquipmentSlot;
+  instanceId: string;
+}
+
+export interface CommerceMaterialAmount { itemId: string; quantity: number }
+interface CommerceOperationBase { commandId: string; occurredAt: number; catalogVersion: number }
+
+/** Game-coin/stack/equipment operations are separate from the deterministic
+ * trip ledger. Exactly one operation belongs to each successful command. */
+export type CommerceOperationRecord = CommerceOperationBase & (
+  | { type: 'SHOP_PURCHASE'; offerId: string; itemId: string; quantity: number; coinCost: number;
+    outputKind: 'STACK' | 'EQUIPMENT'; instanceIds: readonly string[] }
+  | { type: 'EQUIPMENT_EQUIP'; petId: string; slot: EquipmentSlot; instanceId: string; previousInstanceId: string | null }
+  | { type: 'EQUIPMENT_UNEQUIP'; petId: string; slot: EquipmentSlot; instanceId: string }
+  | { type: 'EQUIPMENT_UPGRADE'; instanceId: string; fromEnhancement: number; toEnhancement: number;
+    coinCost: number; materials: readonly CommerceMaterialAmount[] }
+  | { type: 'EQUIPMENT_SALVAGE'; instanceId: string; enhancement: number; materials: readonly CommerceMaterialAmount[] }
+  | { type: 'ITEM_USE'; petId: string; itemId: string }
+);
+
 export interface CgUnlockInput {
   petId: string;
   cgId: string;
@@ -153,6 +186,18 @@ export interface AppTransaction {
   setWalletCoins(coins: number): void;
   listInventory(): InventoryItem[];
   addInventory(itemId: string, quantity: number): void;
+  listItemInstances(): ItemInstanceRecord[];
+  getItemInstance(instanceId: string): ItemInstanceRecord | null;
+  insertItemInstance(record: ItemInstanceRecord): void;
+  upgradeItemInstance(instanceId: string, expectedEnhancement: number): ItemInstanceRecord;
+  deleteItemInstance(instanceId: string): void;
+  listPetEquipment(petId?: string): PetEquipmentRecord[];
+  getPetEquipment(petId: string, slot: EquipmentSlot): PetEquipmentRecord | null;
+  getInstanceEquipment(instanceId: string): PetEquipmentRecord | null;
+  equipItem(record: PetEquipmentRecord): void;
+  unequipItem(petId: string, slot: EquipmentSlot, expectedInstanceId: string): void;
+  getCommerceOperation(commandId: string): CommerceOperationRecord | null;
+  insertCommerceOperation(record: CommerceOperationRecord): void;
   insertTripCgAssetPin(pin: TripCgAssetPin): void;
   listTripCgAssetPins(tripId: string): TripCgAssetPin[];
   getCgUnlock(petId: string, cgId: string, variant: string): CgUnlock | null;
@@ -189,6 +234,6 @@ export interface SqliteConnection {
 
 export interface AppRuntime {
   now(): number;
-  createId(kind: 'trip' | 'event' | 'request' | 'pet'): string;
+  createId(kind: 'trip' | 'event' | 'request' | 'pet' | 'item'): string;
   seed(): number;
 }

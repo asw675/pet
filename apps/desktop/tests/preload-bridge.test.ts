@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { charactersIpcResultSchema, galleryIpcResultSchema, ipcRequestSchema, ipcResultSchema } from '@pet-desktop/contracts';
-import type { AppSnapshot, CharacterCatalogRow, CharactersIpcResult, DomainCommand, GalleryIpcResult, GalleryQuery, IpcRequest, IpcResult } from '@pet-desktop/contracts';
+import type { AppSnapshot, CharacterCatalogRow, CharactersIpcResult, DomainCommand, GalleryIpcResult, GalleryQuery, InventoryIpcResult, IpcRequest, IpcResult } from '@pet-desktop/contracts';
 import { createControlCenterBridge, createPetBridge } from '../src/preload/bridge.js';
 import type { DesktopIpcPort } from '../src/preload/bridge.js';
 import { DESKTOP_IPC } from '../src/shared/protocol.js';
@@ -47,6 +47,12 @@ function charactersSuccess(requestId: string) {
   } satisfies CharactersIpcResult;
 }
 
+function inventorySuccess(requestId: string) {
+  return { schemaVersion: 1, ok: true, requestId, snapshot,
+    inventory: { revision: snapshot.revision, walletCoins: snapshot.walletCoins, catalogVersion: 1, legacyStackOffset: 0, legacyStackTotal: 0,
+      definitions: [], stacks: [], instances: [], offers: [], pets: [] } } satisfies InventoryIpcResult;
+}
+
 const privateDetail = '/Users/test/private.sqlite: database error';
 
 class FakeIpc implements DesktopIpcPort {
@@ -57,6 +63,7 @@ class FakeIpc implements DesktopIpcPort {
       const request = ipcRequestSchema.parse(raw);
       if (request.method === 'gallery/list') return gallerySuccess(request.requestId, request.payload);
       if (request.method === 'characters/list') return charactersSuccess(request.requestId);
+      if (request.method === 'inventory/list') return inventorySuccess(request.requestId);
       return { schemaVersion: 1, ok: true, requestId: request.requestId, snapshot } satisfies IpcResult;
     }
     if (channel === DESKTOP_IPC.getStatus) return status;
@@ -99,14 +106,35 @@ describe('role-specific preload bridges', () => {
     const pet = createPetBridge(ipc);
     const center = createControlCenterBridge(ipc);
     expect(Object.keys(pet).sort()).toEqual([...commonKeys, 'setInteractive', 'reportVisualReady'].sort());
-    expect(Object.keys(center).sort()).toEqual([...commonKeys, 'listGallery', 'listCharacters'].sort());
+    expect(Object.keys(center).sort()).toEqual([...commonKeys, 'listGallery', 'listCharacters', 'listInventory'].sort());
     expect('reportVisualReady' in center).toBe(false);
     expect('listGallery' in pet).toBe(false);
     expect('listCharacters' in pet).toBe(false);
+    expect('listInventory' in pet).toBe(false);
     expect(pet.role).toBe('pet');
     expect(center.role).toBe('control-center');
     expect(Object.isFrozen(pet)).toBe(true);
     expect(Object.isFrozen(center)).toBe(true);
+  });
+
+  it('exposes a closed inventory query only to the control center and rejects unrelated replies', async () => {
+    const ipc = new FakeIpc();
+    const bridge = createControlCenterBridge(ipc, requestIds());
+    expect(await bridge.listInventory()).toEqual(inventorySuccess('request-1'));
+    expect(ipc.calls).toEqual([[DESKTOP_IPC.request, { schemaVersion: 1, requestId: 'request-1', method: 'inventory/list', payload: {} }]]);
+    const list = bridge.listInventory as (...args: unknown[]) => Promise<InventoryIpcResult>;
+    expect(await list({ petId: 'other' })).toMatchObject({ ok: false, error: { code: 'INVALID_REQUEST' } });
+    expect(ipc.calls).toHaveLength(1);
+    ipc.handle = () => charactersSuccess('request-3');
+    expect(await bridge.listInventory()).toMatchObject({ ok: false, error: { code: 'INTERNAL_ERROR' } });
+    ipc.handle = () => ({ ...inventorySuccess('request-4'), inventory: { ...inventorySuccess('request-4').inventory, walletCoins: 999 } });
+    expect(await bridge.listInventory()).toMatchObject({ ok: false, error: { code: 'INTERNAL_ERROR' } });
+    ipc.handle = () => inventorySuccess('request-5');
+    expect(await bridge.getSnapshot()).toMatchObject({ ok: false, error: { code: 'INTERNAL_ERROR' } });
+    ipc.handle = () => ({ ...inventorySuccess('request-6'), inventory: { ...inventorySuccess('request-6').inventory, legacyStackOffset: 128 } });
+    expect(await bridge.listInventory(128)).toMatchObject({ ok: true, inventory: { legacyStackOffset: 128 } });
+    ipc.handle = () => inventorySuccess('request-7');
+    expect(await bridge.listInventory(128)).toMatchObject({ ok: false, error: { code: 'INTERNAL_ERROR' } });
   });
 
   it('validates, wraps and correlates requests without changing the command ID', async () => {

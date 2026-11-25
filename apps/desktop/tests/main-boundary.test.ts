@@ -84,6 +84,28 @@ describe('Main request routing', () => {
     await expect(routeRequest(center, sender(center), [favorite], relay(), undefined)).resolves.toMatchObject({ ok: true });
   });
 
+  it('restricts inventory and all commerce writes to the control center', async () => {
+    const query: IpcRequest = { ...getSnapshot, method: 'inventory/list', payload: {} };
+    const requests = [query,
+      dispatch({ ...common, type: 'SHOP_PURCHASE', payload: { offerId: 'offer', quantity: 1, catalogVersion: 1 } }),
+      dispatch({ ...common, type: 'EQUIPMENT_EQUIP', payload: { petId: 'pet-a', slot: 'WEAPON', instanceId: 'gear', catalogVersion: 1 } }),
+      dispatch({ ...common, type: 'EQUIPMENT_UNEQUIP', payload: { petId: 'pet-a', slot: 'WEAPON', catalogVersion: 1 } }),
+      dispatch({ ...common, type: 'EQUIPMENT_UPGRADE', payload: { instanceId: 'gear', catalogVersion: 1, expectedEnhancement: 0 } }),
+      dispatch({ ...common, type: 'EQUIPMENT_SALVAGE', payload: { instanceId: 'gear', catalogVersion: 1, expectedEnhancement: 0 } }),
+      dispatch({ ...common, type: 'ITEM_USE', payload: { petId: 'pet-a', itemId: 'ration', catalogVersion: 1 } }),
+    ];
+    const forward = relay();
+    for (const request of requests) await expect(routeRequest(pet, sender(pet), [request], forward, 1)).resolves.toMatchObject({ ok: false, error: { code: 'FORBIDDEN' } });
+    expect(forward).not.toHaveBeenCalled();
+    for (const request of requests.slice(1)) await expect(routeRequest(center, sender(center), [request], forward, undefined)).resolves.toMatchObject({ ok: true });
+    const inventory = vi.fn(async (request: IpcRequest): Promise<IpcResult> => ({ schemaVersion: 1, ok: true, requestId: request.requestId,
+      snapshot, inventory: { revision: snapshot.revision, walletCoins: snapshot.walletCoins, catalogVersion: 1, legacyStackOffset: 0, legacyStackTotal: 0,
+        definitions: [], stacks: [], instances: [], offers: [], pets: [] } }));
+    await expect(routeRequest(center, sender(center), [query], inventory, undefined)).resolves.toMatchObject({ ok: true, inventory: { catalogVersion: 1 } });
+    await expect(routeRequest(center, sender(center), [getSnapshot], inventory, undefined)).resolves.toMatchObject({ ok: false, error: { code: 'INTERNAL_ERROR' } });
+    await expect(routeRequest(center, sender(center), [query], forward, undefined)).resolves.toMatchObject({ ok: false, error: { code: 'INTERNAL_ERROR' } });
+  });
+
   it('rejects a valid request ID paired with a success result for the wrong method', async () => {
     const query: IpcRequest = { ...getSnapshot, method: 'gallery/list', payload: { filter: 'ALL', offset: 0, limit: 12 } };
     await expect(routeRequest(center, sender(center), [query], relay(), undefined)).resolves.toMatchObject({ ok: false, error: { code: 'INTERNAL_ERROR' } });

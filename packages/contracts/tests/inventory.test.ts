@@ -6,6 +6,7 @@ import {
   shopOfferSchema, shopPurchasePayloadSchema,
 } from '../src/inventory.js';
 import type { InventoryEquipmentInstance, InventoryPage, InventoryPet, ItemDefinition } from '../src/inventory.js';
+import { domainCommandSchema, inventoryIpcResultSchema, ipcRequestSchema, ipcResultSchema, resultMatchesMethod, snapshotIpcResultSchema } from '../src/index.js';
 
 const stats = (hp = 0, atk = 0, def = 0, spd = 0, luk = 0) => ({ hp, atk, def, spd, luk });
 const ore = { itemId: 'iron-ore', displayName: '铁矿石', description: '强化素材', rarity: 'COMMON',
@@ -32,7 +33,7 @@ const ownedStaff = { instanceId: 'gear-1', definitionId: staff.itemId, definitio
   salvage: { materials: [{ itemId: scrap.itemId, quantity: 2 }], canSalvage: true },
 } satisfies InventoryEquipmentInstance;
 
-const page = { revision: 4, catalogVersion: 1, walletCoins: 30, definitions: [ore, scrap, ration, gift, staff],
+const page = { revision: 4, catalogVersion: 1, walletCoins: 30, legacyStackOffset: 0, legacyStackTotal: 0, definitions: [ore, scrap, ration, gift, staff],
   stacks: [{ itemId: ore.itemId, quantity: 2, definitionState: 'AVAILABLE' },
     { itemId: ration.itemId, quantity: 0, definitionState: 'AVAILABLE' }],
   instances: [ownedStaff], offers: [{ offerId: 'shop-ration', itemId: ration.itemId,
@@ -51,6 +52,43 @@ const unavailable = { ...ownedStaff, instanceId: 'old-staff', definitionVersion:
 const withInstance = (change: Record<string, unknown>) => ({ ...page, instances: [{ ...ownedStaff, ...change }] });
 const withPet = (change: Record<string, unknown>) => ({ ...page, pets: [{ ...pet, ...change }] });
 
+describe('inventory authority method and command intent', () => {
+  const snapshot = { revision: page.revision, walletCoins: page.walletCoins, primaryPetId: 'pet-1', doNotDisturb: false, pausedRender: false,
+    pets: [{ petId: pet.petId, characterId: pet.characterId, nickname: pet.nickname, presence: 'HOME', activity: 'IDLE',
+      mood: 'CALM', healthStatus: 'NORMAL', visibility: 'VISIBLE', moodScore: 70, healthPoints: 100, energy: 80, bond: 0,
+      level: pet.progression.level, xp: pet.progression.cumulativeXp, revision: 1 }] };
+  const response = { schemaVersion: 1, ok: true, requestId: 'inventory-1', snapshot, inventory: page };
+  it('correlates result shape, revision, wallet and every pet identity/progression', () => {
+    const result = inventoryIpcResultSchema.parse(response);
+    expect(ipcResultSchema.safeParse(response).success).toBe(true);
+    expect(resultMatchesMethod('inventory/list', result)).toBe(true);
+    for (const method of ['snapshot/get', 'command/dispatch', 'gallery/list', 'characters/list'] as const) expect(resultMatchesMethod(method, result)).toBe(false);
+    expect(snapshotIpcResultSchema.safeParse(response).success).toBe(false);
+    for (const changed of [{ ...page, walletCoins: 100 }, { ...page, revision: 8 }, { ...page, pets: [] },
+      { ...page, pets: [{ ...pet, nickname: 'fake' }] }, { ...page, pets: [{ ...pet, progression: { ...pet.progression, cumulativeXp: 51, xpInLevel: 51, xpRemainingToNextLevel: 49 } }] }]) {
+      expect(inventoryIpcResultSchema.safeParse({ ...response, inventory: changed }).success).toBe(false);
+    }
+  });
+  it('requires the exact empty query payload and revision for all commerce intents', () => {
+    expect(ipcRequestSchema.safeParse({ schemaVersion: 1, requestId: 'req', method: 'inventory/list', payload: {} }).success).toBe(true);
+    expect(ipcRequestSchema.safeParse({ schemaVersion: 1, requestId: 'req', method: 'inventory/list', payload: { petId: 'pet-1' } }).success).toBe(false);
+    const base = { commandId: 'commerce', issuedAt: 123, expectedRevision: 4 };
+    const intents = [
+      { type: 'SHOP_PURCHASE', payload: { offerId: 'offer-1', quantity: 1, catalogVersion: 1 } },
+      { type: 'EQUIPMENT_EQUIP', payload: { petId: 'pet-1', instanceId: 'gear-1', slot: 'WEAPON', catalogVersion: 1 } },
+      { type: 'EQUIPMENT_UNEQUIP', payload: { petId: 'pet-1', slot: 'WEAPON', catalogVersion: 1 } },
+      { type: 'EQUIPMENT_UPGRADE', payload: { instanceId: 'gear-1', expectedEnhancement: 2, catalogVersion: 1 } },
+      { type: 'EQUIPMENT_SALVAGE', payload: { instanceId: 'gear-1', expectedEnhancement: 2, catalogVersion: 1 } },
+      { type: 'ITEM_USE', payload: { petId: 'pet-1', itemId: 'ration', catalogVersion: 1 } },
+    ];
+    for (const intent of intents) {
+      expect(domainCommandSchema.safeParse({ ...base, ...intent }).success).toBe(true);
+      expect(domainCommandSchema.safeParse({ commandId: base.commandId, issuedAt: base.issuedAt, ...intent }).success).toBe(false);
+      expect(domainCommandSchema.safeParse({ ...base, ...intent, payload: { ...intent.payload, priceCoins: 0 } }).success).toBe(false);
+    }
+  });
+});
+
 describe('coherent versioned inventory wire projections', () => {
   it('accepts stack, equipment, offers, growth and authority quotes in their exact shapes', () => {
     expect(inventoryPageSchema.parse(page)).toEqual(page);
@@ -58,12 +96,26 @@ describe('coherent versioned inventory wire projections', () => {
   });
 
   it('accepts absent historical definitions and refuses to substitute current assets/bonuses', () => {
-    const historical = { ...page, instances: [ownedStaff, unavailable, { ...unavailable, instanceId: 'old-unknown', definitionId: 'forgotten-gear' }],
+    const historical = { ...page, legacyStackTotal: 1, instances: [ownedStaff, unavailable, { ...unavailable, instanceId: 'old-unknown', definitionId: 'forgotten-gear' }],
       stacks: [...page.stacks, { itemId: 'forgotten-herb', quantity: 7, definitionState: 'LEGACY_UNKNOWN' }] };
     expect(inventoryPageSchema.parse(historical)).toEqual(historical);
     expect(inventoryPageSchema.safeParse({ ...historical, instances: [{ ...unavailable, bonus: stats(0, 1) }] }).success).toBe(false);
     expect(inventoryPageSchema.safeParse({ ...historical, instances: [{ ...unavailable, upgrade: ownedStaff.upgrade }] }).success).toBe(false);
     expect(inventoryPageSchema.safeParse({ ...historical, instances: [{ ...unavailable, salvage: ownedStaff.salvage }] }).success).toBe(false);
+  });
+
+  it('keeps legacy stack identity even if its ID now belongs to instance gear, with bounded exact pagination', () => {
+    const collided = { ...page, legacyStackTotal: 1, stacks: [...page.stacks,
+      { itemId: staff.itemId, quantity: 8, definitionState: 'LEGACY_UNKNOWN' }] };
+    expect(inventoryPageSchema.safeParse(collided).success).toBe(true);
+    const legacyRows = Array.from({ length: 128 }, (_, i) => ({ itemId: `legacy-${String(i).padStart(3, '0')}`, quantity: 1, definitionState: 'LEGACY_UNKNOWN' }));
+    const paged = { ...page, legacyStackTotal: 257, stacks: [...page.stacks, ...legacyRows] };
+    expect(inventoryPageSchema.safeParse(paged).success).toBe(true);
+    expect(inventoryPageSchema.safeParse({ ...paged, legacyStackOffset: 128 }).success).toBe(true);
+    expect(inventoryPageSchema.safeParse({ ...paged, legacyStackOffset: 256, stacks: [...page.stacks, { itemId: 'legacy-256', quantity: 1, definitionState: 'LEGACY_UNKNOWN' }] }).success).toBe(true);
+    expect(inventoryPageSchema.safeParse({ ...paged, legacyStackOffset: 256 }).success).toBe(false);
+    expect(inventoryPageSchema.safeParse({ ...paged, stacks: [...page.stacks, ...legacyRows.slice().reverse()] }).success).toBe(false);
+    expect(inventoryPageSchema.safeParse({ ...paged, legacyStackOffset: 258, stacks: page.stacks }).success).toBe(true);
   });
 
   it('permits an explicitly unavailable historical instance still recorded in a pet loadout', () => {

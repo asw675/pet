@@ -1,15 +1,17 @@
 import { describe, expect, it } from 'vitest';
 import { CONTRACT_SCHEMA_VERSION, ipcResultSchema } from '@pet-desktop/contracts';
-import type { AppSnapshot, CharacterCatalogPage, DomainCommand, DomainEvent, GalleryPage, GalleryQuery } from '@pet-desktop/contracts';
+import type { AppSnapshot, CharacterCatalogPage, DomainCommand, DomainEvent, GalleryPage, GalleryQuery, InventoryPage } from '@pet-desktop/contracts';
+import type { EquipmentSlot } from '@pet-desktop/contracts/inventory';
 import { DEMO_ROUTE } from '@pet-desktop/domain';
 import { findBuiltinCg } from '@pet-desktop/domain/cg-catalog';
 import { CHARACTER_CATALOG_VERSION } from '@pet-desktop/domain/character-catalog';
 import { HOME_RULES, advanceHomeState } from '@pet-desktop/domain/home-simulation';
+import { ITEM_CATALOG_VERSION } from '@pet-desktop/domain/item-catalog';
 import type { TripFact } from '@pet-desktop/domain';
 import { AppService } from '../src/app-service.js';
 import type {
   AppRepository, AppRuntime, AppTransaction, CgUnlock, CgUnlockInput, CommandOutcome, CommandReceipt,
-  HomeScheduleRecord, InventoryItem, OutboxRecord, PetAcquisitionRecord, PetRecord, PreferencesRecord, RewardLine, SettlementRecord, TripCgAssetPin, TripRecord,
+  CommerceOperationRecord, HomeScheduleRecord, InventoryItem, ItemInstanceRecord, OutboxRecord, PetAcquisitionRecord, PetEquipmentRecord, PetRecord, PreferencesRecord, RewardLine, SettlementRecord, TripCgAssetPin, TripRecord,
 } from '../src/ports.js';
 
 const MINUTE = 60_000;
@@ -31,6 +33,10 @@ interface MemoryState {
   rewards: RewardLine[];
   wallet: number;
   inventory: InventoryItem[];
+  itemInstances: ItemInstanceRecord[];
+  retiredItemIds: string[];
+  equipment: PetEquipmentRecord[];
+  commerceOperations: CommerceOperationRecord[];
   cgs: CgUnlock[];
   cgPins: TripCgAssetPin[];
   receipts: CommandReceipt[];
@@ -39,7 +45,8 @@ interface MemoryState {
 
 function emptyState(): MemoryState {
   return { preferences: null, pets: [], acquisitions: [], homeSchedules: [], trips: [], facts: [], settlements: [], rewards: [],
-    wallet: 0, inventory: [], cgs: [], cgPins: [], receipts: [], outbox: [] };
+    wallet: 0, inventory: [], itemInstances: [], retiredItemIds: [], equipment: [], commerceOperations: [],
+    cgs: [], cgPins: [], receipts: [], outbox: [] };
 }
 
 /** A transactional fake with value semantics, intentionally independent of SQL. */
@@ -134,8 +141,56 @@ class MemoryRepository implements AppRepository, AppTransaction {
   listInventory(): InventoryItem[] { return copy(this.state.inventory); }
   addInventory(itemId: string, quantity: number): void {
     const existing = this.state.inventory.find((entry) => entry.itemId === itemId);
-    if (existing === undefined) this.state.inventory.push({ itemId, quantity });
-    else existing.quantity += quantity;
+    const next = (existing?.quantity ?? 0) + quantity;
+    if (!Number.isSafeInteger(next) || next < 0) throw new Error('Invalid inventory balance');
+    if (existing === undefined && quantity > 0) this.state.inventory.push({ itemId, quantity });
+    else if (existing !== undefined) existing.quantity = next;
+  }
+  listItemInstances(): ItemInstanceRecord[] { return copy(this.state.itemInstances); }
+  getItemInstance(instanceId: string): ItemInstanceRecord | null {
+    return copy(this.state.itemInstances.find((entry) => entry.instanceId === instanceId) ?? null);
+  }
+  insertItemInstance(record: ItemInstanceRecord): void {
+    if (this.getItemInstance(record.instanceId) || this.state.retiredItemIds.includes(record.instanceId) || record.enhancement !== 0) {
+      throw new Error('Duplicate, retired or invalid equipment instance');
+    }
+    this.state.itemInstances.push(copy(record));
+  }
+  upgradeItemInstance(instanceId: string, expectedEnhancement: number): ItemInstanceRecord {
+    const record = this.state.itemInstances.find((entry) => entry.instanceId === instanceId);
+    if (!record || record.enhancement !== expectedEnhancement || record.enhancement >= 5) throw new Error('Invalid upgrade');
+    record.enhancement++;
+    return copy(record);
+  }
+  deleteItemInstance(instanceId: string): void {
+    const at = this.state.itemInstances.findIndex((entry) => entry.instanceId === instanceId);
+    if (at < 0 || this.getInstanceEquipment(instanceId)) throw new Error('Equipment unavailable or still equipped');
+    this.state.itemInstances.splice(at, 1);
+    this.state.retiredItemIds.push(instanceId);
+  }
+  listPetEquipment(petId?: string): PetEquipmentRecord[] { return copy(this.state.equipment.filter(entry => petId === undefined || entry.petId === petId)); }
+  getPetEquipment(petId: string, slot: EquipmentSlot): PetEquipmentRecord | null {
+    return copy(this.state.equipment.find(entry => entry.petId === petId && entry.slot === slot) ?? null);
+  }
+  getInstanceEquipment(instanceId: string): PetEquipmentRecord | null {
+    return copy(this.state.equipment.find(entry => entry.instanceId === instanceId) ?? null);
+  }
+  equipItem(record: PetEquipmentRecord): void {
+    if (!this.getItemInstance(record.instanceId) || !this.getPet(record.petId) || this.getInstanceEquipment(record.instanceId)
+      || this.getPetEquipment(record.petId, record.slot)) throw new Error('Invalid equipment assignment');
+    this.state.equipment.push(copy(record));
+  }
+  unequipItem(petId: string, slot: EquipmentSlot, expectedInstanceId: string): void {
+    const at = this.state.equipment.findIndex(entry => entry.petId === petId && entry.slot === slot && entry.instanceId === expectedInstanceId);
+    if (at < 0) throw new Error('Invalid equipment removal');
+    this.state.equipment.splice(at, 1);
+  }
+  getCommerceOperation(commandId: string): CommerceOperationRecord | null {
+    return copy(this.state.commerceOperations.find(entry => entry.commandId === commandId) ?? null);
+  }
+  insertCommerceOperation(record: CommerceOperationRecord): void {
+    if (this.getCommerceOperation(record.commandId)) throw new Error('Duplicate commerce operation');
+    this.state.commerceOperations.push(copy(record));
   }
   insertTripCgAssetPin(pin: TripCgAssetPin): void {
     const existing = this.state.cgPins.find((entry) => entry.tripId === pin.tripId && entry.cgId === pin.cgId && entry.variant === pin.variant);
@@ -194,11 +249,13 @@ class FakeRuntime implements AppRuntime {
   at = START;
   nextSeed = 8;
   forcedPetId: string | null = null;
+  forcedItemId: string | null = null;
   private serial = 0;
   now(): number { return this.at; }
   seed(): number { return this.nextSeed; }
-  createId(kind: 'trip' | 'event' | 'request' | 'pet'): string {
-    return kind === 'pet' && this.forcedPetId !== null ? this.forcedPetId : `${kind}-${++this.serial}`;
+  createId(kind: 'trip' | 'event' | 'request' | 'pet' | 'item'): string {
+    return kind === 'pet' && this.forcedPetId !== null ? this.forcedPetId
+      : kind === 'item' && this.forcedItemId !== null ? this.forcedItemId : `${kind}-${++this.serial}`;
   }
 }
 
@@ -241,6 +298,16 @@ function requestCharacters(service: AppService): { snapshot: AppSnapshot; charac
   expect(result.characters.revision).toBe(result.snapshot.revision);
   expect(result.characters.walletCoins).toBe(result.snapshot.walletCoins);
   return { snapshot: result.snapshot, characters: result.characters };
+}
+
+function requestInventory(service: AppService, legacyOffset?: number): { snapshot: AppSnapshot; inventory: InventoryPage } {
+  const result = service.handleRequest({ schemaVersion: 1, requestId: 'inventory-query', method: 'inventory/list',
+    payload: legacyOffset === undefined ? {} : { legacyOffset } });
+  expect(ipcResultSchema.safeParse(result).success).toBe(true);
+  if (!result.ok || !('inventory' in result)) throw new Error('Expected revisioned inventory result');
+  expect(result.inventory.revision).toBe(result.snapshot.revision);
+  expect(result.inventory.walletCoins).toBe(result.snapshot.walletCoins);
+  return { snapshot: result.snapshot, inventory: result.inventory };
 }
 
 describe('application service request boundary', () => {
@@ -868,5 +935,227 @@ describe('authoritative character catalog, acquisition and nickname', () => {
       .toEqual([{ petId: 'pet-1', nickname: '星咏', acquiredAt: null, origin: 'LEGACY' }]);
     expect(result.characters.rows.find(row => row.characterId === 'fluffy-ranger')).toMatchObject({ availability: 'AVAILABLE', instances: [] });
     expect(reopened.state.acquisitions).toEqual([]);
+  });
+});
+
+describe('authoritative shared inventory and independent equipment', () => {
+  const catalogVersion = ITEM_CATALOG_VERSION;
+  type CommerceType = 'SHOP_PURCHASE' | 'EQUIPMENT_EQUIP' | 'EQUIPMENT_UNEQUIP' | 'EQUIPMENT_UPGRADE' | 'EQUIPMENT_SALVAGE' | 'ITEM_USE';
+  function execute<T extends CommerceType>(service: AppService, id: string, type: T, payload: Extract<DomainCommand, { type: T }>['payload']): AppSnapshot {
+    return success(service.dispatch({ commandId: id, issuedAt: 0, type, payload, expectedRevision: service.getSnapshot().revision } as DomainCommand));
+  }
+  function purchase(service: AppService, id: string, offerId: string, quantity = 1): AppSnapshot {
+    return execute(service, id, 'SHOP_PURCHASE', { offerId, quantity, catalogVersion });
+  }
+  function deny<T extends CommerceType>(service: AppService, id: string, type: T, payload: Extract<DomainCommand, { type: T }>['payload'], code = 'BUSINESS_RULE') {
+    expect(service.dispatch({ commandId: id, issuedAt: 0, type, payload, expectedRevision: service.getSnapshot().revision } as DomainCommand))
+      .toMatchObject({ ok: false, error: { code } });
+  }
+
+  it('projects complete offers, known and legacy stacks, progression and compatible equipment without fabricating old data', () => {
+    const { service, repo } = fixture();
+    repo.addInventory('herb', 3);
+    repo.addInventory('old-unknown-item', 2);
+    repo.insertItemInstance({ instanceId: 'old-equipment', definitionId: 'apprentice-staff', definitionVersion: 2, enhancement: 0, acquiredAt: START });
+    repo.equipItem({ petId: 'pet-1', slot: 'WEAPON', instanceId: 'old-equipment' });
+    repo.savePet({ ...repo.getPet('pet-2')!, characterId: 'legacy-unreleased-character', power: 37, xp: 100 });
+    const { inventory, snapshot } = requestInventory(service);
+    expect(inventory.stacks).toEqual([{ itemId: 'herb', quantity: 3, definitionState: 'AVAILABLE' },
+      { itemId: 'old-unknown-item', quantity: 2, definitionState: 'LEGACY_UNKNOWN' }]);
+    expect(inventory.definitions.some(item => item.itemId === 'ration')).toBe(true);
+    expect(inventory.offers.some(offer => offer.offerId === 'shop-apprentice-staff')).toBe(true);
+    expect(inventory.instances).toEqual([expect.objectContaining({ instanceId: 'old-equipment', definitionState: 'UNAVAILABLE', bonus: null,
+      upgrade: { ok: false, reason: 'UNAVAILABLE' }, salvage: { canSalvage: false, materials: [], reason: 'UNAVAILABLE' }, equipped: { petId: 'pet-1', slot: 'WEAPON' } })]);
+    expect(inventory.pets[0]).toMatchObject({ battlePower: 30, stats: { atk: 22 }, progression: { level: 1, cumulativeXp: 0 } });
+    expect(inventory.pets[1]).toMatchObject({ battlePower: 37, stats: null, progression: { level: 2, cumulativeXp: 100 } });
+    expect(snapshot.pets[1]!.level).toBe(2);
+    deny(service, 'legacy-upgrade', 'EQUIPMENT_UPGRADE', { instanceId: 'old-equipment', expectedEnhancement: 0, catalogVersion });
+    execute(service, 'legacy-unbind', 'EQUIPMENT_UNEQUIP', { petId: 'pet-1', slot: 'WEAPON', catalogVersion });
+    deny(service, 'legacy-rebind', 'EQUIPMENT_EQUIP', { petId: 'pet-1', slot: 'WEAPON', instanceId: 'old-equipment', catalogVersion });
+    deny(service, 'legacy-salvage', 'EQUIPMENT_SALVAGE', { instanceId: 'old-equipment', expectedEnhancement: 0, catalogVersion });
+    deny(service, 'legacy-use', 'ITEM_USE', { petId: 'pet-1', itemId: 'old-unknown-item', catalogVersion });
+    expect(repo.state.commerceOperations).toHaveLength(1);
+  });
+
+  it('re-quotes purchases using current coins and mandatory revisions, creates distinct stable equipment IDs, and never repeats a debit', () => {
+    const { service, repo } = fixture();
+    repo.setWalletCoins(100);
+    const revision = service.getSnapshot().revision;
+    const payload = { offerId: 'shop-ration', quantity: 3, catalogVersion };
+    expect(service.dispatch(command('no-revision', 'SHOP_PURCHASE', payload))).toMatchObject({ ok: false, error: { code: 'INVALID_REQUEST' } });
+    expect(service.dispatch(command('bad-catalog', 'SHOP_PURCHASE', { ...payload, catalogVersion: 2 }, { expectedRevision: revision })))
+      .toMatchObject({ ok: false, error: { code: 'REVISION_CONFLICT' } });
+    const exact = command('ration-once', 'SHOP_PURCHASE', payload, { expectedRevision: revision });
+    const bought = success(service.dispatch(exact));
+    expect(bought.walletCoins).toBe(94);
+    expect(repo.listInventory()).toEqual([{ itemId: 'ration', quantity: 3 }]);
+    expect(repo.getCommerceOperation(exact.commandId)).toEqual({ type: 'SHOP_PURCHASE', commandId: exact.commandId, occurredAt: START, catalogVersion,
+      offerId: payload.offerId, itemId: 'ration', quantity: 3, coinCost: 6, outputKind: 'STACK', instanceIds: [] });
+    expect(success(service.dispatch(exact))).toEqual(bought);
+    expect(service.dispatch(command('stale-purchase', 'SHOP_PURCHASE', payload, { expectedRevision: revision })))
+      .toMatchObject({ ok: false, error: { code: 'REVISION_CONFLICT' } });
+    expect(repo.getCommerceOperation('stale-purchase')).toBeNull();
+    expect(purchase(service, 'staff-pair', 'shop-apprentice-staff', 2).walletCoins).toBe(70);
+    const instances = repo.listItemInstances();
+    expect(new Set(instances.map(instance => instance.instanceId)).size).toBe(2);
+    expect(instances).toEqual([expect.objectContaining({ definitionId: 'apprentice-staff', definitionVersion: 1, enhancement: 0, acquiredAt: START }),
+      expect.objectContaining({ definitionId: 'apprentice-staff', definitionVersion: 1, enhancement: 0, acquiredAt: START })]);
+    expect(repo.getCommerceOperation('staff-pair')).toMatchObject({ coinCost: 24, outputKind: 'EQUIPMENT', instanceIds: instances.map(row => row.instanceId).sort() });
+    deny(service, 'over-offer', 'SHOP_PURCHASE', { offerId: 'shop-apprentice-staff', quantity: 4, catalogVersion });
+    deny(service, 'missing-offer', 'SHOP_PURCHASE', { offerId: 'nonexistent', quantity: 1, catalogVersion }, 'NOT_FOUND');
+    repo.setWalletCoins(69);
+    deny(service, 'poor', 'SHOP_PURCHASE', { offerId: 'shop-glimmer-dust', quantity: 10, catalogVersion }, 'BUSINESS_RULE');
+    expect(repo.getWalletCoins()).toBe(69);
+  });
+
+  it('atomically replaces a same-pet slot, forbids stealing equipment, and updates only the affected pet', () => {
+    const { service, repo } = fixture();
+    repo.setWalletCoins(100);
+    purchase(service, 'two-weapons', 'shop-apprentice-staff', 2);
+    const [first, second] = repo.listItemInstances();
+    const base = requestInventory(service);
+    deny(service, 'wrong-slot', 'EQUIPMENT_EQUIP', { petId: 'pet-1', slot: 'ARMOR', instanceId: first!.instanceId, catalogVersion });
+    execute(service, 'equip-first', 'EQUIPMENT_EQUIP', { petId: 'pet-1', slot: 'WEAPON', instanceId: first!.instanceId, catalogVersion });
+    const equipped = requestInventory(service);
+    expect(equipped.inventory.pets[0]!.battlePower).toBeGreaterThan(base.inventory.pets[0]!.battlePower);
+    expect(equipped.snapshot.pets[0]!.revision).toBe(base.snapshot.pets[0]!.revision + 1);
+    expect(equipped.inventory.pets[1]).toEqual(base.inventory.pets[1]);
+    deny(service, 'steal-other-pet', 'EQUIPMENT_EQUIP', { petId: 'pet-2', slot: 'WEAPON', instanceId: first!.instanceId, catalogVersion });
+    deny(service, 'equip-noop', 'EQUIPMENT_EQUIP', { petId: 'pet-1', slot: 'WEAPON', instanceId: first!.instanceId, catalogVersion });
+    const before = copy(repo.state);
+    const replace = command('replace-weapon', 'EQUIPMENT_EQUIP', { petId: 'pet-1', slot: 'WEAPON', instanceId: second!.instanceId, catalogVersion },
+      { expectedRevision: service.getSnapshot().revision });
+    repo.failOnEvent = 'EquipmentEquipped';
+    expect(service.dispatch(replace)).toMatchObject({ ok: false, error: { code: 'INTERNAL_ERROR' } });
+    expect(repo.state).toEqual(before);
+    repo.failOnEvent = null;
+    success(service.dispatch(replace));
+    expect(repo.getPetEquipment('pet-1', 'WEAPON')?.instanceId).toBe(second!.instanceId);
+    expect(repo.getInstanceEquipment(first!.instanceId)).toBeNull();
+    expect(repo.getCommerceOperation(replace.commandId)).toMatchObject({ previousInstanceId: first!.instanceId, instanceId: second!.instanceId });
+    execute(service, 'equip-other', 'EQUIPMENT_EQUIP', { petId: 'pet-2', slot: 'WEAPON', instanceId: first!.instanceId, catalogVersion });
+    expect(repo.listPetEquipment()).toHaveLength(2);
+    execute(service, 'unequip-first', 'EQUIPMENT_UNEQUIP', { petId: 'pet-1', slot: 'WEAPON', catalogVersion });
+    deny(service, 'empty-slot', 'EQUIPMENT_UNEQUIP', { petId: 'pet-1', slot: 'WEAPON', catalogVersion });
+    expect(repo.getPetEquipment('pet-2', 'WEAPON')?.instanceId).toBe(first!.instanceId);
+  });
+
+  it('enforces exact upgrade cost and cap, exact enhancement versions, unequipped salvage, and retired identity uniqueness', () => {
+    const { service, repo, runtime } = fixture();
+    repo.setWalletCoins(500);
+    purchase(service, 'staff', 'shop-apprentice-staff');
+    const instanceId = repo.listItemInstances()[0]!.instanceId;
+    repo.addInventory('iron-ore', 20);
+    execute(service, 'equip-before-upgrade', 'EQUIPMENT_EQUIP', { petId: 'pet-1', slot: 'WEAPON', instanceId, catalogVersion });
+    for (let enhancement = 0; enhancement < 5; enhancement++) {
+      const current = requestInventory(service);
+      const quote = current.inventory.instances[0]!.upgrade;
+      if (!quote.ok) throw new Error('Expected upgrade quote');
+      const costsBefore = new Map(repo.listInventory().map(row => [row.itemId, row.quantity]));
+      const upgraded = execute(service, `upgrade-${enhancement}`, 'EQUIPMENT_UPGRADE', { instanceId, expectedEnhancement: enhancement, catalogVersion });
+      expect(upgraded.walletCoins).toBe(current.snapshot.walletCoins - quote.cost.coins);
+      expect(repo.getItemInstance(instanceId)?.enhancement).toBe(enhancement + 1);
+      for (const material of quote.cost.materials) expect(repo.listInventory().find(row => row.itemId === material.itemId)?.quantity)
+        .toBe(costsBefore.get(material.itemId)! - material.quantity);
+      expect(upgraded.pets[0]!.revision).toBe(current.snapshot.pets[0]!.revision + 1);
+    }
+    expect(requestInventory(service).inventory.instances[0]!.upgrade).toEqual({ ok: false, reason: 'MAX_ENHANCEMENT', maxEnhancement: 5 });
+    deny(service, 'stale-enhancement', 'EQUIPMENT_UPGRADE', { instanceId, expectedEnhancement: 1, catalogVersion }, 'REVISION_CONFLICT');
+    deny(service, 'upgrade-cap', 'EQUIPMENT_UPGRADE', { instanceId, expectedEnhancement: 5, catalogVersion });
+    deny(service, 'salvage-equipped', 'EQUIPMENT_SALVAGE', { instanceId, expectedEnhancement: 5, catalogVersion });
+    execute(service, 'unequip-for-salvage', 'EQUIPMENT_UNEQUIP', { petId: 'pet-1', slot: 'WEAPON', catalogVersion });
+    const previous = service.getSnapshot();
+    const salvage = command('salvage-once', 'EQUIPMENT_SALVAGE', { instanceId, expectedEnhancement: 5, catalogVersion }, { expectedRevision: previous.revision });
+    const result = success(service.dispatch(salvage));
+    expect(result.walletCoins).toBe(previous.walletCoins);
+    expect(repo.listInventory().find(row => row.itemId === 'iron-scrap')?.quantity).toBe(3);
+    expect(repo.getItemInstance(instanceId)).toBeNull();
+    expect(success(service.dispatch(salvage))).toEqual(result);
+    expect(repo.getCommerceOperation(salvage.commandId)).toMatchObject({ enhancement: 5, materials: [{ itemId: 'iron-scrap', quantity: 3 }] });
+    runtime.forcedItemId = instanceId;
+    const before = copy(repo.state);
+    expect(service.dispatch(command('reuse-retired', 'SHOP_PURCHASE', { offerId: 'shop-apprentice-staff', quantity: 1, catalogVersion }, { expectedRevision: result.revision })))
+      .toMatchObject({ ok: false, error: { code: 'INTERNAL_ERROR' } });
+    expect(repo.state).toEqual(before);
+  });
+
+  it('uses one authoritative consumable at HOME, preserving exact fractions except directional or saturated needs', () => {
+    const { service, repo, runtime } = fixture();
+    repo.addInventory('ration', 3);
+    repo.addInventory('healing-potion', 2);
+    repo.addInventory('sweet-biscuit', 2);
+    repo.savePet({ ...repo.getPet('pet-1')!, energy10: 400, healthPoints10: 800, healthStatus: 'INJURED', moodScore10: 490 });
+    runtime.at += 1_000;
+    execute(service, 'eat-ration', 'ITEM_USE', { petId: 'pet-1', itemId: 'ration', catalogVersion });
+    expect(repo.getPet('pet-1')).toMatchObject({ energy10: 600, activity: 'EAT' });
+    expect(repo.getHomeSchedule('pet-1')).toMatchObject({ energyRemainder: 200_000, healthRemainder: 100_000, moodRemainder: 100_000 });
+    runtime.at = START + 18_000;
+    expect(service.getSnapshot().pets[0]!.energy).toBe(60.1);
+    execute(service, 'heal-fully', 'ITEM_USE', { petId: 'pet-1', itemId: 'healing-potion', catalogVersion });
+    expect(repo.getPet('pet-1')).toMatchObject({ healthPoints10: 1000, healthStatus: 'NORMAL' });
+    expect(repo.getHomeSchedule('pet-1')!.healthRemainder).toBe(0);
+    deny(service, 'full-health', 'ITEM_USE', { petId: 'pet-1', itemId: 'healing-potion', catalogVersion });
+    expect(repo.listInventory().find(row => row.itemId === 'healing-potion')?.quantity).toBe(1);
+    execute(service, 'gift', 'ITEM_USE', { petId: 'pet-1', itemId: 'sweet-biscuit', catalogVersion });
+    expect(repo.getPet('pet-1')).toMatchObject({ bond10: 10, moodScore10: 530 });
+    expect(repo.getHomeSchedule('pet-1')).toMatchObject({ moodRemainder: 0, interactionCount: 0, lastInteractionAt: null });
+    depart(service);
+    deny(service, 'feed-away', 'ITEM_USE', { petId: 'pet-1', itemId: 'ration', catalogVersion });
+    expect(repo.listInventory().find(row => row.itemId === 'ration')?.quantity).toBe(2);
+    expect(repo.getPet('pet-2')!.bond10).toBe(0);
+  });
+
+  it('freezes new departure power while every later gear change leaves the active deterministic trip untouched', () => {
+    const { service, repo, runtime } = fixture();
+    repo.setWalletCoins(100);
+    purchase(service, 'travel-staff', 'shop-apprentice-staff');
+    const instanceId = repo.listItemInstances()[0]!.instanceId;
+    execute(service, 'travel-equip', 'EQUIPMENT_EQUIP', { petId: 'pet-1', slot: 'WEAPON', instanceId, catalogVersion });
+    const projected = requestInventory(service).inventory.pets[0]!.battlePower;
+    expect(projected).toBeGreaterThan(30);
+    const tripId = depart(service);
+    const frozen = repo.getTrip(tripId)!.snapshot;
+    expect(frozen.power).toBe(projected);
+    execute(service, 'change-in-flight', 'EQUIPMENT_UNEQUIP', { petId: 'pet-1', slot: 'WEAPON', catalogVersion });
+    expect(repo.getTrip(tripId)!.snapshot).toEqual(frozen);
+    expect(requestInventory(service).inventory.pets[0]!.battlePower).toBe(30);
+    runtime.at += 15 * MINUTE;
+    service.getSnapshot();
+    const current = requestInventory(service).inventory.pets[0]!.battlePower;
+    const next = depart(service, 'pet-1', 'next-travel');
+    expect(repo.getTrip(next)!.snapshot.power).toBe(current);
+    expect(repo.getTrip(tripId)!.snapshot).toEqual(frozen);
+  });
+
+  it('checks instance capacity before writes, keeps legacy stack pages separate, and rolls back injected purchase failures', () => {
+    const { service, repo, runtime } = fixture();
+    repo.setWalletCoins(100_000);
+    const first = command('failed-purchase', 'SHOP_PURCHASE', { offerId: 'shop-apprentice-staff', quantity: 2, catalogVersion },
+      { expectedRevision: service.getSnapshot().revision });
+    const before = copy(repo.state);
+    repo.failOnEvent = 'ShopPurchased';
+    expect(service.dispatch(first)).toMatchObject({ ok: false, error: { code: 'INTERNAL_ERROR' } });
+    expect(repo.state).toEqual(before);
+    repo.failOnEvent = null;
+    runtime.forcedItemId = 'repeated-allocation';
+    expect(service.dispatch(first)).toMatchObject({ ok: false, error: { code: 'INTERNAL_ERROR' } });
+    expect(repo.state).toEqual(before);
+    runtime.forcedItemId = null;
+    success(service.dispatch(first));
+    for (let i = repo.state.itemInstances.length; i < 500; i++) repo.insertItemInstance({ instanceId: `cap-${i}`, definitionId: 'lucky-charm', definitionVersion: 1, enhancement: 0, acquiredAt: START });
+    const wallet = repo.getWalletCoins();
+    deny(service, 'instance-cap', 'SHOP_PURCHASE', { offerId: 'shop-lucky-charm', quantity: 1, catalogVersion });
+    expect(repo.state.itemInstances).toHaveLength(500);
+    for (let i = 0; i < 256; i++) repo.addInventory(`legacy-cap-${i}`, 1);
+    purchase(service, 'legacy-does-not-consume-stack-capacity', 'shop-ration');
+    expect(repo.state.inventory).toHaveLength(257);
+    expect(repo.getWalletCoins()).toBe(wallet - 2);
+    for (const offset of [0, 128, 256]) {
+      const page = requestInventory(service, offset).inventory;
+      expect(page.legacyStackOffset).toBe(offset);
+      expect(page.legacyStackTotal).toBe(256);
+      expect(page.stacks[0]).toEqual({ itemId: 'ration', quantity: 1, definitionState: 'AVAILABLE' });
+      expect(page.stacks.filter(row => row.definitionState === 'LEGACY_UNKNOWN')).toHaveLength(Math.min(128, 256 - offset));
+    }
   });
 });

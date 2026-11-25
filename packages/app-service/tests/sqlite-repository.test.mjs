@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { describe, expect, it } from 'vitest';
 import { advanceTrip, createTripCheckpoint, createTripSnapshot } from '@pet-desktop/domain';
-import { MIGRATION_001, MIGRATION_002, MIGRATION_003, SQLiteRepository } from '../src/sqlite-repository.ts';
+import { MIGRATION_001, MIGRATION_002, MIGRATION_003, MIGRATION_004, SQLiteRepository } from '../src/sqlite-repository.ts';
 
 const START = 1_700_000_000_000;
 const pet = (petId = 'pet-a') => ({
@@ -82,6 +82,7 @@ function rewardLine(trip, kind, targetId, amount) {
 const OLD_MIGRATION_CHECKSUM = 'fnv1a32:9d3ced6f'; // Measured against the committed v1 repository.
 const OLD_MIGRATION_002_CHECKSUM = 'fnv1a32:a0036d79'; // Measured against committed 7fca3d0.
 const OLD_MIGRATION_003_CHECKSUM = 'fnv1a32:519a9ef3'; // Measured against committed 145901c.
+const OLD_MIGRATION_004_CHECKSUM = 'fnv1a32:0f3c0f0e'; // Measured against committed 23b875d.
 const hash = 'a'.repeat(64);
 function departurePin(trip, version = '1.0.0', assetHash = hash) {
   return { tripId: trip.snapshot.tripId, petId: trip.snapshot.petId, cgId: 'postcard', variant: 'default',
@@ -220,6 +221,25 @@ function createV3Archive(db) {
   } catch(error){db.exec('ROLLBACK');throw error;}
 }
 
+/** Genuine v4 archive: historical acquisition/CG/trip records plus the old
+ * stack-only inventory and persisted home clocks; not a downgraded v5 file. */
+function createV4Archive(db) {
+  const prior=createV3Archive(db);
+  db.exec('BEGIN IMMEDIATE');
+  try{
+    db.exec(MIGRATION_004);
+    db.prepare('INSERT INTO schema_migrations VALUES(4,?,?)').run(OLD_MIGRATION_004_CHECKSUM,START+3);
+    db.exec('PRAGMA user_version=4');
+    const clocks=db.prepare('SELECT pet_id FROM pets ORDER BY pet_id').all().map((row,index)=>({
+      ...schedule(row.pet_id,prior.acquired.acquiredAt),energyRemainder:42+index,
+    }));
+    for(const clock of clocks)db.prepare('INSERT INTO pet_home_schedules VALUES (?,?,?,?,?,?,?,?,?)').run(...Object.values(clock));
+    db.prepare('INSERT INTO inventory VALUES (?,?)').run('legacy-unrecognized-material',7);
+    db.exec('COMMIT');
+    return {...prior,clocks,stacks:[{itemId:'herb',quantity:2},{itemId:'legacy-unrecognized-material',quantity:7}]};
+  }catch(error){db.exec('ROLLBACK');throw error;}
+}
+
 describe('SQLite repository — schema and engine', () => {
   it('marks a writer unavailable when transaction rollback itself fails', () => {
     const db = new DatabaseSync(':memory:');
@@ -245,21 +265,23 @@ describe('SQLite repository — schema and engine', () => {
     }
   });
 
-  it('creates v1 through v4 in contiguous order with verified pragmas and no memory tables', () => withMemory((repo, db) => {
+  it('creates v1 through v5 in contiguous order with verified pragmas and no memory tables', () => withMemory((repo, db) => {
     expect(db.prepare('PRAGMA journal_mode').get().journal_mode).toBe('memory');
     expect(db.prepare('PRAGMA foreign_keys').get().foreign_keys).toBe(1);
     expect(db.prepare('PRAGMA synchronous').get().synchronous).toBe(2);
     expect(db.prepare('PRAGMA busy_timeout').get().timeout).toBe(5000);
-    expect(db.prepare('PRAGMA user_version').get().user_version).toBe(4);
+    expect(db.prepare('PRAGMA user_version').get().user_version).toBe(5);
     const history = db.prepare('SELECT version, checksum FROM schema_migrations ORDER BY version').all();
-    expect(history.map(row => row.version)).toEqual([1,2,3,4]);
+    expect(history.map(row => row.version)).toEqual([1,2,3,4,5]);
     expect(history[0].checksum).toBe(OLD_MIGRATION_CHECKSUM);
     expect(history[1].checksum).toBe(OLD_MIGRATION_002_CHECKSUM);
     expect(history[2].checksum).toBe(OLD_MIGRATION_003_CHECKSUM);
-    expect(history[3].checksum).toMatch(/^fnv1a32:[0-9a-f]{8}$/);
+    expect(history[3].checksum).toBe(OLD_MIGRATION_004_CHECKSUM);
+    expect(history[4].checksum).toMatch(/^fnv1a32:[0-9a-f]{8}$/);
     expect(db.prepare('SELECT name FROM sqlite_temp_schema').all()).toEqual([]);
     expect(db.prepare("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all().map(row => row.name)).toEqual([
-      'cg_unlocks', 'commands', 'inventory', 'outbox', 'pet_acquisitions', 'pet_home_schedules', 'pet_progression', 'pet_states', 'pets', 'preferences',
+      'cg_unlocks', 'commands', 'commerce_operation_instances', 'commerce_operation_materials', 'commerce_operations', 'inventory', 'item_instances', 'outbox',
+      'pet_acquisitions', 'pet_equipment', 'pet_home_schedules', 'pet_progression', 'pet_states', 'pets', 'preferences',
       'reward_ledger', 'schema_migrations', 'settlements', 'trip_cg_asset_pins', 'trip_events', 'trip_reports', 'trips', 'wallet',
     ]);
     expect(repo.transaction(tx => [tx.getPreferences(), tx.listPets(), tx.listTrips(), tx.getWalletCoins()])).toEqual([null, [], [], 0]);
@@ -340,16 +362,27 @@ describe('SQLite repository — schema and engine', () => {
     finally { memory.close(); }
   });
 });
+const itemInstance=(instanceId,definitionId='apprentice-staff',definitionVersion=1,acquiredAt=START)=>
+  ({instanceId,definitionId,definitionVersion,enhancement:0,acquiredAt});
+const operationBase=(commandId,type,occurredAt=START,catalogVersion=1)=>({commandId,type,occurredAt,catalogVersion});
+const canonical=(value)=>JSON.stringify(value,(_k,v)=>v!==null&&typeof v==='object'&&!Array.isArray(v)
+  ?Object.fromEntries(Object.keys(v).sort().map(key=>[key,v[key]])):v);
+function commerceReceipt(operation,payload,overrides={},walletCoins=0) {
+  return { commandId:operation.commandId,
+    fingerprint:canonical({commandId:operation.commandId,expectedRevision:0,issuedAt:operation.occurredAt,payload,type:operation.type}),
+    outcome:{ok:true,snapshot:{revision:1,primaryPetId:null,pets:[],walletCoins,doNotDisturb:false,pausedRender:false}},
+    createdAt:operation.occurredAt,...overrides };
+}
 
 describe('SQLite repository — real v1 archive migration', () => {
   it('verifies the old archive, runs a synchronous backup outside the transaction, preserves history and settles legacy in-flight only as unversioned', () => withFile(path => {
     const db = new DatabaseSync(path);
     const { old, active, oldUnlock, final } = createV1Archive(db);
-    const backupPath = `${path}.before-v4`;
+    const backupPath = `${path}.before-v5`;
     let callbacks = 0;
     const repo = new SQLiteRepository(db, { persistent: true, beforeMigration(from, to) {
       callbacks++;
-      expect([from,to]).toEqual([1,4]);
+      expect([from,to]).toEqual([1,5]);
       expect(db.prepare('PRAGMA user_version').get().user_version).toBe(1);
       expect(db.prepare('SELECT version, checksum FROM schema_migrations').all()).toEqual([{ version: 1, checksum: OLD_MIGRATION_CHECKSUM }]);
       expect(db.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
@@ -359,7 +392,7 @@ describe('SQLite repository — real v1 archive migration', () => {
     } });
     try {
       expect(callbacks).toBe(1);
-      expect(db.prepare('PRAGMA user_version').get().user_version).toBe(4);
+      expect(db.prepare('PRAGMA user_version').get().user_version).toBe(5);
       expect(db.prepare('SELECT trip_id, cg_pin_schema FROM trips ORDER BY trip_id').all()).toEqual([
         { trip_id: 'trip-legacy', cg_pin_schema: 1 }, { trip_id: 'trip-old', cg_pin_schema: 1 },
       ]);
@@ -397,12 +430,12 @@ describe('SQLite repository — real v1 archive migration', () => {
       } finally { backup.close(); }
     } finally { repo.close(); }
     const reopened = new DatabaseSync(path);
-    const v4 = new SQLiteRepository(reopened, { persistent: true, beforeMigration() { throw new Error('should not back up v4 again'); } });
+    const v5 = new SQLiteRepository(reopened, { persistent: true, beforeMigration() { throw new Error('should not back up v5 again'); } });
     try {
-      expect(v4.transaction(tx => tx.listCgUnlocks('pet-a'))).toEqual([unlocked(oldUnlock)]);
+      expect(v5.transaction(tx => tx.listCgUnlocks('pet-a'))).toEqual([unlocked(oldUnlock)]);
       expect(reopened.prepare('PRAGMA integrity_check').all().map(row => row.integrity_check)).toEqual(['ok']);
       expect(reopened.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
-    } finally { v4.close(); }
+    } finally { v5.close(); }
   }));
 
   it('refuses to mutate a persistent v1 archive without a successful synchronous backup callback', () => withFile(path => {
@@ -456,25 +489,25 @@ describe('SQLite repository — real v1 archive migration', () => {
       expect(db.prepare('SELECT name FROM sqlite_schema WHERE name=?').get('trip_cg_asset_pins')).toBeUndefined();
       const repo = new SQLiteRepository(db, { persistent: true, beforeMigration });
       expect(backups).toBe(2);
-      expect(db.prepare('PRAGMA user_version').get().user_version).toBe(4);
+      expect(db.prepare('PRAGMA user_version').get().user_version).toBe(5);
       expect(repo.transaction(tx => tx.getCgUnlock('pet-a','postcard','default'))).toEqual(unlocked(oldUnlock));
     } finally { db.close(); }
   }));
 
-  it('verifies all four applied checksums and refuses missing or noncontiguous history on v4 startup', () => withFile(path => {
+  it('verifies all five applied checksums and refuses missing or noncontiguous history on v5 startup', () => withFile(path => {
     const initial = new DatabaseSync(path);
     new SQLiteRepository(initial, { persistent: true }).close();
     const db = new DatabaseSync(path);
     try {
-      const v4 = db.prepare('SELECT checksum FROM schema_migrations WHERE version=4').get().checksum;
-      for (const [version, checksum] of [[1, OLD_MIGRATION_CHECKSUM],[2, OLD_MIGRATION_002_CHECKSUM],[3,OLD_MIGRATION_003_CHECKSUM],[4,v4]]) {
+      const v5 = db.prepare('SELECT checksum FROM schema_migrations WHERE version=5').get().checksum;
+      for (const [version, checksum] of [[1, OLD_MIGRATION_CHECKSUM],[2, OLD_MIGRATION_002_CHECKSUM],[3,OLD_MIGRATION_003_CHECKSUM],[4,OLD_MIGRATION_004_CHECKSUM],[5,v5]]) {
         db.prepare("UPDATE schema_migrations SET checksum='bad' WHERE version=?").run(version);
         expect(() => new SQLiteRepository(db, { persistent: true })).toThrow(/checksum mismatch/);
         db.prepare('UPDATE schema_migrations SET checksum=? WHERE version=?').run(checksum, version);
       }
-      db.exec('UPDATE schema_migrations SET version=5 WHERE version=2');
+      db.exec('UPDATE schema_migrations SET version=6 WHERE version=2');
       expect(() => new SQLiteRepository(db, { persistent: true })).toThrow(/not contiguous/);
-      db.exec('DELETE FROM schema_migrations WHERE version=5');
+      db.exec('DELETE FROM schema_migrations WHERE version=6');
       expect(() => new SQLiteRepository(db, { persistent: true })).toThrow(/history is invalid/);
     } finally { db.close(); }
   }));
@@ -496,13 +529,13 @@ describe('SQLite repository — real v1 archive migration', () => {
 });
 
 describe('SQLite repository — genuine v2 acquisition migration', () => {
-  it('preserves pinned CG/trips/receipt and legacy pets while invoking one v2→v4 pre-backup', () => withFile(path => {
+  it('preserves pinned CG/trips/receipt and legacy pets while invoking one v2→v5 pre-backup', () => withFile(path => {
     const db = new DatabaseSync(path), fixture = createV2Archive(db);
     const backupPath = `${path}.v2-copy`;
     let calls = 0;
     const repo = new SQLiteRepository(db, { persistent:true,beforeMigration(from,to) {
       calls++;
-      expect([from,to]).toEqual([2,4]);
+      expect([from,to]).toEqual([2,5]);
       expect(db.prepare('PRAGMA user_version').get().user_version).toBe(2);
       expect(db.prepare('SELECT version, checksum FROM schema_migrations ORDER BY version').all()).toEqual([
         {version:1,checksum:OLD_MIGRATION_CHECKSUM},{version:2,checksum:OLD_MIGRATION_002_CHECKSUM},
@@ -512,7 +545,7 @@ describe('SQLite repository — genuine v2 acquisition migration', () => {
     } });
     try {
       expect(calls).toBe(1);
-      expect(db.prepare('PRAGMA user_version').get().user_version).toBe(4);
+      expect(db.prepare('PRAGMA user_version').get().user_version).toBe(5);
       expect(db.prepare('SELECT * FROM pet_acquisitions').all()).toEqual([]);
       repo.transaction(tx => {
         expect(tx.listPets().map(p=>p.petId)).toEqual(['pet-a','pet-b','pet-c']);
@@ -590,7 +623,7 @@ describe('SQLite repository — genuine v3 home-clock migration', () => {
     let calls=0;
     const repo=new SQLiteRepository(db,{persistent:true,beforeMigration(from,to){
       calls++;
-      expect([from,to]).toEqual([3,4]);
+      expect([from,to]).toEqual([3,5]);
       expect(db.prepare('PRAGMA user_version').get().user_version).toBe(3);
       expect(db.prepare('SELECT version,checksum FROM schema_migrations ORDER BY version').all()).toEqual([
         {version:1,checksum:OLD_MIGRATION_CHECKSUM},{version:2,checksum:OLD_MIGRATION_002_CHECKSUM},{version:3,checksum:OLD_MIGRATION_003_CHECKSUM},
@@ -600,7 +633,7 @@ describe('SQLite repository — genuine v3 home-clock migration', () => {
     }});
     try{
       expect(calls).toBe(1);
-      expect(db.prepare('PRAGMA user_version').get().user_version).toBe(4);
+      expect(db.prepare('PRAGMA user_version').get().user_version).toBe(5);
       expect(db.prepare('SELECT * FROM pet_home_schedules').all()).toEqual([]);
       repo.transaction(tx=>{
         expect(tx.listPets().map(p=>p.petId)).toEqual(['pet-a','pet-b','pet-c',fixture.acquired.petId]);
@@ -643,6 +676,60 @@ describe('SQLite repository — genuine v3 home-clock migration', () => {
       const repo=new SQLiteRepository(db,{persistent:true,beforeMigration(){}});
       expect(repo.transaction(tx=>[tx.getPetAcquisition(fixture.acquired.petId),tx.getHomeSchedule(fixture.acquired.petId),tx.getCgUnlock('pet-c','postcard','default')]))
         .toEqual([fixture.acquired,null,fixture.cg]);
+    }finally{db.close();}
+  }));
+});
+
+describe('SQLite repository — genuine v4 commerce migration',()=>{
+  it('adds empty equipment and operation tables with a mandatory pre-backup, preserving every legacy stack/history and home clock',()=>withFile(path=>{
+    const db=new DatabaseSync(path),fixture=createV4Archive(db),backupPath=`${path}.v4-backup`;
+    let calls=0;
+    const repo=new SQLiteRepository(db,{persistent:true,beforeMigration(from,to){
+      calls++;expect([from,to]).toEqual([4,5]);
+      expect(db.prepare('PRAGMA user_version').get().user_version).toBe(4);
+      expect(db.prepare('SELECT name FROM sqlite_schema WHERE name=?').get('item_instances')).toBeUndefined();
+      db.prepare('VACUUM INTO ?').run(backupPath);
+    }});
+    try{
+      expect(calls).toBe(1);expect(db.prepare('PRAGMA user_version').get().user_version).toBe(5);
+      repo.transaction(tx=>{
+        expect(tx.listInventory()).toEqual(fixture.stacks);
+        expect(tx.listItemInstances()).toEqual([]);expect(tx.listPetEquipment()).toEqual([]);expect(tx.getCommerceOperation('absent')).toBeNull();
+        expect(fixture.clocks.map(clock=>tx.getHomeSchedule(clock.petId))).toEqual(fixture.clocks);
+        expect(tx.getPetAcquisition(fixture.acquired.petId)).toEqual(fixture.acquired);
+        expect(tx.getCgUnlock('pet-c','postcard','default')).toEqual(fixture.cg);
+        expect(tx.getTrip('trip-v2')).toEqual(fixture.trip);expect(tx.listRewards('trip-v2')).toEqual([fixture.line]);
+        expect(tx.getCommandReceipt(fixture.acquireCommand.commandId)).toEqual(fixture.acquireCommand);
+        expect(tx.getCommandReceipt(fixture.command.commandId)).toEqual(fixture.command);
+      });
+      for(const table of ['item_instances','pet_equipment','commerce_operations','commerce_operation_materials','commerce_operation_instances'])
+        expect(db.prepare(`SELECT count(*) AS n FROM ${table}`).get().n).toBe(0);
+      const backup=new DatabaseSync(backupPath);
+      try{
+        expect(backup.prepare('PRAGMA user_version').get().user_version).toBe(4);
+        expect(backup.prepare('SELECT name FROM sqlite_schema WHERE name=?').get('commerce_operations')).toBeUndefined();
+        expect(backup.prepare('SELECT * FROM inventory ORDER BY item_id').all()).toEqual(fixture.stacks.map(stack=>({item_id:stack.itemId,quantity:stack.quantity})));
+      }finally{backup.close();}
+    }finally{repo.close();}
+  }));
+
+  it('failed backup and injected v5 DDL rollback leave the original v4 archive exactly intact and retryable',()=>withFile(path=>{
+    const db=new DatabaseSync(path),fixture=createV4Archive(db);
+    const capture=()=>({history:db.prepare('SELECT * FROM schema_migrations ORDER BY version').all(),inventory:db.prepare('SELECT * FROM inventory ORDER BY item_id').all(),
+      rewards:db.prepare('SELECT * FROM reward_ledger').all(),commands:db.prepare('SELECT * FROM commands ORDER BY command_id').all(),
+      schedules:db.prepare('SELECT * FROM pet_home_schedules ORDER BY pet_id').all()});
+    const before=capture();
+    const failing={prepare:sql=>db.prepare(sql),close:()=>db.close(),exec(sql){db.exec(sql);if(sql.includes('CREATE TABLE item_instances'))throw new Error('v5 DDL fault');}};
+    try{
+      expect(()=>new SQLiteRepository(db,{persistent:true})).toThrow(/pre-migration backup callback/);
+      expect(()=>new SQLiteRepository(db,{persistent:true,beforeMigration(){throw new Error('v4 backup failed');}})).toThrow(/v4 backup failed/);
+      expect(()=>new SQLiteRepository(failing,{persistent:true,beforeMigration(){}})).toThrow(/v5 DDL fault/);
+      expect(db.prepare('PRAGMA user_version').get().user_version).toBe(4);
+      expect(db.prepare('SELECT name FROM sqlite_schema WHERE name=?').get('item_instances')).toBeUndefined();
+      expect(capture()).toEqual(before);
+      const repo=new SQLiteRepository(db,{persistent:true,beforeMigration(){}});
+      expect(repo.transaction(tx=>[tx.listInventory(),tx.listItemInstances(),tx.getCommandReceipt(fixture.command.commandId)]))
+        .toEqual([fixture.stacks,[],fixture.command]);
     }finally{db.close();}
   }));
 });
@@ -1000,6 +1087,166 @@ describe('SQLite repository — persisted home simulation clocks',()=>{
       throw new Error('home simulation transaction failed');
     })).toThrow(/home simulation transaction failed/);
     expect(repo.transaction(tx=>[tx.getHomeSchedule('pet-a'),tx.getPreferences(),tx.getPet('pet-a')])).toEqual([before,preferences(),pet()]);
+  }));
+});
+
+describe('SQLite repository — active equipment and immutable commerce history',()=>{
+  it('persists all six commerce commands and equipment replacement across WAL restart without touching trip ledger',()=>withFile(path=>{
+    const firstDb=new DatabaseSync(path),repo=new SQLiteRepository(firstDb,{persistent:true});
+    const staffA=itemInstance('item-a'),staffB=itemInstance('item-b');
+    const owner={petId:'pet-a',slot:'WEAPON',instanceId:staffA.instanceId};
+    const replacement={...owner,instanceId:staffB.instanceId};
+    const operations=[];
+    const commit=(operation,payload,mutate)=>repo.transaction(tx=>{
+      mutate(tx);tx.insertCommerceOperation(operation);
+      expect(tx.getCommandReceipt(operation.commandId)).toBeNull();
+      tx.saveCommandReceipt(commerceReceipt(operation,{...payload,catalogVersion:operation.catalogVersion},{},tx.getWalletCoins()));
+      const stored=tx.getCommerceOperation(operation.commandId);
+      operations.push(stored);
+      expect(stored).toEqual(operation.type==='SHOP_PURCHASE'?{...operation,instanceIds:[...operation.instanceIds].sort()}:operation);
+    });
+    try{
+      repo.transaction(tx=>{tx.savePet(pet());tx.savePet({...pet('pet-b'),visibility:'HIDDEN'});tx.setWalletCoins(100);tx.addInventory('iron-ore',5);});
+      const stack={...operationBase('buy-stack','SHOP_PURCHASE'),offerId:'ration-offer',itemId:'ration',quantity:2,coinCost:4,outputKind:'STACK',instanceIds:[]};
+      commit(stack,{offerId:stack.offerId,quantity:2},tx=>{tx.setWalletCoins(96);tx.addInventory('ration',2);});
+      const equipment={...operationBase('buy-items','SHOP_PURCHASE'),offerId:'staff-offer',itemId:'apprentice-staff',quantity:2,coinCost:24,outputKind:'EQUIPMENT',instanceIds:['item-b','item-a']};
+      commit(equipment,{offerId:equipment.offerId,quantity:2},tx=>{tx.setWalletCoins(72);tx.insertItemInstance(staffA);tx.insertItemInstance(staffB);});
+      const equip={...operationBase('equip-one','EQUIPMENT_EQUIP'),...owner,previousInstanceId:null};
+      commit(equip,owner,tx=>tx.equipItem(owner));
+      const replace={...operationBase('equip-replace','EQUIPMENT_EQUIP'),...replacement,previousInstanceId:staffA.instanceId};
+      commit(replace,replacement,tx=>{tx.unequipItem(owner.petId,owner.slot,owner.instanceId);tx.equipItem(replacement);});
+      const unequip={...operationBase('unequip','EQUIPMENT_UNEQUIP'),...replacement};
+      commit(unequip,{petId:replacement.petId,slot:replacement.slot},tx=>tx.unequipItem(replacement.petId,replacement.slot,replacement.instanceId));
+      const upgrade={...operationBase('upgrade','EQUIPMENT_UPGRADE'),instanceId:staffA.instanceId,fromEnhancement:0,toEnhancement:1,coinCost:10,
+        materials:[{itemId:'iron-ore',quantity:1}]};
+      commit(upgrade,{instanceId:staffA.instanceId,expectedEnhancement:0},tx=>{
+        tx.setWalletCoins(62);tx.addInventory('iron-ore',-1);expect(tx.upgradeItemInstance(staffA.instanceId,0)).toEqual({...staffA,enhancement:1});
+      });
+      const salvage={...operationBase('salvage','EQUIPMENT_SALVAGE'),instanceId:staffA.instanceId,enhancement:1,materials:[{itemId:'iron-scrap',quantity:1}]};
+      commit(salvage,{instanceId:staffA.instanceId,expectedEnhancement:1},tx=>{tx.deleteItemInstance(staffA.instanceId);tx.addInventory('iron-scrap',1);});
+      const use={...operationBase('use-ration','ITEM_USE'),petId:'pet-a',itemId:'ration'};
+      commit(use,{petId:'pet-a',itemId:'ration'},tx=>tx.addInventory('ration',-1));
+      expect(firstDb.prepare('SELECT count(*) AS n FROM reward_ledger').get().n).toBe(0);
+    }finally{repo.close();}
+    const db=new DatabaseSync(path),after=new SQLiteRepository(db,{persistent:true});
+    try{
+      after.transaction(tx=>{
+        expect(tx.listItemInstances()).toEqual([staffB]);expect(tx.getItemInstance('item-a')).toBeNull();
+        expect(tx.listPetEquipment()).toEqual([]);expect(tx.getPetEquipment('pet-a','WEAPON')).toBeNull();
+        expect(tx.getInstanceEquipment('item-b')).toBeNull();
+        expect(tx.getWalletCoins()).toBe(62);
+        expect(tx.listInventory()).toEqual([{itemId:'iron-ore',quantity:4},{itemId:'iron-scrap',quantity:1},{itemId:'ration',quantity:1}]);
+        for(const op of operations){expect(tx.getCommerceOperation(op.commandId)).toEqual(op);expect(tx.getCommandReceipt(op.commandId).outcome.ok).toBe(true);}
+        expect(()=>tx.insertItemInstance(staffA)).toThrow(/unique \+0 active identity/);
+      });
+      expect(db.prepare('SELECT retired,enhancement FROM item_instances WHERE instance_id=?').get('item-a')).toEqual({retired:1,enhancement:1});
+      expect(db.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
+      expect(db.prepare('PRAGMA integrity_check').all().map(row=>row.integrity_check)).toEqual(['ok']);
+    }finally{after.close();}
+  }));
+
+  it('enforces unique per-pet slot and per-instance ownership, explicit expected unequip, and tombstone immutability',()=>withMemory((repo,db)=>{
+    const one=itemInstance('item-1'),two=itemInstance('item-2'),binding={petId:'pet-a',slot:'WEAPON',instanceId:one.instanceId};
+    repo.transaction(tx=>{tx.savePet(pet());tx.savePet(pet('pet-b'));tx.insertItemInstance(one);tx.insertItemInstance(two);tx.equipItem(binding);});
+    expect(repo.transaction(tx=>[tx.listPetEquipment('pet-a'),tx.getPetEquipment('pet-a','WEAPON'),tx.getInstanceEquipment(one.instanceId)]))
+      .toEqual([[binding],binding,binding]);
+    for(const conflicting of [{...binding,instanceId:two.instanceId},{...binding,petId:'pet-b'},{...binding,slot:'ARMOR'}])
+      expect(()=>repo.transaction(tx=>tx.equipItem(conflicting))).toThrow(/free slot and active unequipped/);
+    expect(()=>repo.transaction(tx=>tx.unequipItem('pet-a','WEAPON','wrong'))).toThrow(/expected instance/);
+    expect(()=>repo.transaction(tx=>tx.deleteItemInstance(one.instanceId))).toThrow(/unequipped/);
+    expect(()=>db.exec("UPDATE pet_equipment SET slot='ARMOR'")).toThrow(/explicitly unequipped/);
+    expect(()=>db.exec('INSERT OR REPLACE INTO pet_equipment SELECT * FROM pet_equipment')).toThrow(/free slot/);
+    expect(()=>db.exec("UPDATE item_instances SET retired=1 WHERE instance_id='item-1'")).toThrow(/unequipped retirement/);
+    repo.transaction(tx=>{tx.unequipItem(binding.petId,binding.slot,binding.instanceId);tx.deleteItemInstance(one.instanceId);});
+    expect(repo.transaction(tx=>tx.listItemInstances())).toEqual([two]);
+    expect(()=>db.exec("UPDATE item_instances SET retired=0 WHERE instance_id='item-1'")).toThrow(/item identity is immutable/);
+    expect(()=>db.exec("DELETE FROM item_instances WHERE instance_id='item-1'")).toThrow(/identity cannot be deleted/);
+    expect(()=>db.exec("INSERT OR REPLACE INTO item_instances SELECT * FROM item_instances WHERE instance_id='item-1'")).toThrow(/unique \+0/);
+    expect(()=>repo.transaction(tx=>tx.equipItem(binding))).toThrow(/active unequipped/);
+  }));
+
+  it('bounds active equipment at 500, refuses stale/skipped/over-cap upgrades, and never reuses retired IDs',()=>withMemory((repo,db)=>{
+    const first=itemInstance('item-000');
+    repo.transaction(tx=>{
+      for(let i=0;i<500;i++)tx.insertItemInstance(itemInstance(`item-${String(i).padStart(3,'0')}`));
+      expect(tx.listItemInstances()).toHaveLength(500);
+      expect(()=>tx.insertItemInstance(itemInstance('overflow'))).toThrow(/within capacity/);
+      for(let n=0;n<5;n++)expect(tx.upgradeItemInstance(first.instanceId,n).enhancement).toBe(n+1);
+      expect(()=>tx.upgradeItemInstance(first.instanceId,4)).toThrow(/expected enhancement/);
+      expect(()=>tx.upgradeItemInstance(first.instanceId,5)).toThrow();
+      tx.deleteItemInstance(first.instanceId);tx.insertItemInstance(itemInstance('replacement'));
+      expect(tx.listItemInstances()).toHaveLength(500);
+      expect(()=>tx.insertItemInstance(first)).toThrow(/unique \+0/);
+    });
+    expect(()=>db.exec("UPDATE item_instances SET enhancement=enhancement+2 WHERE instance_id='replacement'")).toThrow(/one upgrade/);
+    expect(()=>db.exec("UPDATE item_instances SET definition_version=2,enhancement=1 WHERE instance_id='replacement'")).toThrow(/identity is immutable/);
+    expect(()=>db.exec("UPDATE item_instances SET acquired_at=acquired_at+1,enhancement=1 WHERE instance_id='replacement'")).toThrow(/identity is immutable/);
+    expect(()=>repo.transaction(tx=>tx.insertItemInstance({...itemInstance('new'),'enhancement':1}))).toThrow(/start at \+0/);
+  }));
+
+  it('requires exact operation/receipt intent, timestamp, catalog version and successful outcome, rolling back wallet, stacks and item writes',()=>withMemory(repo=>{
+    const op={...operationBase('purchase','SHOP_PURCHASE'),offerId:'ration-offer',itemId:'ration',quantity:2,coinCost:4,outputKind:'STACK',instanceIds:[]};
+    const payload={offerId:op.offerId,quantity:2,catalogVersion:1};
+    repo.transaction(tx=>tx.setWalletCoins(20));
+    const valid=commerceReceipt(op,payload,{},16);
+    for(const wrong of [commerceReceipt(op,{...payload,quantity:1},{},16),commerceReceipt(op,{...payload,offerId:'other-offer'},{},16),
+      commerceReceipt(op,{...payload,catalogVersion:2},{},16),{...valid,createdAt:START+1},
+      {...valid,outcome:{ok:true,snapshot:{...valid.outcome.snapshot,revision:2}}},
+      {...valid,outcome:{ok:true,snapshot:{...valid.outcome.snapshot,walletCoins:17}}},
+      {...valid,outcome:{ok:false,error:{code:'BUSINESS_RULE',message:'denied',retryable:false}}}]){
+      expect(()=>repo.transaction(tx=>{tx.setWalletCoins(16);tx.addInventory('ration',2);tx.insertCommerceOperation(op);tx.saveCommandReceipt(wrong);})).toThrow(/exact immutable successful operation/);
+      expect(repo.transaction(tx=>[tx.getWalletCoins(),tx.listInventory(),tx.getCommerceOperation(op.commandId),tx.getCommandReceipt(op.commandId)]))
+        .toEqual([20,[],null,null]);
+    }
+    expect(()=>repo.transaction(tx=>{tx.setWalletCoins(16);tx.addInventory('ration',2);tx.insertCommerceOperation(op);})).toThrow(/foreign key/i);
+    expect(repo.transaction(tx=>[tx.getWalletCoins(),tx.listInventory(),tx.getCommerceOperation(op.commandId)])).toEqual([20,[],null]);
+    expect(()=>repo.transaction(tx=>tx.saveCommandReceipt(valid))).toThrow(/exact immutable successful operation/);
+    const rejection={...valid,outcome:{ok:false,error:{code:'BUSINESS_RULE',message:'denied',retryable:false}}};
+    repo.transaction(tx=>tx.saveCommandReceipt(rejection));
+    expect(repo.transaction(tx=>tx.getCommandReceipt(op.commandId))).toEqual(rejection);
+    expect(()=>repo.transaction(tx=>tx.insertCommerceOperation(op))).toThrow(/new unique command without receipt/);
+  }));
+
+  it('validates closed bounded evidence and refuses purchases/upgrade/equip/salvage receipts without corresponding actual instance state',()=>withMemory(repo=>{
+    const item=itemInstance('owned-item');
+    repo.transaction(tx=>{tx.savePet(pet());tx.insertItemInstance(item);});
+    const shop={...operationBase('bad-shop','SHOP_PURCHASE'),offerId:'staff-offer',itemId:item.definitionId,quantity:1,coinCost:12,outputKind:'EQUIPMENT',instanceIds:[item.instanceId]};
+    for(const invalid of [{...shop,quantity:2},{...shop,instanceIds:['owned-item','owned-item']},{...shop,coinCost:-1},{...shop,extra:'x'},{...shop,outputKind:'STACK'},
+      {...operationBase('bad-upgrade','EQUIPMENT_UPGRADE'),instanceId:item.instanceId,fromEnhancement:0,toEnhancement:2,coinCost:10,materials:[{itemId:'iron-ore',quantity:1}]},
+      {...operationBase('bad-salvage','EQUIPMENT_SALVAGE'),instanceId:item.instanceId,enhancement:0,materials:[{itemId:'iron-ore',quantity:1},{itemId:'iron-ore',quantity:2}]},
+      {...operationBase('unbounded','EQUIPMENT_SALVAGE'),instanceId:item.instanceId,enhancement:0,materials:Array.from({length:17},(_,i)=>({itemId:`material-${i}`,quantity:1}))},
+    ])expect(()=>repo.transaction(tx=>tx.insertCommerceOperation(invalid))).toThrow();
+    expect(()=>repo.transaction(tx=>tx.insertCommerceOperation({...shop,occurredAt:START+1}))).toThrow(/invalid or immutable commerce instance evidence/);
+    expect(()=>repo.transaction(tx=>tx.insertCommerceOperation({...shop,itemId:'other-definition'}))).toThrow(/invalid or immutable commerce instance evidence/);
+    const upgrade={...operationBase('upgrade-not-applied','EQUIPMENT_UPGRADE'),instanceId:item.instanceId,fromEnhancement:0,toEnhancement:1,coinCost:10,materials:[{itemId:'iron-ore',quantity:1}]};
+    const salvage={...operationBase('salvage-not-applied','EQUIPMENT_SALVAGE'),instanceId:item.instanceId,enhancement:0,materials:[{itemId:'iron-scrap',quantity:1}]};
+    const equip={...operationBase('equip-not-applied','EQUIPMENT_EQUIP'),petId:'pet-a',slot:'WEAPON',instanceId:item.instanceId,previousInstanceId:null};
+    for(const [operation,payload] of [[upgrade,{instanceId:item.instanceId,expectedEnhancement:0,catalogVersion:1}],
+      [salvage,{instanceId:item.instanceId,expectedEnhancement:0,catalogVersion:1}],[equip,{petId:'pet-a',slot:'WEAPON',instanceId:item.instanceId,catalogVersion:1}]]){
+      expect(()=>repo.transaction(tx=>{tx.insertCommerceOperation(operation);tx.saveCommandReceipt(commerceReceipt(operation,payload));})).toThrow(/exact immutable successful operation/);
+      expect(repo.transaction(tx=>tx.getCommerceOperation(operation.commandId))).toBeNull();
+    }
+    expect(repo.transaction(tx=>[tx.getItemInstance(item.instanceId),tx.listPetEquipment()])).toEqual([item,[]]);
+  }));
+
+  it('prevents late material or instance evidence, historical operation/receipt rewriting and duplicate purchase grants',()=>withMemory((repo,db)=>{
+    const item=itemInstance('owned'),shop={...operationBase('shop','SHOP_PURCHASE'),offerId:'staff-offer',itemId:item.definitionId,quantity:1,coinCost:12,outputKind:'EQUIPMENT',instanceIds:[item.instanceId]};
+    const upgrade={...operationBase('upgrade','EQUIPMENT_UPGRADE'),instanceId:item.instanceId,fromEnhancement:0,toEnhancement:1,coinCost:10,materials:[{itemId:'iron-ore',quantity:1}]};
+    repo.transaction(tx=>{tx.insertItemInstance(item);tx.insertCommerceOperation(shop);tx.saveCommandReceipt(commerceReceipt(shop,{offerId:shop.offerId,quantity:1,catalogVersion:1}));});
+    expect(()=>repo.transaction(tx=>tx.insertCommerceOperation({...shop,commandId:'duplicate-shop'}))).toThrow(/invalid or immutable commerce instance evidence/);
+    repo.transaction(tx=>{tx.upgradeItemInstance(item.instanceId,0);tx.insertCommerceOperation(upgrade);tx.saveCommandReceipt(commerceReceipt(upgrade,{instanceId:item.instanceId,expectedEnhancement:0,catalogVersion:1}));});
+    expect(()=>db.exec("UPDATE commerce_operations SET coin_cost=0 WHERE command_id='upgrade'")).toThrow(/immutable/);
+    expect(()=>db.exec('DELETE FROM commerce_operations')).toThrow(/immutable/);
+    expect(()=>db.exec('INSERT OR REPLACE INTO commerce_operations SELECT * FROM commerce_operations')).toThrow(/new unique command/);
+    expect(()=>db.exec("UPDATE commerce_operation_materials SET quantity=2")).toThrow(/immutable/);
+    expect(()=>db.exec('DELETE FROM commerce_operation_materials')).toThrow(/immutable/);
+    expect(()=>db.exec("INSERT INTO commerce_operation_materials VALUES ('upgrade','late-material',1)")).toThrow(/immutable commerce material/);
+    expect(()=>db.exec('DELETE FROM commerce_operation_instances')).toThrow(/immutable/);
+    expect(()=>db.exec("INSERT INTO commerce_operation_instances VALUES ('shop','missing')")).toThrow(/immutable commerce instance/);
+    expect(()=>db.exec("UPDATE commands SET outcome_json='{}' WHERE command_id='upgrade'")).toThrow(/commerce receipt is immutable/);
+    expect(()=>db.exec("DELETE FROM commands WHERE command_id='shop'")).toThrow(/commerce receipt is immutable/);
+    expect(()=>db.exec("INSERT OR REPLACE INTO commands SELECT * FROM commands WHERE command_id='shop'")).toThrow(/exact immutable successful operation/);
+    expect(repo.transaction(tx=>[tx.getCommerceOperation(shop.commandId),tx.getCommerceOperation(upgrade.commandId)])).toEqual([shop,upgrade]);
   }));
 });
 

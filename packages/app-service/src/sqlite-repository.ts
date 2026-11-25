@@ -3,17 +3,19 @@ import {
   idSchema, ipcErrorCodeSchema, moodSchema, presenceSchema, visibilitySchema,
 } from '@pet-desktop/contracts';
 import type { CgAssetRef, DomainEvent } from '@pet-desktop/contracts';
+import type { EquipmentSlot } from '@pet-desktop/contracts/inventory';
 import { advanceTrip, MAX_TRIP_FACTS, MAX_TRIP_NODES } from '@pet-desktop/domain';
 import type { RewardDraft, TripCheckpoint, TripFact, TripSnapshot } from '@pet-desktop/domain';
 import type {
-  AppRepository, AppTransaction, CgUnlock, CgUnlockInput, CommandOutcome, CommandReceipt, InventoryItem, OutboxRecord,
+  AppRepository, AppTransaction, CgUnlock, CgUnlockInput, CommandOutcome, CommandReceipt, CommerceMaterialAmount, CommerceOperationRecord,
+  InventoryItem, ItemInstanceRecord, OutboxRecord, PetEquipmentRecord,
   HomeScheduleRecord, PetAcquisitionRecord, PetRecord, PreferencesRecord, RewardLine, SettlementRecord, SqliteConnection, TripCgAssetPin, TripRecord,
 } from './ports.js';
 
 const MAX_SAFE = Number.MAX_SAFE_INTEGER;
 const UINT32_MAX = 0xffff_ffff;
 const BUSY_TIMEOUT_MS = 5_000;
-const SCHEMA_VERSION = 4;
+const SCHEMA_VERSION = 5;
 const JSON_SCHEMA_VERSION = 1;
 const MIGRATION_001_JSON_SCHEMA_VERSION = 1;
 const MIGRATION_001_MAX_TRIP_FACTS = 14;
@@ -357,7 +359,7 @@ const migration004ClockRegresses = (previous: string, next: string) => `
   OR (${next}.interaction_day = ${previous}.interaction_day AND ${next}.interaction_count < ${previous}.interaction_count)
   OR (${previous}.last_interaction_at IS NOT NULL AND (${next}.last_interaction_at IS NULL
     OR ${next}.last_interaction_at < ${previous}.last_interaction_at))`;
-const MIGRATION_004 = `
+export const MIGRATION_004 = `
 CREATE TABLE pet_home_schedules (
   pet_id TEXT PRIMARY KEY NOT NULL REFERENCES pets(pet_id) CHECK (${idCheck('pet_id')}),
   last_sim_at INTEGER NOT NULL CHECK (${unsigned('last_sim_at')}),
@@ -396,11 +398,192 @@ WHEN EXISTS (SELECT 1 FROM pet_home_schedules)
 BEGIN SELECT RAISE(ABORT, 'application logical clock cannot be deleted'); END;
 `;
 
+// Separate owned instance inventory and successful commerce records. Retired
+// identities are retained privately, never reused or exposed as live items.
+// Operation evidence uses closed scalar columns and bounded relation rows.
+const MIGRATION_005_INSTANCE_LIMIT = 500;
+const MIGRATION_005_ENHANCEMENT_LIMIT = 5;
+const MIGRATION_005_MATERIAL_LIMIT = 16;
+const MIGRATION_005_PURCHASE_LIMIT = 100;
+const migration005CommerceTypes = "'SHOP_PURCHASE','EQUIPMENT_EQUIP','EQUIPMENT_UNEQUIP','EQUIPMENT_UPGRADE','EQUIPMENT_SALVAGE','ITEM_USE'";
+const migration005ReceiptMatches = (receipt: string, operation: string) => `
+  json_extract(${receipt}.fingerprint,'$.commandId')=${receipt}.command_id
+  AND json_extract(${receipt}.fingerprint,'$.type')=${operation}.operation_type
+  AND json_type(${receipt}.fingerprint,'$.expectedRevision')='integer'
+  AND json_extract(${receipt}.fingerprint,'$.expectedRevision')>=0
+  AND json_type(${receipt}.fingerprint,'$.payload.catalogVersion')='integer'
+  AND json_extract(${receipt}.fingerprint,'$.payload.catalogVersion')=${operation}.catalog_version
+  AND ${receipt}.created_at=${operation}.occurred_at AND json_type(${receipt}.outcome_json,'$.ok')='true'
+  AND json_type(${receipt}.outcome_json,'$.snapshot.revision')='integer'
+  AND json_extract(${receipt}.outcome_json,'$.snapshot.revision')=json_extract(${receipt}.fingerprint,'$.expectedRevision')+1
+  AND json_type(${receipt}.outcome_json,'$.snapshot.walletCoins')='integer'
+  AND EXISTS (SELECT 1 FROM wallet w WHERE w.currency='coin' AND w.balance=json_extract(${receipt}.outcome_json,'$.snapshot.walletCoins'))
+  AND CASE ${operation}.operation_type
+    WHEN 'SHOP_PURCHASE' THEN json_extract(${receipt}.fingerprint,'$.payload.offerId')=${operation}.offer_id
+      AND json_extract(${receipt}.fingerprint,'$.payload.quantity')=${operation}.quantity
+    WHEN 'EQUIPMENT_EQUIP' THEN json_extract(${receipt}.fingerprint,'$.payload.petId')=${operation}.pet_id
+      AND json_extract(${receipt}.fingerprint,'$.payload.slot')=${operation}.slot
+      AND json_extract(${receipt}.fingerprint,'$.payload.instanceId')=${operation}.instance_id
+    WHEN 'EQUIPMENT_UNEQUIP' THEN json_extract(${receipt}.fingerprint,'$.payload.petId')=${operation}.pet_id
+      AND json_extract(${receipt}.fingerprint,'$.payload.slot')=${operation}.slot
+    WHEN 'EQUIPMENT_UPGRADE' THEN json_extract(${receipt}.fingerprint,'$.payload.instanceId')=${operation}.instance_id
+      AND json_extract(${receipt}.fingerprint,'$.payload.expectedEnhancement')=${operation}.from_enhancement
+    WHEN 'EQUIPMENT_SALVAGE' THEN json_extract(${receipt}.fingerprint,'$.payload.instanceId')=${operation}.instance_id
+      AND json_extract(${receipt}.fingerprint,'$.payload.expectedEnhancement')=${operation}.from_enhancement
+    WHEN 'ITEM_USE' THEN json_extract(${receipt}.fingerprint,'$.payload.petId')=${operation}.pet_id
+      AND json_extract(${receipt}.fingerprint,'$.payload.itemId')=${operation}.item_id
+    ELSE 0 END`;
+const migration005EffectsMatch = (operation: string) => `CASE ${operation}.operation_type
+  WHEN 'SHOP_PURCHASE' THEN (SELECT count(*) FROM commerce_operation_instances i WHERE i.command_id=${operation}.command_id)
+    = CASE WHEN ${operation}.output_kind='EQUIPMENT' THEN ${operation}.quantity ELSE 0 END
+    AND NOT EXISTS (SELECT 1 FROM commerce_operation_instances i JOIN item_instances e USING(instance_id)
+      WHERE i.command_id=${operation}.command_id AND (e.retired<>0 OR e.definition_id<>${operation}.item_id
+        OR e.definition_version<>${operation}.catalog_version OR e.enhancement<>0 OR e.acquired_at<>${operation}.occurred_at))
+  WHEN 'EQUIPMENT_EQUIP' THEN EXISTS (SELECT 1 FROM pet_equipment e WHERE e.pet_id=${operation}.pet_id
+    AND e.slot=${operation}.slot AND e.instance_id=${operation}.instance_id)
+    AND (${operation}.previous_instance_id IS NULL OR NOT EXISTS (SELECT 1 FROM pet_equipment e WHERE e.instance_id=${operation}.previous_instance_id))
+  WHEN 'EQUIPMENT_UNEQUIP' THEN NOT EXISTS (SELECT 1 FROM pet_equipment e WHERE e.instance_id=${operation}.instance_id
+    OR (e.pet_id=${operation}.pet_id AND e.slot=${operation}.slot))
+    AND EXISTS (SELECT 1 FROM item_instances i WHERE i.instance_id=${operation}.instance_id AND i.retired=0)
+  WHEN 'EQUIPMENT_UPGRADE' THEN EXISTS (SELECT 1 FROM item_instances i WHERE i.instance_id=${operation}.instance_id
+    AND i.retired=0 AND i.definition_version=${operation}.catalog_version AND i.enhancement=${operation}.to_enhancement)
+    AND (SELECT count(*) FROM commerce_operation_materials m WHERE m.command_id=${operation}.command_id) BETWEEN 1 AND ${MIGRATION_005_MATERIAL_LIMIT}
+  WHEN 'EQUIPMENT_SALVAGE' THEN EXISTS (SELECT 1 FROM item_instances i WHERE i.instance_id=${operation}.instance_id
+    AND i.retired=1 AND i.definition_version=${operation}.catalog_version AND i.enhancement=${operation}.from_enhancement)
+    AND (SELECT count(*) FROM commerce_operation_materials m WHERE m.command_id=${operation}.command_id) BETWEEN 1 AND ${MIGRATION_005_MATERIAL_LIMIT}
+  WHEN 'ITEM_USE' THEN 1 ELSE 0 END`;
+const MIGRATION_005 = `
+CREATE TABLE item_instances (
+  instance_id TEXT PRIMARY KEY NOT NULL CHECK (${idCheck('instance_id')}),
+  definition_id TEXT NOT NULL CHECK (${idCheck('definition_id')}),
+  definition_version INTEGER NOT NULL CHECK (${positive('definition_version')}),
+  enhancement INTEGER NOT NULL CHECK (enhancement BETWEEN 0 AND ${MIGRATION_005_ENHANCEMENT_LIMIT}),
+  acquired_at INTEGER NOT NULL CHECK (${unsigned('acquired_at')}),
+  retired INTEGER NOT NULL DEFAULT 0 CHECK (retired IN (0,1))
+) STRICT;
+CREATE INDEX active_item_instances ON item_instances(instance_id) WHERE retired=0;
+CREATE TABLE pet_equipment (
+  pet_id TEXT NOT NULL REFERENCES pets(pet_id),
+  slot TEXT NOT NULL CHECK (slot IN ('WEAPON','ARMOR','ACCESSORY')),
+  instance_id TEXT NOT NULL UNIQUE REFERENCES item_instances(instance_id),
+  PRIMARY KEY (pet_id,slot)
+) STRICT;
+CREATE TRIGGER validate_new_item_instance BEFORE INSERT ON item_instances
+WHEN NEW.enhancement<>0 OR NEW.retired<>0 OR EXISTS (SELECT 1 FROM item_instances i WHERE i.instance_id=NEW.instance_id)
+  OR (SELECT count(*) FROM item_instances WHERE retired=0)>=${MIGRATION_005_INSTANCE_LIMIT}
+BEGIN SELECT RAISE(ABORT, 'new item instance requires unique +0 active identity within capacity'); END;
+CREATE TRIGGER freeze_item_instance_identity BEFORE UPDATE ON item_instances
+WHEN OLD.instance_id IS NOT NEW.instance_id OR OLD.definition_id IS NOT NEW.definition_id
+  OR OLD.definition_version IS NOT NEW.definition_version OR OLD.acquired_at IS NOT NEW.acquired_at OR OLD.retired=1
+  OR (NEW.retired=0 AND NEW.enhancement<>OLD.enhancement+1)
+  OR (NEW.retired=1 AND (NEW.enhancement<>OLD.enhancement OR EXISTS (SELECT 1 FROM pet_equipment e WHERE e.instance_id=OLD.instance_id)))
+BEGIN SELECT RAISE(ABORT, 'item identity is immutable; only one upgrade or unequipped retirement allowed'); END;
+CREATE TRIGGER preserve_retired_item_identity BEFORE DELETE ON item_instances
+BEGIN SELECT RAISE(ABORT, 'item identity cannot be deleted'); END;
+CREATE TRIGGER validate_equipment_binding BEFORE INSERT ON pet_equipment
+WHEN NOT EXISTS (SELECT 1 FROM item_instances i WHERE i.instance_id=NEW.instance_id AND i.retired=0)
+  OR EXISTS (SELECT 1 FROM pet_equipment e WHERE (e.pet_id=NEW.pet_id AND e.slot=NEW.slot) OR e.instance_id=NEW.instance_id)
+BEGIN SELECT RAISE(ABORT, 'equipment binding requires free slot and active unequipped instance'); END;
+CREATE TRIGGER freeze_equipment_binding BEFORE UPDATE ON pet_equipment
+BEGIN SELECT RAISE(ABORT, 'equipment binding must be explicitly unequipped'); END;
+CREATE TABLE commerce_operations (
+  command_id TEXT PRIMARY KEY NOT NULL CHECK (${idCheck('command_id')}),
+  operation_type TEXT NOT NULL CHECK (operation_type IN (${migration005CommerceTypes})),
+  occurred_at INTEGER NOT NULL CHECK (${unsigned('occurred_at')}),
+  catalog_version INTEGER NOT NULL CHECK (${positive('catalog_version')}),
+  offer_id TEXT CHECK (${idCheck('offer_id')}),
+  item_id TEXT CHECK (${idCheck('item_id')}),
+  quantity INTEGER CHECK (quantity BETWEEN 1 AND ${MIGRATION_005_PURCHASE_LIMIT}),
+  coin_cost INTEGER CHECK (${unsigned('coin_cost')}),
+  output_kind TEXT CHECK (output_kind IN ('STACK','EQUIPMENT')),
+  pet_id TEXT REFERENCES pets(pet_id),
+  slot TEXT CHECK (slot IN ('WEAPON','ARMOR','ACCESSORY')),
+  instance_id TEXT REFERENCES item_instances(instance_id),
+  previous_instance_id TEXT REFERENCES item_instances(instance_id),
+  from_enhancement INTEGER CHECK (from_enhancement BETWEEN 0 AND ${MIGRATION_005_ENHANCEMENT_LIMIT}),
+  to_enhancement INTEGER CHECK (to_enhancement BETWEEN 0 AND ${MIGRATION_005_ENHANCEMENT_LIMIT}),
+  FOREIGN KEY (command_id) REFERENCES commands(command_id) DEFERRABLE INITIALLY DEFERRED,
+  CHECK (CASE operation_type
+    WHEN 'SHOP_PURCHASE' THEN offer_id IS NOT NULL AND item_id IS NOT NULL AND quantity IS NOT NULL AND coin_cost IS NOT NULL AND output_kind IS NOT NULL
+      AND pet_id IS NULL AND slot IS NULL AND instance_id IS NULL AND previous_instance_id IS NULL AND from_enhancement IS NULL AND to_enhancement IS NULL
+    WHEN 'EQUIPMENT_EQUIP' THEN offer_id IS NULL AND item_id IS NULL AND quantity IS NULL AND coin_cost IS NULL AND output_kind IS NULL
+      AND pet_id IS NOT NULL AND slot IS NOT NULL AND instance_id IS NOT NULL AND (previous_instance_id IS NULL OR previous_instance_id<>instance_id)
+      AND from_enhancement IS NULL AND to_enhancement IS NULL
+    WHEN 'EQUIPMENT_UNEQUIP' THEN offer_id IS NULL AND item_id IS NULL AND quantity IS NULL AND coin_cost IS NULL AND output_kind IS NULL
+      AND pet_id IS NOT NULL AND slot IS NOT NULL AND instance_id IS NOT NULL AND previous_instance_id IS NULL AND from_enhancement IS NULL AND to_enhancement IS NULL
+    WHEN 'EQUIPMENT_UPGRADE' THEN offer_id IS NULL AND item_id IS NULL AND quantity IS NULL AND coin_cost IS NOT NULL AND output_kind IS NULL
+      AND pet_id IS NULL AND slot IS NULL AND instance_id IS NOT NULL AND previous_instance_id IS NULL AND from_enhancement IS NOT NULL
+      AND to_enhancement IS NOT NULL AND to_enhancement=from_enhancement+1
+    WHEN 'EQUIPMENT_SALVAGE' THEN offer_id IS NULL AND item_id IS NULL AND quantity IS NULL AND coin_cost IS NULL AND output_kind IS NULL
+      AND pet_id IS NULL AND slot IS NULL AND instance_id IS NOT NULL AND previous_instance_id IS NULL AND from_enhancement IS NOT NULL AND to_enhancement IS NULL
+    WHEN 'ITEM_USE' THEN offer_id IS NULL AND item_id IS NOT NULL AND quantity IS NULL AND coin_cost IS NULL AND output_kind IS NULL
+      AND pet_id IS NOT NULL AND slot IS NULL AND instance_id IS NULL AND previous_instance_id IS NULL AND from_enhancement IS NULL AND to_enhancement IS NULL
+    ELSE 0 END)
+) STRICT;
+CREATE TABLE commerce_operation_materials (
+  command_id TEXT NOT NULL REFERENCES commerce_operations(command_id),
+  item_id TEXT NOT NULL CHECK (${idCheck('item_id')}),
+  quantity INTEGER NOT NULL CHECK (${positive('quantity')}),
+  PRIMARY KEY (command_id,item_id)
+) STRICT;
+CREATE TABLE commerce_operation_instances (
+  command_id TEXT NOT NULL REFERENCES commerce_operations(command_id),
+  instance_id TEXT NOT NULL UNIQUE REFERENCES item_instances(instance_id),
+  PRIMARY KEY (command_id,instance_id)
+) STRICT;
+CREATE TRIGGER validate_new_commerce_operation BEFORE INSERT ON commerce_operations
+WHEN EXISTS (SELECT 1 FROM commerce_operations o WHERE o.command_id=NEW.command_id)
+  OR EXISTS (SELECT 1 FROM commands c WHERE c.command_id=NEW.command_id)
+BEGIN SELECT RAISE(ABORT, 'commerce operation requires new unique command without receipt'); END;
+CREATE TRIGGER freeze_commerce_operation BEFORE UPDATE ON commerce_operations
+BEGIN SELECT RAISE(ABORT, 'commerce operation is immutable'); END;
+CREATE TRIGGER preserve_commerce_operation BEFORE DELETE ON commerce_operations
+BEGIN SELECT RAISE(ABORT, 'commerce operation is immutable'); END;
+CREATE TRIGGER validate_commerce_material BEFORE INSERT ON commerce_operation_materials
+WHEN NOT EXISTS (SELECT 1 FROM commerce_operations o WHERE o.command_id=NEW.command_id AND o.operation_type IN ('EQUIPMENT_UPGRADE','EQUIPMENT_SALVAGE'))
+  OR EXISTS (SELECT 1 FROM commands c WHERE c.command_id=NEW.command_id)
+  OR EXISTS (SELECT 1 FROM commerce_operation_materials m WHERE m.command_id=NEW.command_id AND m.item_id=NEW.item_id)
+  OR (SELECT count(*) FROM commerce_operation_materials m WHERE m.command_id=NEW.command_id)>=${MIGRATION_005_MATERIAL_LIMIT}
+BEGIN SELECT RAISE(ABORT, 'invalid or immutable commerce material evidence'); END;
+CREATE TRIGGER freeze_commerce_material BEFORE UPDATE ON commerce_operation_materials
+BEGIN SELECT RAISE(ABORT, 'commerce material is immutable'); END;
+CREATE TRIGGER preserve_commerce_material BEFORE DELETE ON commerce_operation_materials
+BEGIN SELECT RAISE(ABORT, 'commerce material is immutable'); END;
+CREATE TRIGGER validate_commerce_purchase_instance BEFORE INSERT ON commerce_operation_instances
+WHEN NOT EXISTS (SELECT 1 FROM commerce_operations o JOIN item_instances i ON i.instance_id=NEW.instance_id
+  WHERE o.command_id=NEW.command_id AND o.operation_type='SHOP_PURCHASE' AND o.output_kind='EQUIPMENT'
+    AND i.retired=0 AND i.definition_id=o.item_id AND i.definition_version=o.catalog_version
+    AND i.enhancement=0 AND i.acquired_at=o.occurred_at
+    AND (SELECT count(*) FROM commerce_operation_instances p WHERE p.command_id=o.command_id)<o.quantity)
+  OR EXISTS (SELECT 1 FROM commands c WHERE c.command_id=NEW.command_id)
+  OR EXISTS (SELECT 1 FROM commerce_operation_instances p WHERE p.instance_id=NEW.instance_id)
+BEGIN SELECT RAISE(ABORT, 'invalid or immutable commerce instance evidence'); END;
+CREATE TRIGGER freeze_commerce_purchase_instance BEFORE UPDATE ON commerce_operation_instances
+BEGIN SELECT RAISE(ABORT, 'commerce instance evidence is immutable'); END;
+CREATE TRIGGER preserve_commerce_purchase_instance BEFORE DELETE ON commerce_operation_instances
+BEGIN SELECT RAISE(ABORT, 'commerce instance evidence is immutable'); END;
+CREATE TRIGGER validate_successful_commerce_receipt BEFORE INSERT ON commands
+WHEN (EXISTS (SELECT 1 FROM commerce_operations o WHERE o.command_id=NEW.command_id)
+  OR (json_extract(NEW.fingerprint,'$.type') IN (${migration005CommerceTypes}) AND json_type(NEW.outcome_json,'$.ok')='true'))
+  AND (EXISTS (SELECT 1 FROM commands c WHERE c.command_id=NEW.command_id)
+    OR NOT EXISTS (SELECT 1 FROM commerce_operations o WHERE o.command_id=NEW.command_id
+      AND ${migration005ReceiptMatches('NEW','o')} AND (${migration005EffectsMatch('o')})))
+BEGIN SELECT RAISE(ABORT, 'commerce command requires exact immutable successful operation and receipt'); END;
+CREATE TRIGGER freeze_commerce_receipt BEFORE UPDATE ON commands
+WHEN EXISTS (SELECT 1 FROM commerce_operations o WHERE o.command_id=OLD.command_id)
+  OR (json_extract(NEW.fingerprint,'$.type') IN (${migration005CommerceTypes}) AND json_type(NEW.outcome_json,'$.ok')='true')
+BEGIN SELECT RAISE(ABORT, 'commerce receipt is immutable'); END;
+CREATE TRIGGER preserve_commerce_receipt BEFORE DELETE ON commands
+WHEN EXISTS (SELECT 1 FROM commerce_operations o WHERE o.command_id=OLD.command_id)
+BEGIN SELECT RAISE(ABORT, 'commerce receipt is immutable'); END;
+`;
+
 const MIGRATIONS = Object.freeze([
   { version: 1, sql: MIGRATION_001 },
   { version: 2, sql: MIGRATION_002 },
   { version: 3, sql: MIGRATION_003 },
   { version: 4, sql: MIGRATION_004 },
+  { version: 5, sql: MIGRATION_005 },
 ]);
 
 /** FNV-1a is a migration-change detector, not a security signature. */
@@ -718,6 +901,124 @@ function homeScheduleRegresses(previous: HomeScheduleRecord, next: HomeScheduleR
   return next.lastSimAt < previous.lastSimAt || next.interactionDay < previous.interactionDay
     || (next.interactionDay === previous.interactionDay && next.interactionCount < previous.interactionCount)
     || (previous.lastInteractionAt !== null && (next.lastInteractionAt === null || next.lastInteractionAt < previous.lastInteractionAt));
+}
+
+function equipmentSlot(value: unknown): EquipmentSlot {
+  return enumeration(value, 'equipment slot', ['WEAPON', 'ARMOR', 'ACCESSORY']);
+}
+
+function validateItemInstance(value: unknown): ItemInstanceRecord {
+  const item = closed(value, 'item instance', ['instanceId', 'definitionId', 'definitionVersion', 'enhancement', 'acquiredAt']);
+  return { instanceId: id(item.instanceId), definitionId: id(item.definitionId), definitionVersion: integer(item.definitionVersion, 'item definition version', 1),
+    enhancement: integer(item.enhancement, 'equipment enhancement', 0, MIGRATION_005_ENHANCEMENT_LIMIT),
+    acquiredAt: integer(item.acquiredAt, 'item acquisition time') };
+}
+
+function itemInstanceFromRow(value: unknown): ItemInstanceRecord {
+  const row = object(value, 'item instance row');
+  if (integer(row.retired, 'item retirement flag', 0, 1) !== 0) throw new Error('Retired item is not an active instance');
+  return validateItemInstance({ instanceId: row.instance_id, definitionId: row.definition_id,
+    definitionVersion: integer(row.definition_version, 'item definition version', 1), enhancement: integer(row.enhancement, 'equipment enhancement'),
+    acquiredAt: integer(row.acquired_at, 'item acquisition time') });
+}
+
+function validateEquipmentBinding(value: unknown): PetEquipmentRecord {
+  const binding = closed(value, 'equipment binding', ['petId', 'slot', 'instanceId']);
+  return { petId: id(binding.petId), slot: equipmentSlot(binding.slot), instanceId: id(binding.instanceId) };
+}
+
+function equipmentBindingFromRow(value: unknown): PetEquipmentRecord {
+  const row = object(value, 'equipment binding row');
+  return validateEquipmentBinding({ petId: row.pet_id, slot: row.slot, instanceId: row.instance_id });
+}
+
+const commerceTypes = ['SHOP_PURCHASE','EQUIPMENT_EQUIP','EQUIPMENT_UNEQUIP','EQUIPMENT_UPGRADE','EQUIPMENT_SALVAGE','ITEM_USE'] as const;
+const commerceCommonFields = ['commandId','occurredAt','catalogVersion','type'] as const;
+function validateCommerceMaterials(value: unknown): CommerceMaterialAmount[] {
+  const materials = array(value, 'commerce materials', MIGRATION_005_MATERIAL_LIMIT).map(raw => {
+    const entry = closed(raw, 'commerce material', ['itemId','quantity']);
+    return { itemId: id(entry.itemId), quantity: integer(entry.quantity, 'commerce material quantity', 1) };
+  }).sort((a,b) => a.itemId < b.itemId ? -1 : a.itemId > b.itemId ? 1 : 0);
+  if (materials.length === 0 || new Set(materials.map(entry => entry.itemId)).size !== materials.length) throw new Error('Commerce materials must be nonempty and unique');
+  return materials;
+}
+
+function validateCommerceOperation(value: unknown): CommerceOperationRecord {
+  const raw = object(value, 'commerce operation');
+  const common = { commandId: id(raw.commandId), occurredAt: integer(raw.occurredAt, 'commerce operation time'),
+    catalogVersion: integer(raw.catalogVersion, 'commerce catalog version', 1) };
+  const type = enumeration(raw.type, 'commerce operation type', commerceTypes);
+  switch (type) {
+    case 'SHOP_PURCHASE': {
+      closed(raw,'shop operation',[...commerceCommonFields,'offerId','itemId','quantity','coinCost','outputKind','instanceIds']);
+      const quantity = integer(raw.quantity,'purchase quantity',1,MIGRATION_005_PURCHASE_LIMIT);
+      const outputKind = enumeration(raw.outputKind,'purchase output kind',['STACK','EQUIPMENT']);
+      const instanceIds = array(raw.instanceIds,'purchase instance IDs',MIGRATION_005_PURCHASE_LIMIT).map(id).sort();
+      if (new Set(instanceIds).size !== instanceIds.length || instanceIds.length !== (outputKind === 'EQUIPMENT' ? quantity : 0)) {
+        throw new Error('Purchased equipment IDs contradict quantity or output kind');
+      }
+      return { ...common,type,offerId:id(raw.offerId),itemId:id(raw.itemId),quantity,coinCost:integer(raw.coinCost,'purchase coin cost'),outputKind,instanceIds };
+    }
+    case 'EQUIPMENT_EQUIP': {
+      closed(raw,'equip operation',[...commerceCommonFields,'petId','slot','instanceId','previousInstanceId']);
+      const instanceId = id(raw.instanceId), previousInstanceId = raw.previousInstanceId === null ? null : id(raw.previousInstanceId);
+      if (previousInstanceId === instanceId) throw new Error('Equip operation cannot replace itself');
+      return { ...common,type,petId:id(raw.petId),slot:equipmentSlot(raw.slot),instanceId,previousInstanceId };
+    }
+    case 'EQUIPMENT_UNEQUIP':
+      closed(raw,'unequip operation',[...commerceCommonFields,'petId','slot','instanceId']);
+      return { ...common,type,petId:id(raw.petId),slot:equipmentSlot(raw.slot),instanceId:id(raw.instanceId) };
+    case 'EQUIPMENT_UPGRADE': {
+      closed(raw,'upgrade operation',[...commerceCommonFields,'instanceId','fromEnhancement','toEnhancement','coinCost','materials']);
+      const fromEnhancement = integer(raw.fromEnhancement,'upgrade previous enhancement',0,MIGRATION_005_ENHANCEMENT_LIMIT-1);
+      const toEnhancement = integer(raw.toEnhancement,'upgrade next enhancement',1,MIGRATION_005_ENHANCEMENT_LIMIT);
+      if (toEnhancement !== fromEnhancement+1) throw new Error('Upgrade operation requires exactly one enhancement');
+      return { ...common,type,instanceId:id(raw.instanceId),fromEnhancement,toEnhancement,coinCost:integer(raw.coinCost,'upgrade coin cost'),
+        materials:validateCommerceMaterials(raw.materials) };
+    }
+    case 'EQUIPMENT_SALVAGE':
+      closed(raw,'salvage operation',[...commerceCommonFields,'instanceId','enhancement','materials']);
+      return { ...common,type,instanceId:id(raw.instanceId),enhancement:integer(raw.enhancement,'salvaged enhancement',0,MIGRATION_005_ENHANCEMENT_LIMIT),
+        materials:validateCommerceMaterials(raw.materials) };
+    case 'ITEM_USE':
+      closed(raw,'item use operation',[...commerceCommonFields,'petId','itemId']);
+      return { ...common,type,petId:id(raw.petId),itemId:id(raw.itemId) };
+  }
+}
+
+function commerceOperationFromRow(value: unknown, materials: CommerceMaterialAmount[], instanceIds: string[]): CommerceOperationRecord {
+  const row = object(value, 'commerce operation row');
+  const type = enumeration(row.operation_type,'commerce operation type',commerceTypes);
+  const common = { commandId: row.command_id, occurredAt: integer(row.occurred_at,'commerce operation time'),
+    catalogVersion: integer(row.catalog_version,'commerce catalog version',1), type };
+  const optionalColumns = ['offer_id','item_id','quantity','coin_cost','output_kind','pet_id','slot','instance_id','previous_instance_id','from_enhancement','to_enhancement'];
+  const requireColumns = (used: readonly string[], allowMaterials = false, allowInstances = false): void => {
+    if (optionalColumns.some(key => !used.includes(key) && row[key] !== null) || (!allowMaterials && materials.length !== 0) || (!allowInstances && instanceIds.length !== 0)) {
+      throw new Error('Commerce row has contradictory extra evidence');
+    }
+  };
+  switch (type) {
+    case 'SHOP_PURCHASE':
+      requireColumns(['offer_id','item_id','quantity','coin_cost','output_kind'],false,true);
+      return validateCommerceOperation({ ...common,offerId:row.offer_id,itemId:row.item_id,quantity:integer(row.quantity,'purchase quantity'),
+        coinCost:integer(row.coin_cost,'purchase coin cost'),outputKind:row.output_kind,instanceIds });
+    case 'EQUIPMENT_EQUIP':
+      requireColumns(['pet_id','slot','instance_id','previous_instance_id']);
+      return validateCommerceOperation({ ...common,petId:row.pet_id,slot:row.slot,instanceId:row.instance_id,previousInstanceId:row.previous_instance_id });
+    case 'EQUIPMENT_UNEQUIP':
+      requireColumns(['pet_id','slot','instance_id']);
+      return validateCommerceOperation({ ...common,petId:row.pet_id,slot:row.slot,instanceId:row.instance_id });
+    case 'EQUIPMENT_UPGRADE':
+      requireColumns(['instance_id','from_enhancement','to_enhancement','coin_cost'],true);
+      return validateCommerceOperation({ ...common,instanceId:row.instance_id,fromEnhancement:integer(row.from_enhancement,'previous enhancement'),
+        toEnhancement:integer(row.to_enhancement,'next enhancement'),coinCost:integer(row.coin_cost,'upgrade coin cost'),materials });
+    case 'EQUIPMENT_SALVAGE':
+      requireColumns(['instance_id','from_enhancement'],true);
+      return validateCommerceOperation({ ...common,instanceId:row.instance_id,enhancement:integer(row.from_enhancement,'salvaged enhancement'),materials });
+    case 'ITEM_USE':
+      requireColumns(['pet_id','item_id']);
+      return validateCommerceOperation({ ...common,petId:row.pet_id,itemId:row.item_id });
+  }
 }
 
 const PET_SELECT = `SELECT p.*, s.presence, s.activity, s.mood, s.health_status, s.visibility,
@@ -1105,6 +1406,118 @@ class SQLiteTransaction implements AppTransaction {
     }
   }
 
+  listItemInstances(): ItemInstanceRecord[] {
+    const instances = this.db.prepare('SELECT * FROM item_instances WHERE retired=0 ORDER BY instance_id').all().map(itemInstanceFromRow);
+    if (instances.length > MIGRATION_005_INSTANCE_LIMIT) throw new Error('Active equipment capacity is corrupt');
+    return instances;
+  }
+
+  getItemInstance(instanceId: string): ItemInstanceRecord | null {
+    const value = this.db.prepare('SELECT * FROM item_instances WHERE instance_id=? AND retired=0').get(id(instanceId));
+    return value === undefined || value === null ? null : itemInstanceFromRow(value);
+  }
+
+  insertItemInstance(record: ItemInstanceRecord): void {
+    const db = this.db, item = validateItemInstance(record);
+    if (item.enhancement !== 0) throw new Error('New item instance must start at +0');
+    db.prepare('INSERT INTO item_instances (instance_id,definition_id,definition_version,enhancement,acquired_at) VALUES (?, ?, ?, ?, ?)')
+      .run(item.instanceId,item.definitionId,item.definitionVersion,item.enhancement,item.acquiredAt);
+  }
+
+  upgradeItemInstance(instanceId: string, expectedEnhancement: number): ItemInstanceRecord {
+    const db = this.db, item = this.getItemInstance(instanceId);
+    const expected = integer(expectedEnhancement,'expected enhancement',0,MIGRATION_005_ENHANCEMENT_LIMIT-1);
+    if (item === null || item.enhancement !== expected) throw new Error('Equipment upgrade requires active instance at expected enhancement');
+    const result = db.prepare('UPDATE item_instances SET enhancement=enhancement+1 WHERE instance_id=? AND retired=0 AND enhancement=?')
+      .run(item.instanceId,expected);
+    if (integer(result.changes,'equipment upgrade change count') !== 1) throw new Error('Equipment upgrade did not commit');
+    return { ...item,enhancement:expected+1 };
+  }
+
+  deleteItemInstance(instanceId: string): void {
+    const db = this.db, item = this.getItemInstance(instanceId);
+    if (item === null) throw new Error('Equipment instance does not exist');
+    if (this.getInstanceEquipment(instanceId) !== null) throw new Error('Equipped instance must be unequipped before retirement');
+    const result = db.prepare('UPDATE item_instances SET retired=1 WHERE instance_id=? AND retired=0').run(item.instanceId);
+    if (integer(result.changes,'equipment retirement change count') !== 1) throw new Error('Equipment retirement did not commit');
+  }
+
+  private checkedEquipmentBinding(value: unknown): PetEquipmentRecord {
+    const binding = equipmentBindingFromRow(value);
+    if (this.getItemInstance(binding.instanceId) === null) throw new Error('Equipment binding references retired or missing instance');
+    return binding;
+  }
+
+  listPetEquipment(petId?: string): PetEquipmentRecord[] {
+    const rows = petId === undefined ? this.db.prepare('SELECT * FROM pet_equipment ORDER BY pet_id,slot').all()
+      : this.db.prepare('SELECT * FROM pet_equipment WHERE pet_id=? ORDER BY slot').all(id(petId));
+    return rows.map(value => this.checkedEquipmentBinding(value));
+  }
+
+  getPetEquipment(petId: string, slot: EquipmentSlot): PetEquipmentRecord | null {
+    const value = this.db.prepare('SELECT * FROM pet_equipment WHERE pet_id=? AND slot=?').get(id(petId),equipmentSlot(slot));
+    return value === undefined || value === null ? null : this.checkedEquipmentBinding(value);
+  }
+
+  getInstanceEquipment(instanceId: string): PetEquipmentRecord | null {
+    const value = this.db.prepare('SELECT * FROM pet_equipment WHERE instance_id=?').get(id(instanceId));
+    return value === undefined || value === null ? null : this.checkedEquipmentBinding(value);
+  }
+
+  equipItem(record: PetEquipmentRecord): void {
+    const db = this.db, binding = validateEquipmentBinding(record);
+    if (this.getItemInstance(binding.instanceId) === null || this.getPetEquipment(binding.petId,binding.slot) !== null
+      || this.getInstanceEquipment(binding.instanceId) !== null) throw new Error('Equipment binding requires free slot and active unequipped instance');
+    db.prepare('INSERT INTO pet_equipment (pet_id,slot,instance_id) VALUES (?, ?, ?)').run(binding.petId,binding.slot,binding.instanceId);
+  }
+
+  unequipItem(petId: string, slot: EquipmentSlot, expectedInstanceId: string): void {
+    const db = this.db, result = db.prepare('DELETE FROM pet_equipment WHERE pet_id=? AND slot=? AND instance_id=?')
+      .run(id(petId),equipmentSlot(slot),id(expectedInstanceId));
+    if (integer(result.changes,'equipment unequip change count') !== 1) throw new Error('Equipment binding does not match expected instance');
+  }
+
+  getCommerceOperation(commandId: string): CommerceOperationRecord | null {
+    const db = this.db, key = id(commandId), row = db.prepare('SELECT * FROM commerce_operations WHERE command_id=?').get(key);
+    if (row === undefined || row === null) return null;
+    const materials = db.prepare('SELECT item_id,quantity FROM commerce_operation_materials WHERE command_id=? ORDER BY item_id').all(key).map(raw => {
+      const value = object(raw,'commerce material row'); return { itemId:id(value.item_id),quantity:integer(value.quantity,'commerce material quantity',1) };
+    });
+    const instanceIds = db.prepare('SELECT instance_id FROM commerce_operation_instances WHERE command_id=? ORDER BY instance_id').all(key)
+      .map(raw => id(object(raw,'commerce instance row').instance_id));
+    return commerceOperationFromRow(row,materials,instanceIds);
+  }
+
+  insertCommerceOperation(record: CommerceOperationRecord): void {
+    const db = this.db, operation = validateCommerceOperation(record);
+    const values: { offerId:string|null;itemId:string|null;quantity:number|null;coinCost:number|null;outputKind:string|null;
+      petId:string|null;slot:string|null;instanceId:string|null;previousInstanceId:string|null;fromEnhancement:number|null;toEnhancement:number|null } =
+      { offerId:null,itemId:null,quantity:null,coinCost:null,outputKind:null,petId:null,slot:null,instanceId:null,previousInstanceId:null,fromEnhancement:null,toEnhancement:null };
+    let materials: readonly CommerceMaterialAmount[] = [], instanceIds: readonly string[] = [];
+    switch (operation.type) {
+      case 'SHOP_PURCHASE':
+        Object.assign(values,{offerId:operation.offerId,itemId:operation.itemId,quantity:operation.quantity,coinCost:operation.coinCost,outputKind:operation.outputKind});
+        instanceIds = operation.instanceIds; break;
+      case 'EQUIPMENT_EQUIP':
+        Object.assign(values,{petId:operation.petId,slot:operation.slot,instanceId:operation.instanceId,previousInstanceId:operation.previousInstanceId}); break;
+      case 'EQUIPMENT_UNEQUIP':
+        Object.assign(values,{petId:operation.petId,slot:operation.slot,instanceId:operation.instanceId}); break;
+      case 'EQUIPMENT_UPGRADE':
+        Object.assign(values,{instanceId:operation.instanceId,fromEnhancement:operation.fromEnhancement,toEnhancement:operation.toEnhancement,coinCost:operation.coinCost});
+        materials = operation.materials; break;
+      case 'EQUIPMENT_SALVAGE':
+        Object.assign(values,{instanceId:operation.instanceId,fromEnhancement:operation.enhancement}); materials = operation.materials; break;
+      case 'ITEM_USE': Object.assign(values,{petId:operation.petId,itemId:operation.itemId}); break;
+    }
+    db.prepare(`INSERT INTO commerce_operations (command_id,operation_type,occurred_at,catalog_version,offer_id,item_id,quantity,coin_cost,output_kind,
+      pet_id,slot,instance_id,previous_instance_id,from_enhancement,to_enhancement) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(operation.commandId,operation.type,operation.occurredAt,operation.catalogVersion,values.offerId,values.itemId,values.quantity,values.coinCost,
+        values.outputKind,values.petId,values.slot,values.instanceId,values.previousInstanceId,values.fromEnhancement,values.toEnhancement);
+    for (const material of materials) db.prepare('INSERT INTO commerce_operation_materials VALUES (?, ?, ?)')
+      .run(operation.commandId,material.itemId,material.quantity);
+    for (const instanceId of instanceIds) db.prepare('INSERT INTO commerce_operation_instances VALUES (?, ?)').run(operation.commandId,instanceId);
+  }
+
   private tripCgPinSchema(tripId: string): number {
     const row = object(this.db.prepare('SELECT cg_pin_schema FROM trips WHERE trip_id=?').get(id(tripId)), 'trip CG pin schema row');
     return integer(row.cg_pin_schema, 'trip CG pin schema', 1, 2);
@@ -1366,6 +1779,11 @@ function migrate(db: SqliteConnection, persistent: boolean, beforeMigration?: (f
       } : null;
       const oldPetCount = migration.version === 3 ? rowCount(db, 'SELECT count(*) AS count FROM pets') : null;
       const oldHomePetCount = migration.version === 4 ? rowCount(db, 'SELECT count(*) AS count FROM pets') : null;
+      const oldCommerceCounts = migration.version === 5 ? {
+        stacks: rowCount(db, 'SELECT count(*) AS count FROM inventory'),
+        rewards: rowCount(db, 'SELECT count(*) AS count FROM reward_ledger'),
+        receipts: rowCount(db, 'SELECT count(*) AS count FROM commands'),
+      } : null;
       db.exec(migration.sql);
       if (oldCounts !== null && (oldCounts.trips !== rowCount(db, 'SELECT count(*) AS count FROM trips')
         || oldCounts.unlocks !== rowCount(db, 'SELECT count(*) AS count FROM cg_unlocks')
@@ -1380,6 +1798,13 @@ function migrate(db: SqliteConnection, persistent: boolean, beforeMigration?: (f
       if (oldHomePetCount !== null && (oldHomePetCount !== rowCount(db, 'SELECT count(*) AS count FROM pets')
         || rowCount(db, 'SELECT count(*) AS count FROM pet_home_schedules') !== 0)) {
         throw new Error('Home schedule migration changed legacy pets or invented simulation clocks');
+      }
+      if (oldCommerceCounts !== null && (oldCommerceCounts.stacks !== rowCount(db,'SELECT count(*) AS count FROM inventory')
+        || oldCommerceCounts.rewards !== rowCount(db,'SELECT count(*) AS count FROM reward_ledger')
+        || oldCommerceCounts.receipts !== rowCount(db,'SELECT count(*) AS count FROM commands')
+        || ['item_instances','pet_equipment','commerce_operations','commerce_operation_materials','commerce_operation_instances']
+          .some(table => rowCount(db,`SELECT count(*) AS count FROM ${table}`) !== 0))) {
+        throw new Error('Commerce migration changed old stacks or reward history or invented instances and operations');
       }
       db.prepare('INSERT INTO schema_migrations (version, checksum, applied_at) VALUES (?, ?, ?)')
         .run(migration.version, migrationChecksum(migration.sql), Date.now());

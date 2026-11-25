@@ -1,6 +1,8 @@
 import { z } from 'zod';
 import { cgMarkViewedPayloadSchema, cgSetFavoritePayloadSchema, galleryPageSchema, galleryQuerySchema } from '#gallery';
 import { characterCatalogPageSchema, petAcquirePayloadSchema, petRenamePayloadSchema } from '#characters';
+import { equipmentEquipPayloadSchema, equipmentUnequipPayloadSchema, equipmentUpgradePayloadSchema,
+  equipmentSalvagePayloadSchema, inventoryPageSchema, inventoryQuerySchema, itemUsePayloadSchema, shopPurchasePayloadSchema } from '#inventory';
 
 /** Independent from the application, database and game-rule versions. */
 export const CONTRACT_SCHEMA_VERSION = 1 as const;
@@ -99,6 +101,7 @@ const commandFields = {
   issuedAt: timestampSchema,
   expectedRevision: revisionSchema.optional(),
 };
+const commerceCommandFields = { ...commandFields, expectedRevision: revisionSchema };
 
 export const interactionSchema = z.enum(['PET', 'REST', 'WAKE']);
 export const modeFlagSchema = z.enum(['doNotDisturb', 'pausedRender']);
@@ -109,6 +112,12 @@ export type ModeFlag = z.infer<typeof modeFlagSchema>;
 export const domainCommandSchema = z.discriminatedUnion('type', [
   z.strictObject({ ...commandFields, type: z.literal('PET_ACQUIRE'), payload: petAcquirePayloadSchema }),
   z.strictObject({ ...commandFields, type: z.literal('PET_RENAME'), payload: petRenamePayloadSchema }),
+  z.strictObject({ ...commerceCommandFields, type: z.literal('SHOP_PURCHASE'), payload: shopPurchasePayloadSchema }),
+  z.strictObject({ ...commerceCommandFields, type: z.literal('EQUIPMENT_EQUIP'), payload: equipmentEquipPayloadSchema }),
+  z.strictObject({ ...commerceCommandFields, type: z.literal('EQUIPMENT_UNEQUIP'), payload: equipmentUnequipPayloadSchema }),
+  z.strictObject({ ...commerceCommandFields, type: z.literal('EQUIPMENT_UPGRADE'), payload: equipmentUpgradePayloadSchema }),
+  z.strictObject({ ...commerceCommandFields, type: z.literal('EQUIPMENT_SALVAGE'), payload: equipmentSalvagePayloadSchema }),
+  z.strictObject({ ...commerceCommandFields, type: z.literal('ITEM_USE'), payload: itemUsePayloadSchema }),
   z.strictObject({
     ...commandFields,
     type: z.literal('PET_SELECT'),
@@ -211,6 +220,7 @@ export const ipcRequestSchema = z.discriminatedUnion('method', [
   }),
   z.strictObject({ ...requestFields, method: z.literal('gallery/list'), payload: galleryQuerySchema }),
   z.strictObject({ ...requestFields, method: z.literal('characters/list'), payload: z.strictObject({}) }),
+  z.strictObject({ ...requestFields, method: z.literal('inventory/list'), payload: inventoryQuerySchema }),
 ]);
 export type IpcRequest = z.infer<typeof ipcRequestSchema>;
 
@@ -244,6 +254,19 @@ const charactersSuccessSchema = snapshotSuccessSchema.extend({ characters: chara
     }
   });
 
+const inventorySuccessSchema = snapshotSuccessSchema.extend({ inventory: inventoryPageSchema })
+  .superRefine(({ inventory, snapshot }, ctx) => {
+    if (inventory.revision !== snapshot.revision || inventory.walletCoins !== snapshot.walletCoins) {
+      ctx.addIssue({ code: 'custom', path: ['inventory'], message: 'Inventory and snapshot must share an authority revision and wallet' });
+    }
+    const pets = new Map(snapshot.pets.map((pet) => [pet.petId, pet]));
+    if (inventory.pets.length !== pets.size || inventory.pets.some((entry) => {
+      const pet = pets.get(entry.petId);
+      return !pet || pet.characterId !== entry.characterId || pet.nickname !== entry.nickname
+        || entry.progression.cumulativeXp !== pet.xp || entry.progression.level !== pet.level;
+    })) ctx.addIssue({ code: 'custom', path: ['inventory', 'pets'], message: 'Inventory pets must match the authority snapshot' });
+  });
+
 // Old snapshot and persistent command result shape stays exactly as before.
 // The gallery query has a distinct closed success shape plus the same snapshot.
 export const snapshotIpcResultSchema = z.union([snapshotSuccessSchema, errorResultSchema]);
@@ -252,7 +275,9 @@ export const galleryIpcResultSchema = z.union([gallerySuccessSchema, errorResult
 export type GalleryIpcResult = z.infer<typeof galleryIpcResultSchema>;
 export const charactersIpcResultSchema = z.union([charactersSuccessSchema, errorResultSchema]);
 export type CharactersIpcResult = z.infer<typeof charactersIpcResultSchema>;
-export const ipcResultSchema = z.union([snapshotSuccessSchema, gallerySuccessSchema, charactersSuccessSchema, errorResultSchema]);
+export const inventoryIpcResultSchema = z.union([inventorySuccessSchema, errorResultSchema]);
+export type InventoryIpcResult = z.infer<typeof inventoryIpcResultSchema>;
+export const ipcResultSchema = z.union([snapshotSuccessSchema, gallerySuccessSchema, charactersSuccessSchema, inventorySuccessSchema, errorResultSchema]);
 export type IpcResult = z.infer<typeof ipcResultSchema>;
 
 /** Request correlation includes its method, not merely an equal request ID. */
@@ -260,7 +285,8 @@ export function resultMatchesMethod(method: IpcRequest['method'], result: IpcRes
   if (!result.ok) return true;
   if (method === 'gallery/list') return 'gallery' in result;
   if (method === 'characters/list') return 'characters' in result;
-  return !('gallery' in result) && !('characters' in result);
+  if (method === 'inventory/list') return 'inventory' in result;
+  return !('gallery' in result) && !('characters' in result) && !('inventory' in result);
 }
 
 /** Explicit renderer-facing API, independent of Electron and transport internals. */
@@ -273,3 +299,4 @@ export interface AppBridge {
 export * from '#character-pack';
 export * from '#gallery';
 export * from '#characters';
+export type { InventoryPage } from '#inventory';

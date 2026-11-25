@@ -11,11 +11,14 @@
     "./progression": "./src/progression.ts",
     "./equipment-rules": "./src/equipment-rules.ts",
     "./item-catalog": "./src/item-catalog.ts",
-    "./commerce-rules": "./src/commerce-rules.ts"
+    "./commerce-rules": "./src/commerce-rules.ts",
+    "./route-catalog": "./src/route-catalog.ts",
+    "./trip-preparation": "./src/trip-preparation.ts"
   },
   "imports": {
     "#item-catalog": "./src/item-catalog.ts",
-    "#equipment-rules": "./src/equipment-rules.ts"
+    "#equipment-rules": "./src/equipment-rules.ts",
+    "#route-catalog": "./src/route-catalog.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",

@@ -34,6 +34,19 @@ export interface PetAcquisitionRecord {
   commandId: string | null;
 }
 
+/** Persisted deterministic HOME simulation clock, independent of pet state. */
+export interface HomeScheduleRecord {
+  petId: string;
+  lastSimAt: number;
+  activityDueAt: number | null;
+  energyRemainder: number;
+  healthRemainder: number;
+  moodRemainder: number;
+  interactionDay: number;
+  interactionCount: number;
+  lastInteractionAt: number | null;
+}
+
 export interface PreferencesRecord {
   revision: number;
   logicalTime: number;
@@ -124,6 +137,8 @@ export interface AppTransaction {
   savePet(pet: PetRecord): void;
   getPetAcquisition(petId: string): PetAcquisitionRecord | null;
   insertPetAcquisition(record: PetAcquisitionRecord): void;
+  getHomeSchedule(petId: string): HomeScheduleRecord | null;
+  saveHomeSchedule(record: HomeScheduleRecord): void;
   listTrips(): TripRecord[];
   getTrip(tripId: string): TripRecord | null;
   insertTrip(trip: TripRecord): void;

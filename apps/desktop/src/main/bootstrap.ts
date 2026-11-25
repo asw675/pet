@@ -14,6 +14,8 @@ import type { ServiceChild } from './service-client';
 import { clampBounds, InputLease, rendererUrl } from './window-policy';
 import { desiredPetSurface, isCurrentVisualReport, planPetHandover, samePetSurface } from './pet-handover';
 import type { PetSurfaceIdentity, PetSurfaceInfo, PetSurfacePhase } from './pet-handover';
+import { canContinueWindowWalk, createWindowWalkPlan, walkPositionAt } from './walk-window-policy';
+import type { WindowWalkPlan } from './walk-window-policy';
 
 const CENTER_KEY = 'control-center';
 const PET_SIZE = { width: 260, height: 295 };
@@ -42,6 +44,13 @@ interface WindowRecord {
   readonly inputLease: InputLease;
   responsive: boolean;
   focusOnReady: boolean;
+}
+interface NativeWalkRun {
+  readonly senderId: number;
+  readonly displayId: number;
+  readonly plan: WindowWalkPlan;
+  expected: { x: number; y: number };
+  timer: ReturnType<typeof setInterval>;
 }
 
 function makeTrayIcon() {
@@ -97,6 +106,8 @@ class DesktopHost {
   private locked = false;
   private inputMode: 'auto' | 'through' | 'temporary-interactive' = 'auto';
   private interactionTimer: ReturnType<typeof setTimeout> | undefined;
+  private walkingAttempt: string | undefined;
+  private walkingRun: NativeWalkRun | undefined;
   private readonly rendererDir = join(__dirname, '../renderer');
   private readonly devUrl = app.isPackaged ? undefined : process.env.ELECTRON_RENDERER_URL;
 
@@ -381,6 +392,64 @@ class DesktopHost {
         }
       }
     }
+    this.syncWalkMotion(active);
+  }
+
+  private stopWalkMotion(resetAttempt = false): void {
+    if (this.walkingRun) clearInterval(this.walkingRun.timer);
+    this.walkingRun = undefined;
+    if (resetAttempt) this.walkingAttempt = undefined;
+  }
+
+  private canWalk(record: WindowRecord): boolean {
+    return this.isActivePet(record) && record.window.isVisible() && this.inputMode === 'auto' && !this.snapshot?.pausedRender
+      && this.snapshot?.pets.some((pet) => pet.petId === record.pet?.identity.petId && pet.presence === 'HOME' && pet.activity === 'WALK') === true;
+  }
+
+  /** WALK is an authority-projected visual activity, not a new game command.
+   * Move only the visible own window a short distance; no cursor/OS input. */
+  private syncWalkMotion(record: WindowRecord | undefined): void {
+    // Transient suppression (pause, host hide, input mode) must not re-arm the
+    // same authority-projected WALK. Only leave WALK or change identity.
+    const desired = desiredPetSurface(this.snapshot, this.status, false);
+    const stillWalking = desired && this.snapshot?.pets.some((pet) => pet.petId === desired.petId && pet.activity === 'WALK');
+    const projectedIdentity = stillWalking ? `${desired.generation}:${desired.petId}` : undefined;
+    if (this.walkingAttempt !== projectedIdentity) this.stopWalkMotion(true);
+    if (!record?.pet || !this.canWalk(record)) { this.stopWalkMotion(); return; }
+    const identity = `${record.pet.identity.generation}:${record.pet.identity.petId}`;
+    if (this.walkingAttempt === identity) return;
+    this.stopWalkMotion();
+    this.walkingAttempt = identity;
+    try {
+      const bounds = record.window.getBounds();
+      const display = screen.getDisplayMatching(bounds);
+      const plan = createWindowWalkPlan(bounds, display.workArea, (this.snapshot?.revision ?? 0) % 2 === 0 ? 1 : -1, performance.now());
+      const expected = { x: bounds.x, y: bounds.y };
+      if (!plan || record.inputLease.active || !canContinueWindowWalk(plan, bounds, expected, display.workArea, screen.getCursorScreenPoint())) return;
+      const run: NativeWalkRun = {
+        senderId: record.binding.senderId, displayId: display.id, plan, expected,
+        timer: setInterval(() => this.tickWalkMotion(record, run), 100),
+      };
+      this.walkingRun = run;
+    } catch { this.stopWalkMotion(); }
+  }
+
+  private tickWalkMotion(record: WindowRecord, run: NativeWalkRun): void {
+    if (this.walkingRun !== run) return;
+    try {
+      if (!this.canWalk(record) || record.inputLease.active) { this.stopWalkMotion(); return; }
+      const bounds = record.window.getBounds();
+      const display = screen.getDisplayMatching(bounds);
+      const next = walkPositionAt(run.plan, performance.now());
+      if (display.id !== run.displayId || !canContinueWindowWalk(run.plan, bounds, run.expected, display.workArea, screen.getCursorScreenPoint(), next.position)) {
+        this.stopWalkMotion(); return;
+      }
+      if (next.position.x !== run.expected.x || next.position.y !== run.expected.y) {
+        record.window.setPosition(next.position.x, next.position.y, false);
+        run.expected = next.position;
+      }
+      if (next.done) this.stopWalkMotion();
+    } catch { this.stopWalkMotion(); }
   }
 
   private updatePetInput(record: WindowRecord): boolean {
@@ -513,6 +582,7 @@ class DesktopHost {
 
   private unregister(record: WindowRecord): void {
     record.inputLease.clear();
+    if (this.walkingRun?.senderId === record.binding.senderId) this.stopWalkMotion();
     if (record.pet) this.clearPetTimers(record.pet);
     if (this.windows.get(record.key) === record) this.windows.delete(record.key);
     if (this.senders.get(record.binding.senderId) === record) this.senders.delete(record.binding.senderId);
@@ -613,6 +683,7 @@ class DesktopHost {
     if (this.interactionTimer !== undefined) clearTimeout(this.interactionTimer);
     this.interactionTimer = undefined;
     this.inputMode = mode;
+    if (mode !== 'auto') this.stopWalkMotion();
     if (mode === 'temporary-interactive') {
       this.interactionTimer = setTimeout(() => this.setInputMode('auto'), TEMP_INTERACTION_MS);
     }
@@ -652,6 +723,7 @@ class DesktopHost {
   async stop(): Promise<void> {
     if (this.stopping) return;
     this.stopping = true;
+    this.stopWalkMotion(true);
     for (const timer of this.retryTimers.values()) clearTimeout(timer);
     this.retryTimers.clear();
     if (this.interactionTimer !== undefined) clearTimeout(this.interactionTimer);

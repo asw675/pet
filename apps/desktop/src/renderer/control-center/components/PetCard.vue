@@ -26,7 +26,8 @@ function select() {
 function interact(interaction: Interaction) {
   if (!canAct.value || props.pet.presence !== 'HOME') return;
   void store.dispatch({ type: 'PET_INTERACT', payload: { petId: props.pet.petId, interaction } },
-    interaction === 'PET' ? `已摸摸${props.pet.nickname}的头` : `${props.pet.nickname}开始休息`);
+    interaction === 'PET' ? `已摸摸${props.pet.nickname}的头` : interaction === 'WAKE'
+      ? `${props.pet.nickname}已唤醒` : `${props.pet.nickname}开始休息，体力将逐渐恢复`);
 }
 function toggleVisibility() {
   if (!canAct.value) return;
@@ -64,7 +65,8 @@ function toggleVisibility() {
       </div>
       <div class="pet-actions" aria-label="宠物操作">
         <button class="button button-primary" type="button" :disabled="!canAct || pet.presence !== 'HOME'" @click="interact('PET')"><Icon name="heart" />摸摸头</button>
-        <button class="button button-secondary" type="button" :disabled="!canAct || pet.presence !== 'HOME'" @click="interact('REST')"><Icon name="moon" />休息</button>
+        <button v-if="pet.activity === 'REST' || pet.activity === 'SLEEP'" class="button button-secondary" type="button" :disabled="!canAct || pet.presence !== 'HOME'" @click="interact('WAKE')"><Icon name="moon" />唤醒</button>
+        <button v-else class="button button-secondary" type="button" :disabled="!canAct || pet.presence !== 'HOME'" @click="interact('REST')"><Icon name="moon" />休息</button>
         <button class="button button-secondary" type="button" :disabled="!canAct || primary" @click="select">{{ primary ? '当前主宠' : '设为主宠' }}</button>
         <button class="button button-secondary" type="button" :disabled="!canAct" @click="toggleVisibility">{{ visible ? '隐藏桌宠' : '显示桌宠' }}</button>
       </div>

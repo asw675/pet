@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { describe, expect, it } from 'vitest';
 import { advanceTrip, createTripCheckpoint, createTripSnapshot } from '@pet-desktop/domain';
-import { MIGRATION_001, MIGRATION_002, SQLiteRepository } from '../src/sqlite-repository.ts';
+import { MIGRATION_001, MIGRATION_002, MIGRATION_003, SQLiteRepository } from '../src/sqlite-repository.ts';
 
 const START = 1_700_000_000_000;
 const pet = (petId = 'pet-a') => ({
@@ -15,6 +15,9 @@ const pet = (petId = 'pet-a') => ({
 const preferences = (primaryPetId = 'pet-a') => ({
   revision: 0, logicalTime: START, primaryPetId, doNotDisturb: true, pausedRender: true,
 });
+const DAY_MS=86_400_000;
+const schedule=(petId='pet-a',lastSimAt=START)=>({petId,lastSimAt,activityDueAt:null,
+  energyRemainder:0,healthRemainder:0,moodRemainder:0,interactionDay:Math.floor(lastSimAt/DAY_MS),interactionCount:0,lastInteractionAt:null});
 const route = {
   routeId: 'test-route', contentVersion: 1, returnDurationMs: 10,
   nodes: [
@@ -78,6 +81,7 @@ function rewardLine(trip, kind, targetId, amount) {
 
 const OLD_MIGRATION_CHECKSUM = 'fnv1a32:9d3ced6f'; // Measured against the committed v1 repository.
 const OLD_MIGRATION_002_CHECKSUM = 'fnv1a32:a0036d79'; // Measured against committed 7fca3d0.
+const OLD_MIGRATION_003_CHECKSUM = 'fnv1a32:519a9ef3'; // Measured against committed 145901c.
 const hash = 'a'.repeat(64);
 function departurePin(trip, version = '1.0.0', assetHash = hash) {
   return { tripId: trip.snapshot.tripId, petId: trip.snapshot.petId, cgId: 'postcard', variant: 'default',
@@ -193,6 +197,29 @@ function createV2Archive(db) {
   }
 }
 
+/** Real v3 archive, built from immutable prior migrations; contains both
+ * acquired and legacy pets, plus preserved v2 CG/trip/receipt history. */
+function createV3Archive(db) {
+  const prior=createV2Archive(db);
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    db.exec(MIGRATION_003);
+    db.prepare('INSERT INTO schema_migrations VALUES(3, ?, ?)').run(OLD_MIGRATION_003_CHECKSUM,START+2);
+    db.exec('PRAGMA user_version=3');
+    const acquired={...gameAcquisition(),acquiredAt:START+500};
+    const command=successfulAcquireReceipt(acquired);
+    db.prepare('UPDATE preferences SET logical_time=?').run(acquired.acquiredAt);
+    db.prepare('INSERT INTO pets VALUES (?, ?, ?, ?)').run(acquired.petId,'nova','诺瓦',1);
+    db.prepare('INSERT INTO pet_states VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(acquired.petId,'HOME','IDLE','CALM','NORMAL','HIDDEN',500,1000,1000,0);
+    db.prepare('INSERT INTO pet_progression VALUES (?, ?, ?)').run(acquired.petId,28,0);
+    db.prepare('INSERT INTO pet_acquisitions VALUES (?, ?, ?, ?, ?, ?)').run(acquired.petId,acquired.acquiredAt,
+      acquired.origin,acquired.catalogVersion,acquired.coinCost,acquired.commandId);
+    db.prepare('INSERT INTO commands VALUES (?, ?, ?, 1, ?)').run(command.commandId,command.fingerprint,JSON.stringify(command.outcome),command.createdAt);
+    db.exec('COMMIT');
+    return {...prior,acquired,acquireCommand:command};
+  } catch(error){db.exec('ROLLBACK');throw error;}
+}
+
 describe('SQLite repository — schema and engine', () => {
   it('marks a writer unavailable when transaction rollback itself fails', () => {
     const db = new DatabaseSync(':memory:');
@@ -218,20 +245,21 @@ describe('SQLite repository — schema and engine', () => {
     }
   });
 
-  it('creates v1 through v3 in contiguous order with verified pragmas and no memory tables', () => withMemory((repo, db) => {
+  it('creates v1 through v4 in contiguous order with verified pragmas and no memory tables', () => withMemory((repo, db) => {
     expect(db.prepare('PRAGMA journal_mode').get().journal_mode).toBe('memory');
     expect(db.prepare('PRAGMA foreign_keys').get().foreign_keys).toBe(1);
     expect(db.prepare('PRAGMA synchronous').get().synchronous).toBe(2);
     expect(db.prepare('PRAGMA busy_timeout').get().timeout).toBe(5000);
-    expect(db.prepare('PRAGMA user_version').get().user_version).toBe(3);
+    expect(db.prepare('PRAGMA user_version').get().user_version).toBe(4);
     const history = db.prepare('SELECT version, checksum FROM schema_migrations ORDER BY version').all();
-    expect(history.map(row => row.version)).toEqual([1,2,3]);
+    expect(history.map(row => row.version)).toEqual([1,2,3,4]);
     expect(history[0].checksum).toBe(OLD_MIGRATION_CHECKSUM);
     expect(history[1].checksum).toBe(OLD_MIGRATION_002_CHECKSUM);
-    expect(history[2].checksum).toMatch(/^fnv1a32:[0-9a-f]{8}$/);
+    expect(history[2].checksum).toBe(OLD_MIGRATION_003_CHECKSUM);
+    expect(history[3].checksum).toMatch(/^fnv1a32:[0-9a-f]{8}$/);
     expect(db.prepare('SELECT name FROM sqlite_temp_schema').all()).toEqual([]);
     expect(db.prepare("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all().map(row => row.name)).toEqual([
-      'cg_unlocks', 'commands', 'inventory', 'outbox', 'pet_acquisitions', 'pet_progression', 'pet_states', 'pets', 'preferences',
+      'cg_unlocks', 'commands', 'inventory', 'outbox', 'pet_acquisitions', 'pet_home_schedules', 'pet_progression', 'pet_states', 'pets', 'preferences',
       'reward_ledger', 'schema_migrations', 'settlements', 'trip_cg_asset_pins', 'trip_events', 'trip_reports', 'trips', 'wallet',
     ]);
     expect(repo.transaction(tx => [tx.getPreferences(), tx.listPets(), tx.listTrips(), tx.getWalletCoins()])).toEqual([null, [], [], 0]);
@@ -317,11 +345,11 @@ describe('SQLite repository — real v1 archive migration', () => {
   it('verifies the old archive, runs a synchronous backup outside the transaction, preserves history and settles legacy in-flight only as unversioned', () => withFile(path => {
     const db = new DatabaseSync(path);
     const { old, active, oldUnlock, final } = createV1Archive(db);
-    const backupPath = `${path}.before-v3`;
+    const backupPath = `${path}.before-v4`;
     let callbacks = 0;
     const repo = new SQLiteRepository(db, { persistent: true, beforeMigration(from, to) {
       callbacks++;
-      expect([from,to]).toEqual([1,3]);
+      expect([from,to]).toEqual([1,4]);
       expect(db.prepare('PRAGMA user_version').get().user_version).toBe(1);
       expect(db.prepare('SELECT version, checksum FROM schema_migrations').all()).toEqual([{ version: 1, checksum: OLD_MIGRATION_CHECKSUM }]);
       expect(db.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
@@ -331,7 +359,7 @@ describe('SQLite repository — real v1 archive migration', () => {
     } });
     try {
       expect(callbacks).toBe(1);
-      expect(db.prepare('PRAGMA user_version').get().user_version).toBe(3);
+      expect(db.prepare('PRAGMA user_version').get().user_version).toBe(4);
       expect(db.prepare('SELECT trip_id, cg_pin_schema FROM trips ORDER BY trip_id').all()).toEqual([
         { trip_id: 'trip-legacy', cg_pin_schema: 1 }, { trip_id: 'trip-old', cg_pin_schema: 1 },
       ]);
@@ -369,12 +397,12 @@ describe('SQLite repository — real v1 archive migration', () => {
       } finally { backup.close(); }
     } finally { repo.close(); }
     const reopened = new DatabaseSync(path);
-    const v3 = new SQLiteRepository(reopened, { persistent: true, beforeMigration() { throw new Error('should not back up v3 again'); } });
+    const v4 = new SQLiteRepository(reopened, { persistent: true, beforeMigration() { throw new Error('should not back up v4 again'); } });
     try {
-      expect(v3.transaction(tx => tx.listCgUnlocks('pet-a'))).toEqual([unlocked(oldUnlock)]);
+      expect(v4.transaction(tx => tx.listCgUnlocks('pet-a'))).toEqual([unlocked(oldUnlock)]);
       expect(reopened.prepare('PRAGMA integrity_check').all().map(row => row.integrity_check)).toEqual(['ok']);
       expect(reopened.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
-    } finally { v3.close(); }
+    } finally { v4.close(); }
   }));
 
   it('refuses to mutate a persistent v1 archive without a successful synchronous backup callback', () => withFile(path => {
@@ -428,25 +456,25 @@ describe('SQLite repository — real v1 archive migration', () => {
       expect(db.prepare('SELECT name FROM sqlite_schema WHERE name=?').get('trip_cg_asset_pins')).toBeUndefined();
       const repo = new SQLiteRepository(db, { persistent: true, beforeMigration });
       expect(backups).toBe(2);
-      expect(db.prepare('PRAGMA user_version').get().user_version).toBe(3);
+      expect(db.prepare('PRAGMA user_version').get().user_version).toBe(4);
       expect(repo.transaction(tx => tx.getCgUnlock('pet-a','postcard','default'))).toEqual(unlocked(oldUnlock));
     } finally { db.close(); }
   }));
 
-  it('verifies all three applied checksums and refuses missing or noncontiguous history on v3 startup', () => withFile(path => {
+  it('verifies all four applied checksums and refuses missing or noncontiguous history on v4 startup', () => withFile(path => {
     const initial = new DatabaseSync(path);
     new SQLiteRepository(initial, { persistent: true }).close();
     const db = new DatabaseSync(path);
     try {
-      const v3 = db.prepare('SELECT checksum FROM schema_migrations WHERE version=3').get().checksum;
-      for (const [version, checksum] of [[1, OLD_MIGRATION_CHECKSUM],[2, OLD_MIGRATION_002_CHECKSUM],[3,v3]]) {
+      const v4 = db.prepare('SELECT checksum FROM schema_migrations WHERE version=4').get().checksum;
+      for (const [version, checksum] of [[1, OLD_MIGRATION_CHECKSUM],[2, OLD_MIGRATION_002_CHECKSUM],[3,OLD_MIGRATION_003_CHECKSUM],[4,v4]]) {
         db.prepare("UPDATE schema_migrations SET checksum='bad' WHERE version=?").run(version);
         expect(() => new SQLiteRepository(db, { persistent: true })).toThrow(/checksum mismatch/);
         db.prepare('UPDATE schema_migrations SET checksum=? WHERE version=?').run(checksum, version);
       }
-      db.exec('UPDATE schema_migrations SET version=4 WHERE version=2');
+      db.exec('UPDATE schema_migrations SET version=5 WHERE version=2');
       expect(() => new SQLiteRepository(db, { persistent: true })).toThrow(/not contiguous/);
-      db.exec('DELETE FROM schema_migrations WHERE version=4');
+      db.exec('DELETE FROM schema_migrations WHERE version=5');
       expect(() => new SQLiteRepository(db, { persistent: true })).toThrow(/history is invalid/);
     } finally { db.close(); }
   }));
@@ -468,13 +496,13 @@ describe('SQLite repository — real v1 archive migration', () => {
 });
 
 describe('SQLite repository — genuine v2 acquisition migration', () => {
-  it('preserves pinned CG/trips/receipt and legacy pets while invoking one v2→v3 pre-backup', () => withFile(path => {
+  it('preserves pinned CG/trips/receipt and legacy pets while invoking one v2→v4 pre-backup', () => withFile(path => {
     const db = new DatabaseSync(path), fixture = createV2Archive(db);
     const backupPath = `${path}.v2-copy`;
     let calls = 0;
     const repo = new SQLiteRepository(db, { persistent:true,beforeMigration(from,to) {
       calls++;
-      expect([from,to]).toEqual([2,3]);
+      expect([from,to]).toEqual([2,4]);
       expect(db.prepare('PRAGMA user_version').get().user_version).toBe(2);
       expect(db.prepare('SELECT version, checksum FROM schema_migrations ORDER BY version').all()).toEqual([
         {version:1,checksum:OLD_MIGRATION_CHECKSUM},{version:2,checksum:OLD_MIGRATION_002_CHECKSUM},
@@ -484,7 +512,7 @@ describe('SQLite repository — genuine v2 acquisition migration', () => {
     } });
     try {
       expect(calls).toBe(1);
-      expect(db.prepare('PRAGMA user_version').get().user_version).toBe(3);
+      expect(db.prepare('PRAGMA user_version').get().user_version).toBe(4);
       expect(db.prepare('SELECT * FROM pet_acquisitions').all()).toEqual([]);
       repo.transaction(tx => {
         expect(tx.listPets().map(p=>p.petId)).toEqual(['pet-a','pet-b','pet-c']);
@@ -553,6 +581,69 @@ describe('SQLite repository — genuine v2 acquisition migration', () => {
       expect(repo.transaction(tx=>[tx.getCgUnlock('pet-c','postcard','default'),tx.getCommandReceipt(fixture.command.commandId),tx.getPetAcquisition('pet-c')]))
         .toEqual([fixture.cg,fixture.command,null]);
     } finally { db.close(); }
+  }));
+});
+
+describe('SQLite repository — genuine v3 home-clock migration', () => {
+  it('upgrades v3 with one verified pre-backup and no invented clocks or changes to acquisition, CG, trip and receipt history', () => withFile(path=>{
+    const db=new DatabaseSync(path), fixture=createV3Archive(db), backupPath=`${path}.v3-copy`;
+    let calls=0;
+    const repo=new SQLiteRepository(db,{persistent:true,beforeMigration(from,to){
+      calls++;
+      expect([from,to]).toEqual([3,4]);
+      expect(db.prepare('PRAGMA user_version').get().user_version).toBe(3);
+      expect(db.prepare('SELECT version,checksum FROM schema_migrations ORDER BY version').all()).toEqual([
+        {version:1,checksum:OLD_MIGRATION_CHECKSUM},{version:2,checksum:OLD_MIGRATION_002_CHECKSUM},{version:3,checksum:OLD_MIGRATION_003_CHECKSUM},
+      ]);
+      expect(db.prepare('SELECT name FROM sqlite_schema WHERE name=?').get('pet_home_schedules')).toBeUndefined();
+      db.prepare('VACUUM INTO ?').run(backupPath);
+    }});
+    try{
+      expect(calls).toBe(1);
+      expect(db.prepare('PRAGMA user_version').get().user_version).toBe(4);
+      expect(db.prepare('SELECT * FROM pet_home_schedules').all()).toEqual([]);
+      repo.transaction(tx=>{
+        expect(tx.listPets().map(p=>p.petId)).toEqual(['pet-a','pet-b','pet-c',fixture.acquired.petId]);
+        for(const p of tx.listPets()) expect(tx.getHomeSchedule(p.petId)).toBeNull();
+        expect(tx.getPetAcquisition(fixture.acquired.petId)).toEqual(fixture.acquired);
+        expect(tx.getPetAcquisition('pet-a')).toBeNull();
+        expect(tx.getCommandReceipt(fixture.acquireCommand.commandId)).toEqual(fixture.acquireCommand);
+        expect(tx.getCommandReceipt(fixture.command.commandId)).toEqual(fixture.command);
+        expect(tx.getCgUnlock('pet-c','postcard','default')).toEqual(fixture.cg);
+        expect(tx.listTripCgAssetPins('trip-v2')).toEqual([fixture.pin]);
+        expect(tx.getTrip('trip-v2')).toEqual(fixture.trip);
+        expect(tx.getTrip('trip-legacy')).toEqual(fixture.active);
+        expect(tx.getPreferences().logicalTime).toBe(fixture.acquired.acquiredAt);
+      });
+      const backup=new DatabaseSync(backupPath);
+      try{
+        expect(backup.prepare('PRAGMA user_version').get().user_version).toBe(3);
+        expect(backup.prepare('SELECT name FROM sqlite_schema WHERE name=?').get('pet_home_schedules')).toBeUndefined();
+        expect(backup.prepare('SELECT acquired_at,command_id FROM pet_acquisitions WHERE pet_id=?').get(fixture.acquired.petId)).toEqual({acquired_at:fixture.acquired.acquiredAt,command_id:fixture.acquired.commandId});
+        expect(backup.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
+      }finally{backup.close();}
+    }finally{repo.close();}
+  }));
+
+  it('failed pre-backup or post-DDL v4 fault preserves the original genuine v3 archive, then safely retries',()=>withFile(path=>{
+    const db=new DatabaseSync(path), fixture=createV3Archive(db);
+    const capture=()=>({history:db.prepare('SELECT * FROM schema_migrations ORDER BY version').all(),
+      pets:db.prepare('SELECT * FROM pets ORDER BY pet_id').all(),acquisitions:db.prepare('SELECT * FROM pet_acquisitions').all(),
+      cgs:db.prepare('SELECT * FROM cg_unlocks ORDER BY pet_id').all(),trips:db.prepare('SELECT * FROM trips ORDER BY trip_id').all(),
+      commands:db.prepare('SELECT * FROM commands ORDER BY command_id').all()});
+    const before=capture();
+    const failing={prepare:sql=>db.prepare(sql),close:()=>db.close(),exec(sql){db.exec(sql);if(sql.includes('CREATE TABLE pet_home_schedules'))throw new Error('v4 DDL fault');}};
+    try{
+      expect(()=>new SQLiteRepository(db,{persistent:true})).toThrow(/pre-migration backup callback/);
+      expect(()=>new SQLiteRepository(db,{persistent:true,beforeMigration(){throw new Error('v3 backup failed');}})).toThrow(/v3 backup failed/);
+      expect(()=>new SQLiteRepository(failing,{persistent:true,beforeMigration(){}})).toThrow(/v4 DDL fault/);
+      expect(db.prepare('PRAGMA user_version').get().user_version).toBe(3);
+      expect(db.prepare('SELECT name FROM sqlite_schema WHERE name=?').get('pet_home_schedules')).toBeUndefined();
+      expect(capture()).toEqual(before);
+      const repo=new SQLiteRepository(db,{persistent:true,beforeMigration(){}});
+      expect(repo.transaction(tx=>[tx.getPetAcquisition(fixture.acquired.petId),tx.getHomeSchedule(fixture.acquired.petId),tx.getCgUnlock('pet-c','postcard','default')]))
+        .toEqual([fixture.acquired,null,fixture.cg]);
+    }finally{db.close();}
   }));
 });
 
@@ -802,6 +893,113 @@ describe('SQLite repository — immutable pet acquisition and deferred receipt',
     // behavior until a later explicit migration/feature changes it.
     repo.transaction(tx=>{tx.savePet(pet('legacy'));tx.savePet({...tx.getPet('legacy'),characterId:'new-character'});});
     expect(repo.transaction(tx=>[tx.getPet('legacy').characterId,tx.getPetAcquisition('legacy')])).toEqual(['new-character',null]);
+  }));
+});
+
+describe('SQLite repository — persisted home simulation clocks',()=>{
+  it('roundtrips independent HOME/offsite schedules and exact fractional remainders through a WAL restart',()=>withFile(path=>{
+    const db=new DatabaseSync(path), repo=new SQLiteRepository(db,{persistent:true});
+    const target=START+12345;
+    const first={...schedule(),lastSimAt:target,activityDueAt:target+30_000,energyRemainder:3_599_999,
+      healthRemainder:555,moodRemainder:123,interactionCount:1,lastInteractionAt:target};
+    const away=schedule('pet-b',target);
+    try{
+      repo.transaction(tx=>{
+        tx.savePet({...pet(),activity:'REST'});tx.savePet({...pet('pet-b'),presence:'AWAY',activity:null});
+        tx.savePreferences({...preferences(),logicalTime:target});
+        expect(tx.getHomeSchedule('pet-a')).toBeNull();
+        tx.saveHomeSchedule(schedule());tx.saveHomeSchedule(first);tx.saveHomeSchedule(first);
+        tx.saveHomeSchedule(away);
+        expect(tx.getHomeSchedule('pet-a')).toEqual(first);
+      });
+      expect(db.prepare('SELECT count(*) AS n FROM pet_home_schedules').get().n).toBe(2);
+    }finally{repo.close();}
+    const reopened=new DatabaseSync(path), after=new SQLiteRepository(reopened,{persistent:true});
+    try{
+      expect(after.transaction(tx=>[tx.getHomeSchedule('pet-a'),tx.getHomeSchedule('pet-b'),tx.getHomeSchedule('absent')])).toEqual([first,away,null]);
+      expect(reopened.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
+    }finally{after.close();}
+  }));
+
+  it('rejects regressing simulation time, UTC day, first-interaction timestamp and same-day count; resets only on a new UTC day',()=>withMemory(repo=>{
+    const day=Math.floor(START/DAY_MS), nearMidnight=(day+1)*DAY_MS-100;
+    const first={...schedule('pet-a',nearMidnight),interactionCount:5,lastInteractionAt:nearMidnight-20};
+    repo.transaction(tx=>{tx.savePet(pet());tx.savePreferences({...preferences(),logicalTime:nearMidnight+1000});tx.saveHomeSchedule(first);});
+    const invalid=[{...first,lastSimAt:nearMidnight-1},{...first,interactionDay:day-1,interactionCount:0},
+      {...first,interactionCount:4},{...first,lastInteractionAt:first.lastInteractionAt-1},
+      {...first,lastSimAt:nearMidnight+200,interactionDay:day+1,interactionCount:0,lastInteractionAt:null}];
+    for(const record of invalid) expect(()=>repo.transaction(tx=>tx.saveHomeSchedule(record))).toThrow(/clock cannot regress/);
+    expect(repo.transaction(tx=>tx.getHomeSchedule('pet-a'))).toEqual(first);
+    const nextDay={...first,lastSimAt:nearMidnight+200,interactionDay:day+1,interactionCount:0};
+    const nextReward={...nextDay,lastSimAt:nearMidnight+500,interactionCount:1,lastInteractionAt:nearMidnight+500};
+    repo.transaction(tx=>{tx.saveHomeSchedule(nextDay);expect(tx.getHomeSchedule('pet-a')).toEqual(nextDay);
+      tx.saveHomeSchedule(nextReward);});
+    expect(repo.transaction(tx=>tx.getHomeSchedule('pet-a'))).toEqual(nextReward);
+    expect(()=>repo.transaction(tx=>tx.saveHomeSchedule(nextDay))).toThrow(/clock cannot regress/);
+  }));
+
+  it('does not allow a schedule ahead of persisted application time or application clock rollback behind any pet',()=>withMemory((repo,db)=>{
+    const first={...schedule(),lastSimAt:START+100};
+    repo.transaction(tx=>{
+      tx.savePet(pet());tx.savePet(pet('pet-b'));
+      // A seed can be written before preferences exist, but initializing the
+      // authoritative clock earlier than that seed is then refused.
+      tx.saveHomeSchedule(first);
+      expect(()=>tx.savePreferences(preferences())).toThrow(/precedes home schedules/);
+      tx.savePreferences({...preferences(),logicalTime:first.lastSimAt});
+    });
+    const future=schedule('pet-b',first.lastSimAt+1);
+    expect(()=>repo.transaction(tx=>tx.saveHomeSchedule(future))).toThrow(/exceeds application logical time/);
+    expect(()=>db.prepare('INSERT INTO pet_home_schedules VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)').run(...Object.values(future))).toThrow(/exceeds application logical time/);
+    expect(()=>repo.transaction(tx=>tx.savePreferences({...preferences(),logicalTime:START}))).toThrow(/precedes home schedules/);
+    expect(()=>db.exec(`UPDATE preferences SET logical_time=${START}`)).toThrow(/precedes home schedules/);
+    expect(()=>db.exec('DELETE FROM preferences')).toThrow(/logical clock cannot be deleted/);
+    repo.transaction(tx=>{tx.savePreferences({...preferences(),logicalTime:future.lastSimAt});tx.saveHomeSchedule(future);});
+    expect(repo.transaction(tx=>tx.getHomeSchedule('pet-b'))).toEqual(future);
+  }));
+
+  it('rejects malformed schedule shapes, bad timestamps/remainders/counters and missing pet FK',()=>withMemory((repo,db)=>{
+    const base=schedule();
+    repo.transaction(tx=>{tx.savePet(pet());tx.savePreferences(preferences());});
+    const invalid=[{...base,lastSimAt:-1},{...base,lastSimAt:NaN},{...base,lastSimAt:Number.MAX_SAFE_INTEGER+1},
+      {...base,activityDueAt:START-1},{...base,activityDueAt:1.5},{...base,energyRemainder:3_600_000},
+      {...base,healthRemainder:-1},{...base,moodRemainder:.5},{...base,interactionDay:base.interactionDay+1},
+      {...base,interactionCount:11},{...base,interactionCount:1},{...base,lastInteractionAt:START+1},
+      {...base,interactionCount:1,lastInteractionAt:START-DAY_MS},{...base,extra:'unexpected'},{petId:base.petId}];
+    for(const record of invalid)expect(()=>repo.transaction(tx=>tx.saveHomeSchedule(record))).toThrow();
+    expect(()=>repo.transaction(tx=>tx.saveHomeSchedule(schedule('missing')))).toThrow(/foreign key/i);
+    const raw=db.prepare('INSERT INTO pet_home_schedules VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)');
+    for(const record of [{...base,energyRemainder:3_600_000},{...base,activityDueAt:START-1},
+      {...base,interactionCount:1},{...base,interactionDay:base.interactionDay+1},{...base,lastInteractionAt:START+1}])
+      expect(()=>raw.run(...Object.values(record))).toThrow(/check constraint/i);
+    expect(repo.transaction(tx=>tx.getHomeSchedule('pet-a'))).toBeNull();
+    db.exec('PRAGMA ignore_check_constraints=ON');
+    raw.run(...Object.values({...base,energyRemainder:3_600_000}));
+    expect(()=>repo.transaction(tx=>tx.getHomeSchedule('pet-a'))).toThrow(/home energy remainder/);
+  }));
+
+  it('protects persisted clocks from raw SQL regression, deletion or REPLACE reset',()=>withMemory((repo,db)=>{
+    const current={...schedule(),interactionCount:2,lastInteractionAt:START-1};
+    repo.transaction(tx=>{tx.savePet(pet());tx.savePet(pet('pet-b'));tx.savePreferences(preferences());tx.saveHomeSchedule(current);});
+    expect(()=>db.exec('UPDATE pet_home_schedules SET last_sim_at=last_sim_at-1')).toThrow(/cannot regress/);
+    expect(()=>db.exec('UPDATE pet_home_schedules SET interaction_count=0')).toThrow(/cannot regress/);
+    expect(()=>db.exec('UPDATE pet_home_schedules SET last_interaction_at=NULL')).toThrow(/cannot regress/);
+    expect(()=>db.exec("UPDATE pet_home_schedules SET pet_id='pet-b'")).toThrow(/cannot regress or change pet/);
+    expect(()=>db.prepare('INSERT OR REPLACE INTO pet_home_schedules VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)').run(...Object.values(schedule()))).toThrow(/cannot regress/);
+    expect(()=>db.exec('DELETE FROM pet_home_schedules')).toThrow(/cannot be deleted/);
+    expect(repo.transaction(tx=>tx.getHomeSchedule('pet-a'))).toEqual(current);
+  }));
+
+  it('rolls back home clock, fractional simulation, preference and pet changes within the same failed transaction',()=>withMemory(repo=>{
+    const before=schedule();
+    repo.transaction(tx=>{tx.savePet(pet());tx.savePreferences(preferences());tx.saveHomeSchedule(before);});
+    expect(()=>repo.transaction(tx=>{
+      tx.savePreferences({...preferences(),logicalTime:START+2000});
+      tx.savePet({...pet(),energy10:700,revision:1});
+      tx.saveHomeSchedule({...before,lastSimAt:START+2000,energyRemainder:20,interactionCount:1,lastInteractionAt:START+2000});
+      throw new Error('home simulation transaction failed');
+    })).toThrow(/home simulation transaction failed/);
+    expect(repo.transaction(tx=>[tx.getHomeSchedule('pet-a'),tx.getPreferences(),tx.getPet('pet-a')])).toEqual([before,preferences(),pet()]);
   }));
 });
 

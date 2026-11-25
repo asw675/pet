@@ -4,11 +4,12 @@ import type { AppSnapshot, CharacterCatalogPage, DomainCommand, DomainEvent, Gal
 import { DEMO_ROUTE } from '@pet-desktop/domain';
 import { findBuiltinCg } from '@pet-desktop/domain/cg-catalog';
 import { CHARACTER_CATALOG_VERSION } from '@pet-desktop/domain/character-catalog';
+import { HOME_RULES, advanceHomeState } from '@pet-desktop/domain/home-simulation';
 import type { TripFact } from '@pet-desktop/domain';
 import { AppService } from '../src/app-service.js';
 import type {
   AppRepository, AppRuntime, AppTransaction, CgUnlock, CgUnlockInput, CommandOutcome, CommandReceipt,
-  InventoryItem, OutboxRecord, PetAcquisitionRecord, PetRecord, PreferencesRecord, RewardLine, SettlementRecord, TripCgAssetPin, TripRecord,
+  HomeScheduleRecord, InventoryItem, OutboxRecord, PetAcquisitionRecord, PetRecord, PreferencesRecord, RewardLine, SettlementRecord, TripCgAssetPin, TripRecord,
 } from '../src/ports.js';
 
 const MINUTE = 60_000;
@@ -23,6 +24,7 @@ interface MemoryState {
   preferences: PreferencesRecord | null;
   pets: PetRecord[];
   acquisitions: PetAcquisitionRecord[];
+  homeSchedules: HomeScheduleRecord[];
   trips: TripRecord[];
   facts: TripFact[];
   settlements: SettlementRecord[];
@@ -36,7 +38,7 @@ interface MemoryState {
 }
 
 function emptyState(): MemoryState {
-  return { preferences: null, pets: [], acquisitions: [], trips: [], facts: [], settlements: [], rewards: [],
+  return { preferences: null, pets: [], acquisitions: [], homeSchedules: [], trips: [], facts: [], settlements: [], rewards: [],
     wallet: 0, inventory: [], cgs: [], cgPins: [], receipts: [], outbox: [] };
 }
 
@@ -78,6 +80,17 @@ class MemoryRepository implements AppRepository, AppTransaction {
       throw new Error('Invalid or duplicate pet acquisition');
     }
     this.state.acquisitions.push(copy(record));
+  }
+  getHomeSchedule(petId: string): HomeScheduleRecord | null {
+    return copy(this.state.homeSchedules.find((entry) => entry.petId === petId) ?? null);
+  }
+  saveHomeSchedule(record: HomeScheduleRecord): void {
+    const previous = this.getHomeSchedule(record.petId);
+    if (!this.getPet(record.petId) || record.lastSimAt > (this.state.preferences?.logicalTime ?? record.lastSimAt)
+      || (previous && record.lastSimAt < previous.lastSimAt)) throw new Error('Invalid or regressing home schedule');
+    const index = this.state.homeSchedules.findIndex((entry) => entry.petId === record.petId);
+    if (index < 0) this.state.homeSchedules.push(copy(record));
+    else this.state.homeSchedules[index] = copy(record);
   }
   listTrips(): TripRecord[] { return copy(this.state.trips); }
   getTrip(tripId: string): TripRecord | null {
@@ -343,7 +356,7 @@ describe('pet and trip use cases', () => {
     runtime.at = START + OFFLINE_72H;
     const home = service.getSnapshot();
     expect(home.pets[0]).toMatchObject({ presence: 'HOME', activity: 'IDLE', xp: 4,
-      energy: 85, visibility: 'HIDDEN', trip: { tripId, status: 'SETTLED', expectedReturnAt: START + 6 * MINUTE } });
+      energy: 100, visibility: 'HIDDEN', trip: { tripId, status: 'SETTLED', expectedReturnAt: START + 6 * MINUTE } });
     expect(home.primaryPetId).toBe('pet-2');
     expect(repo.getSettlement(tripId)).toMatchObject({ settledAt: START + 6 * MINUTE, rewards: { xp: 4, coins: 0 } });
     expect(repo.getTrip(tripId)!.reportReadAt).toBeNull();
@@ -356,15 +369,22 @@ describe('pet and trip use cases', () => {
     expect(repo.listRewards(tripId)).toHaveLength(2);
   });
 
-  it('rejects insufficient energy and clamps repeated interactions to fixed-point bounds', () => {
+  it('rejects insufficient energy, limits repeated feedback, and recovers needs only through elapsed HOME time', () => {
     const { service, repo, runtime } = fixture();
     repo.savePet({ ...repo.getPet('pet-1')!, energy10: 149 });
     const denied = command('no-energy', 'TRIP_START', { petId: 'pet-1', routeId: DEMO_ROUTE.routeId });
     expect(service.dispatch(denied)).toMatchObject({ ok: false, error: { code: 'BUSINESS_RULE' } });
     expect(repo.getPet('pet-1')!.energy10).toBe(149);
     for (let i = 0; i < 110; i++) success(service.dispatch(command(`pet-${i}`, 'PET_INTERACT', { petId: 'pet-1', interaction: 'PET' })));
-    expect(repo.getPet('pet-1')).toMatchObject({ moodScore10: 1000, bond10: 1000 });
+    expect(repo.getPet('pet-1')).toMatchObject({ moodScore10: 550, bond10: 10 });
+    expect(repo.getHomeSchedule('pet-1')?.interactionCount).toBe(1);
+    const interactions = repo.state.outbox.filter((entry) => entry.event.type === 'PetInteracted');
+    expect(interactions.filter((entry) => entry.event.payload.rewardGranted)).toHaveLength(1);
+    expect(interactions.filter((entry) => entry.event.payload.reason === 'COOLDOWN')).toHaveLength(109);
     success(service.dispatch(command('rest-1', 'PET_INTERACT', { petId: 'pet-1', interaction: 'REST' })));
+    expect(repo.getPet('pet-1')!.energy10).toBe(149);
+    runtime.at += HOME_RULES.hourMs;
+    service.getSnapshot();
     expect(repo.getPet('pet-1')!.energy10).toBe(349);
     const tripId = depart(service);
     expect(repo.getPet('pet-1')!.energy10).toBe(199);
@@ -439,7 +459,17 @@ describe('deterministic, atomic offline settlement', () => {
       expect(service.getSnapshot().walletCoins).toBe(16);
       return repo.state;
     }
-    expect(run(true)).toEqual(run(false));
+    // Visible state can be published at different intermediate poll times,
+    // so revision watermarks legitimately differ; durable travel facts,
+    // economy, receipts, event content/order and final simulated state do not.
+    const comparable = (state: MemoryState) => ({
+      ...state, preferences: { ...state.preferences, revision: 0 },
+      pets: state.pets.map((pet) => ({ ...pet, revision: 0 })),
+      homeSchedules: state.pets.map(({ revision: _revision, ...pet }) => advanceHomeState({ ...pet,
+        ...state.homeSchedules.find((schedule) => schedule.petId === pet.petId)! }, state.preferences!.logicalTime)),
+      outbox: state.outbox.map((entry) => ({ ...entry, event: { ...entry.event, revision: 0 } })),
+    });
+    expect(comparable(run(true))).toEqual(comparable(run(false)));
   });
 
   it('rejects plausible but forged checkpoint rewards and facts without overwriting them or settling another pet', () => {

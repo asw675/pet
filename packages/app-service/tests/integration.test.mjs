@@ -4,10 +4,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { AppService } from '../src/app-service.ts';
 import { verifyMigrationBackup } from '../src/migration-backup.ts';
-import { MIGRATION_001, SQLiteRepository } from '../src/sqlite-repository.ts';
+import { MIGRATION_001, MIGRATION_002, MIGRATION_003, SQLiteRepository } from '../src/sqlite-repository.ts';
 import { advanceTrip, createTripCheckpoint, createTripSnapshot, DEMO_ROUTE } from '@pet-desktop/domain';
 import { findBuiltinCg } from '@pet-desktop/domain/cg-catalog';
 import { CHARACTER_CATALOG_VERSION } from '@pet-desktop/domain/character-catalog';
+import { HOME_RULES, advanceHomeState } from '@pet-desktop/domain/home-simulation';
 
 const initialTime = 1_800_000_000_000;
 const minutes = (n) => n * 60_000;
@@ -317,14 +318,16 @@ describe.skipIf(!supported)('application service + real SQLite persisted integra
       unlockedAt: initialTime + minutes(15), favorite: false, viewedAt: null });
     const ledger = instance.repo.transaction((tx) => tx.listRewards(tripId));
     f.advance(initialTime + minutes(16));
+    const currentBeforeView = instance.service.getSnapshot();
+    expect(currentBeforeView.pets.find((pet) => pet.petId === petId).energy).toBe(85.3);
     const { characterId, eventDefId, assetVersion, assetHash } = pin.assetRef;
     const viewCommand = f.command('CG_MARK_VIEWED', { ...keys, characterId, eventDefId, assetVersion, assetHash }, 'view-cg-once');
     const viewed = expectSuccess(f.request(instance.service, viewCommand));
     const favoriteCommand = f.command('CG_SET_FAVORITE', { ...keys, favorite: true }, 'favorite-cg-once');
     const favorited = expectSuccess(f.request(instance.service, favoriteCommand));
-    expect(viewed.revision).toBe(settled.snapshot.revision + 1);
+    expect(viewed.revision).toBe(currentBeforeView.revision + 1);
     expect(favorited.revision).toBe(viewed.revision + 1);
-    expect(favorited).toEqual({ ...settled.snapshot, revision: favorited.revision });
+    expect(favorited).toEqual({ ...currentBeforeView, revision: favorited.revision });
     instance.close();
 
     f.advance(initialTime + minutes(17));
@@ -468,5 +471,203 @@ describe.skipIf(!supported)('application service + real SQLite persisted integra
     expect(instance.repo.transaction(tx => tx.listOutbox(0, 100).filter(entry => entry.event.type === 'PetAcquired'))).toHaveLength(1);
     expect(instance.repo.transaction(tx => tx.getWalletCoins())).toBe(8);
     instance.close();
+  });
+});
+
+describe.skipIf(!supported)('persisted HOME recovery and bounded interactions', () => {
+  const petState = (instance, petId) => instance.repo.transaction(tx => ({
+    pet: tx.getPet(petId), schedule: tx.getHomeSchedule(petId), logicalTime: tx.getPreferences().logicalTime,
+  }));
+
+  it('defers fraction-only polls, persists exactly when visible needs change, and recomputes across restart', () => {
+    const f = fixture();
+    let instance = f.open();
+    instance.repo.transaction(tx => tx.savePet({ ...tx.getPet('pet-1'), energy10: 600 }));
+    const original = instance.service.getSnapshot();
+    const durable = petState(instance, 'pet-1').schedule;
+    f.advance(initialTime + 17_999);
+    expect(instance.service.getSnapshot()).toEqual(original);
+    expect(petState(instance, 'pet-1')).toMatchObject({ pet: { energy10: 600 }, schedule: durable,
+      logicalTime: initialTime + 17_999 });
+    instance.close();
+    instance = f.open();
+    expect(instance.service.getSnapshot()).toEqual(original);
+    expect(petState(instance, 'pet-1').schedule).toEqual(durable);
+    f.advance(initialTime + 18_000);
+    const next = instance.service.getSnapshot();
+    expect(next.revision).toBe(original.revision + 1);
+    expect(next.pets[0]).toMatchObject({ energy: 60.1, revision: original.pets[0].revision + 1 });
+    expect(petState(instance, 'pet-1').schedule).toMatchObject({ lastSimAt: initialTime + 18_000, energyRemainder: 0 });
+    instance.close();
+  });
+
+  it('has identical 72-hour and irregular segmented effective HOME state with real persisted restarts', () => {
+    function run(segmented, elapsed) {
+      const f = fixture();
+      let instance = f.open();
+      instance.repo.transaction(tx => {
+        tx.savePet({ ...tx.getPet('pet-1'), energy10: 125, healthPoints10: 400, healthStatus: 'INJURED', moodScore10: 920, bond10: 240 });
+        tx.savePet({ ...tx.getPet('pet-2'), energy10: 600, healthPoints10: 780, healthStatus: 'RECOVERING', moodScore10: 200, bond10: 180 });
+      });
+      instance.service.getSnapshot();
+      if (segmented) {
+        for (const delta of [1_000, 17_999, 36_123, HOME_RULES.hourMs + 7, 2 * HOME_RULES.hourMs + 123,
+          4 * HOME_RULES.hourMs + 13_337, HOME_RULES.dayMs, 2 * HOME_RULES.dayMs + 7]) {
+          if (delta >= elapsed) continue;
+          f.advance(initialTime + delta);
+          instance.service.getSnapshot();
+          instance.close();
+          instance = f.open();
+        }
+      }
+      f.advance(initialTime + elapsed);
+      const snapshot = instance.service.getSnapshot();
+      const projected = ['pet-1', 'pet-2'].map(id => {
+        const { pet, schedule, logicalTime } = petState(instance, id);
+        const { revision: _revision, ...withoutRevision } = pet;
+        return advanceHomeState({ ...withoutRevision, ...schedule }, logicalTime);
+      });
+      expect(snapshot.pets.map(pet => pet.bond)).toEqual([24, 18]);
+      expect(snapshot.walletCoins).toBe(0);
+      instance.close();
+      return projected;
+    }
+    for (const elapsed of [5 * HOME_RULES.hourMs + 18_099, 72 * HOME_RULES.hourMs + 12_345]) {
+      expect(run(true, elapsed)).toEqual(run(false, elapsed));
+    }
+  });
+
+  it('never recovers while away and credits only elapsed HOME time from the actual returnedAt after restart', () => {
+    const f = fixture();
+    let instance = f.open();
+    instance.repo.transaction(tx => {
+      tx.savePet({ ...tx.getPet('pet-1'), energy10: 600 });
+      tx.savePet({ ...tx.getPet('pet-2'), energy10: 700 });
+    });
+    const started = expectSuccess(f.request(instance.service, f.command('TRIP_START', { petId: 'pet-1', routeId: DEMO_ROUTE.routeId })));
+    const tripId = started.pets[0].trip.tripId;
+    expect(started.pets[0].energy).toBe(45);
+    f.advance(initialTime + minutes(12));
+    expect(instance.service.getSnapshot().pets[0]).toMatchObject({ presence: 'RETURNING', energy: 45 });
+    expect(petState(instance, 'pet-1').schedule.activityDueAt).toBeNull();
+    instance.close();
+    f.advance(initialTime + minutes(45));
+    instance = f.open();
+    const arrived = instance.service.getSnapshot();
+    expect(arrived.pets[0]).toMatchObject({ presence: 'HOME', energy: 55, xp: 24, trip: { tripId, status: 'SETTLED',
+      expectedReturnAt: initialTime + minutes(15) } });
+    expect(arrived.pets[1].energy).toBe(85); // the other pet was HOME the full 45 minutes
+    expect(petState(instance, 'pet-1').schedule.lastSimAt).toBe(initialTime + minutes(45));
+    expect(instance.repo.transaction(tx => tx.getSettlement(tripId)).settledAt).toBe(initialTime + minutes(15));
+    instance.close();
+  });
+
+  it('retains independent cooldown, UTC daily count and authoritative receipts across midnight and restart', () => {
+    const f = fixture();
+    let instance = f.open();
+    const midnight = (Math.floor(initialTime / HOME_RULES.dayMs) + 1) * HOME_RULES.dayMs;
+    const firstAt = midnight - 10_000;
+    f.advance(firstAt);
+    const raw = f.command('PET_INTERACT', { petId: 'pet-1', interaction: 'PET' }, 'first-home-touch');
+    const first = expectSuccess(f.request(instance.service, raw));
+    expect(first.pets[0].bond).toBe(1);
+    expect(petState(instance, 'pet-1').schedule).toMatchObject({ interactionCount: 1, lastInteractionAt: firstAt });
+    instance.close();
+    f.advance(midnight);
+    instance = f.open();
+    expect(expectSuccess(f.request(instance.service, raw))).toEqual(first); // historical success, no replay
+    const touch = (petId, id) => expectSuccess(f.request(instance.service, f.command('PET_INTERACT', { petId, interaction: 'PET' }, id)));
+    expect(touch('pet-1', 'midnight-cooldown').pets[0].bond).toBe(1);
+    expect(petState(instance, 'pet-1').schedule).toMatchObject({ interactionDay: Math.floor(midnight / HOME_RULES.dayMs),
+      interactionCount: 0, lastInteractionAt: firstAt });
+    expect(touch('pet-2', 'independent-touch').pets[1].bond).toBe(1);
+    f.advance(midnight + 20_000);
+    expect(touch('pet-1', 'second-eligible').pets[0].bond).toBe(2);
+    for (let i = 1; i < HOME_RULES.petDailyLimit; i++) {
+      f.advance(midnight + 20_000 + i * HOME_RULES.petCooldownMs);
+      touch('pet-1', `bounded-${i}`);
+    }
+    const beforeExcess = petState(instance, 'pet-1');
+    f.advance(midnight + 20_000 + HOME_RULES.petDailyLimit * HOME_RULES.petCooldownMs);
+    expect(touch('pet-1', 'daily-excess').pets[0].bond).toBe(11);
+    expect(petState(instance, 'pet-1').schedule).toMatchObject({ interactionCount: 10, lastInteractionAt: beforeExcess.schedule.lastInteractionAt });
+    expect(instance.repo.transaction(tx => tx.listOutbox(0, 100).filter(entry => entry.event.type === 'PetInteracted').at(-1).event.payload))
+      .toMatchObject({ rewardGranted: false, reason: 'DAILY_LIMIT' });
+    instance.close();
+    f.advance(midnight + HOME_RULES.dayMs);
+    instance = f.open();
+    expect(touch('pet-1', 'next-utc-day').pets[0].bond).toBe(12);
+    expect(petState(instance, 'pet-1').schedule.interactionCount).toBe(1);
+    expect(instance.service.getSnapshot().pets[1].bond).toBe(1);
+    instance.close();
+  });
+
+  it('migrates genuine v3 at prior authority time, not old adoption, and preserves raw old successful receipts', () => {
+    const f = fixture();
+    const petId = 'pet-1';
+    const oldCommand = { commandId: 'historical-rest', issuedAt: initialTime - minutes(1),
+      payload: { interaction: 'REST', petId }, type: 'PET_INTERACT' };
+    const oldSnapshot = { revision: 5, primaryPetId: petId, walletCoins: 0, doNotDisturb: false, pausedRender: false,
+      pets: [{ petId, characterId: 'star-singer', nickname: '星咏', presence: 'HOME', activity: 'REST', mood: 'HAPPY',
+        healthStatus: 'INJURED', visibility: 'VISIBLE', moodScore: 70, healthPoints: 50, energy: 40, bond: 15, level: 1, xp: 0, revision: 5 }] };
+    const fingerprint = JSON.stringify(oldCommand);
+    const outcome = JSON.stringify({ ok: true, snapshot: oldSnapshot });
+    const db = new DatabaseSync(f.dbPath);
+    try {
+      for (const [version, sql, checksum] of [
+        [1, MIGRATION_001, 'fnv1a32:9d3ced6f'], [2, MIGRATION_002, 'fnv1a32:a0036d79'], [3, MIGRATION_003, 'fnv1a32:519a9ef3'],
+      ]) {
+        db.exec(sql);
+        db.prepare('INSERT INTO schema_migrations VALUES (?, ?, ?)').run(version, checksum, initialTime);
+        db.exec(`PRAGMA user_version = ${version}`);
+      }
+      db.prepare('INSERT INTO pets VALUES (?, ?, ?, ?)').run(petId, 'star-singer', '星咏', 5);
+      db.prepare('INSERT INTO pet_states VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+        .run(petId, 'HOME', 'REST', 'HAPPY', 'INJURED', 'VISIBLE', 700, 500, 400, 150);
+      db.prepare('INSERT INTO pet_progression VALUES (?, ?, ?)').run(petId, 30, 0);
+      db.prepare('INSERT INTO preferences VALUES (?, ?, ?, ?, ?, ?)').run(1, 5, initialTime, petId, 0, 0);
+      db.prepare('INSERT INTO pet_acquisitions VALUES (?, ?, ?, ?, ?, ?)')
+        .run(petId, initialTime - HOME_RULES.dayMs, 'STARTER', CHARACTER_CATALOG_VERSION, 0, null);
+      db.prepare('INSERT INTO commands VALUES (?, ?, ?, ?, ?)')
+        .run(oldCommand.commandId, fingerprint, outcome, 1, initialTime);
+    } finally { db.close(); }
+    f.advance(initialTime + minutes(30));
+    const beforeMigration = (source, from) => {
+      expect(from).toBe(3);
+      verifyMigrationBackup(source, `${f.dbPath}.v3-home-backup`, from, filename => new DatabaseSync(filename, { readOnly: true }));
+    };
+    const instance = f.open(repo => repo, { beforeMigration });
+    const now = instance.service.getSnapshot();
+    expect(now.pets[0]).toMatchObject({ energy: 50, healthPoints: 55, moodScore: 65, bond: 15, healthStatus: 'RECOVERING', activity: 'REST' });
+    expect(petState(instance, petId).schedule).toMatchObject({ lastSimAt: initialTime + minutes(30), interactionCount: 0, lastInteractionAt: null });
+    expect(expectSuccess(f.request(instance.service, oldCommand))).toEqual(oldSnapshot);
+    expect(instance.service.getSnapshot()).toEqual(now);
+    instance.close();
+    const upgraded = new DatabaseSync(f.dbPath, { readOnly: true });
+    try {
+      expect(upgraded.prepare('PRAGMA user_version').get().user_version).toBe(4);
+      expect(upgraded.prepare('SELECT fingerprint,outcome_json,created_at FROM commands WHERE command_id=?').get(oldCommand.commandId))
+        .toEqual({ fingerprint, outcome_json: outcome, created_at: initialTime });
+      expect(upgraded.prepare('SELECT acquired_at FROM pet_acquisitions WHERE pet_id=?').get(petId).acquired_at)
+        .toBe(initialTime - HOME_RULES.dayMs);
+    } finally { upgraded.close(); }
+  });
+
+  it('refuses startup on a partially missing or activity-inconsistent home schedule rather than reseeding it', () => {
+    for (const corruption of ['partial', 'activity']) {
+      const f = fixture();
+      const instance = f.open();
+      if (corruption === 'activity') {
+        instance.repo.transaction(tx => tx.savePet({ ...tx.getPet('pet-1'), activity: 'INTERACT' })); // no matching deadline
+      }
+      instance.close();
+      if (corruption === 'partial') {
+        // Synthetic corruption fixture only; the real v4 write path prohibits deleting schedule rows.
+        const db = new DatabaseSync(f.dbPath);
+        try { db.exec('DROP TRIGGER preserve_home_schedule'); db.prepare('DELETE FROM pet_home_schedules WHERE pet_id=?').run('pet-1'); }
+        finally { db.close(); }
+      }
+      expect(() => f.open()).toThrow();
+    }
   });
 });

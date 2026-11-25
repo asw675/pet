@@ -100,7 +100,7 @@ const commandFields = {
   expectedRevision: revisionSchema.optional(),
 };
 
-export const interactionSchema = z.enum(['PET', 'REST']);
+export const interactionSchema = z.enum(['PET', 'REST', 'WAKE']);
 export const modeFlagSchema = z.enum(['doNotDisturb', 'pausedRender']);
 export type Interaction = z.infer<typeof interactionSchema>;
 export type ModeFlag = z.infer<typeof modeFlagSchema>;

@@ -140,7 +140,7 @@ function interact(interaction: Interaction): void {
   hostError.value = null;
   if (interaction === 'PET') petCanvas.value?.playSemantic('tap.head');
   void store.dispatch({ type: 'PET_INTERACT', payload: { petId: pet.value.petId, interaction } },
-    interaction === 'PET' ? '已互动，好感与心情已更新' : '已安排休息');
+    interaction === 'PET' ? '已互动' : interaction === 'WAKE' ? '已唤醒' : '已安排休息，体力将逐渐恢复');
 }
 
 </script>
@@ -166,7 +166,8 @@ function interact(interaction: Interaction): void {
       </div>
       <div class="actions" data-hit>
         <button :disabled="!canAct" @click="interact('PET')">摸头</button>
-        <button :disabled="!canAct" @click="interact('REST')">休息</button>
+        <button v-if="pet.activity === 'REST' || pet.activity === 'SLEEP'" :disabled="!canAct" @click="interact('WAKE')">唤醒</button>
+        <button v-else :disabled="!canAct" @click="interact('REST')">休息</button>
         <button v-if="store.ready" :disabled="openingCenter" title="在控制中心选择路线并出发" @click="openControlCenter">旅行…</button>
         <button v-else :disabled="store.loading" title="重新查询本地宠物状态" @click="store.refresh()">刷新</button>
       </div>

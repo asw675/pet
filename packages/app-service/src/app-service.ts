@@ -8,11 +8,14 @@ import {
 } from '@pet-desktop/domain';
 import type { RewardDraft, TripAdvanceResult, TripFact } from '@pet-desktop/domain';
 import { CHARACTER_CATALOG_VERSION, evaluateCharacterAcquisition, normalizeCharacterNickname } from '@pet-desktop/domain/character-catalog';
+import { advanceHomeState, interactHome } from '@pet-desktop/domain/home-simulation';
+import type { HomeSimulationState } from '@pet-desktop/domain/home-simulation';
 import type {
   AppRepository, AppRuntime, AppTransaction, CommandOutcome, PetRecord, PreferencesRecord, RewardLine, TripRecord,
 } from './ports.js';
 import { freezeTripCgAssets, projectGallery, TRIP_CG_VARIANT as CG_VARIANT } from '#gallery-service';
 import { characterAcquisitionContext, createCharacterPet, createStarterPets, projectCharacterCatalog } from '#character-service';
+import { applyHomeState, hasVisibleHomeChange, initialHomeState, readHomeState, scheduleFromHome, transitionHomeState } from '#home-state-service';
 
 const DEPARTURE_ENERGY10 = 150;
 
@@ -141,6 +144,7 @@ export class AppService {
         for (const trip of tx.listTrips()) {
           if (trip.status === 'SETTLED') this.verifySettledReport(state, trip);
         }
+        this.initializeLegacyHomeSchedules(state);
         this.advanceAll(state);
         this.snapshot(state);
         return;
@@ -152,13 +156,15 @@ export class AppService {
       }
       const starters = createStarterPets();
       const startedAt = this.now();
-      for (const pet of starters) tx.savePet(pet);
+      const initial = starters.map((pet) => ({ pet, home: initialHomeState(pet, startedAt) }));
+      for (const { pet, home } of initial) tx.savePet(applyHomeState(pet, home));
       tx.setWalletCoins(0);
       tx.savePreferences({ revision: 0, logicalTime: startedAt, primaryPetId: 'pet-1',
         doNotDisturb: false, pausedRender: false });
-      for (const pet of starters) {
+      for (const { pet, home } of initial) {
         tx.insertPetAcquisition({ petId: pet.petId, acquiredAt: startedAt, origin: 'STARTER',
           catalogVersion: CHARACTER_CATALOG_VERSION, coinCost: 0, commandId: null });
+        tx.saveHomeSchedule(scheduleFromHome(home));
       }
     });
   }
@@ -176,6 +182,37 @@ export class AppService {
   private revise(state: TransactionState, changes: Partial<PreferencesRecord> = {}): void {
     state.preferences = { ...state.preferences, ...changes, revision: addNonnegative(state.preferences.revision, 1) };
     state.tx.savePreferences(state.preferences);
+  }
+
+  /** A v3 (or earlier) save has no HOME schedules at all. Anchor its newly
+   * introduced simulation at the last known authority time, not at a guessed
+   * adoption date or the current wall clock. Partial absence is corruption. */
+  private initializeLegacyHomeSchedules(state: TransactionState): void {
+    const pets = state.tx.listPets().sort((a, b) => compareIds(a.petId, b.petId));
+    const schedules = pets.map((pet) => state.tx.getHomeSchedule(pet.petId));
+    if (schedules.some((entry) => entry === null) && schedules.some((entry) => entry !== null)) {
+      throw new Error('Partially missing home schedules');
+    }
+    for (const pet of pets) {
+      if (schedules.every((entry) => entry === null)) {
+        this.persistHomeProjection(state, pet, initialHomeState(pet, state.preferences.logicalTime), true);
+      } else {
+        readHomeState(state.tx, pet, state.preferences.logicalTime);
+      }
+    }
+  }
+
+  private persistHomeProjection(state: TransactionState, pet: PetRecord, home: HomeSimulationState, forceClock = false): void {
+    const visibleChanged = hasVisibleHomeChange(pet, home);
+    if (visibleChanged) {
+      state.tx.savePet({ ...applyHomeState(pet, home), revision: addNonnegative(pet.revision, 1) });
+      this.revise(state);
+    }
+    // Fractions and UTC day changes alone never publish a new revision or
+    // require a database write on each poll. They are computed exactly from
+    // the last durable baseline on the following tick. Explicit actions and
+    // actual presence transitions persist all fractional state atomically.
+    if (visibleChanged || forceClock) state.tx.saveHomeSchedule(scheduleFromHome(home));
   }
 
   private event(state: TransactionState, type: string, aggregateId: string, causationId: string,
@@ -221,6 +258,7 @@ export class AppService {
     const { tx } = state;
     const targetTime = Math.max(state.preferences.logicalTime, this.now());
     const pets = tx.listPets();
+    for (const pet of pets) readHomeState(tx, pet, state.preferences.logicalTime);
     const active = tx.listTrips().filter((trip) => trip.status === 'TRAVELING');
     const travellingPets = new Set<string>();
     for (const trip of active) {
@@ -263,6 +301,15 @@ export class AppService {
         tx.updateTrip({ ...trip, checkpoint: result.checkpoint });
       }
     }
+
+    // Resolve travel first. A pet that returned offline begins HOME recovery
+    // at its verified actual returnedAt rather than at departure or the final
+    // catch-up target. Still-away pets accrue no HOME needs.
+    for (const pet of tx.listPets().sort((a, b) => compareIds(a.petId, b.petId))) {
+      if (pet.presence !== 'HOME') continue;
+      const home = readHomeState(tx, pet, state.preferences.logicalTime);
+      this.persistHomeProjection(state, pet, advanceHomeState(home, targetTime));
+    }
   }
 
   /** Replay from the frozen seed, route and recorded recall, then check against
@@ -293,8 +340,17 @@ export class AppService {
       }
       updatedPet = this.settle(state, updated, updatedPet, replayed.rewardDraft, causationId ?? lastFact.eventId);
     }
+    // A presence transition establishes the new clock boundary. Do not move
+    // an away pet's durable home clock to a later polling target before its
+    // actual return has been processed in global due-time order.
+    const transition = updatedPet.presence !== pet.presence
+      ? transitionHomeState(readHomeState(tx, pet, state.preferences.logicalTime), updatedPet,
+        updated.status === 'SETTLED' ? updated.checkpoint.actualReturnedAt! : result.checkpoint.logicalTime)
+      : null;
+    if (transition) updatedPet = applyHomeState(updatedPet, transition);
     tx.updateTrip(updated);
     tx.savePet(updatedPet);
+    if (transition) tx.saveHomeSchedule(scheduleFromHome(transition));
     return updated;
   }
 
@@ -396,10 +452,13 @@ export class AppService {
       }
       const petId = idSchema.parse(this.runtime.createId('pet'));
       if (tx.getPet(petId) !== null) throw new Error('Generated pet ID already exists');
-      tx.savePet(createCharacterPet(decision.definition, petId, 'HIDDEN'));
+      const acquired = createCharacterPet(decision.definition, petId, 'HIDDEN');
+      const home = initialHomeState(acquired, at);
+      tx.savePet(applyHomeState(acquired, home));
       if (decision.coinCost > 0) tx.setWalletCoins(context.walletCoins - decision.coinCost);
       tx.insertPetAcquisition({ petId, acquiredAt: at, origin: 'GAME', catalogVersion,
         coinCost: decision.coinCost, commandId: command.commandId });
+      tx.saveHomeSchedule(scheduleFromHome(home));
       this.revise(state);
       this.event(state, 'PetAcquired', petId, command.commandId, at, { petId, characterId, catalogVersion, coinCost: decision.coinCost });
       return;
@@ -430,15 +489,13 @@ export class AppService {
         }
         return;
       case 'PET_INTERACT': {
-        if (pet.presence !== 'HOME') return failure('BUSINESS_RULE', 'The pet must be home to interact.');
         const { interaction } = command.payload;
-        if (interaction === 'PET') {
-          updatePet({ activity: 'INTERACT', mood: 'HAPPY', moodScore10: Math.min(1000, pet.moodScore10 + 50),
-            bond10: Math.min(1000, pet.bond10 + 10) });
-        } else {
-          updatePet({ activity: 'REST', energy10: Math.min(1000, pet.energy10 + 200) });
-        }
-        this.event(state, 'PetInteracted', pet.petId, command.commandId, at, { petId: pet.petId, interaction });
+        const result = interactHome(readHomeState(tx, pet, at), interaction, at);
+        if (!result.accepted) return failure('BUSINESS_RULE', result.reason === 'ACTIVITY_BUSY'
+          ? 'Finish the current activity before requesting rest or wake.' : 'The pet must be home to interact.');
+        this.persistHomeProjection(state, pet, result.state, true);
+        this.event(state, 'PetInteracted', pet.petId, command.commandId, at, { petId: pet.petId, interaction,
+          rewardGranted: result.rewardGranted, reason: result.reason ?? null });
         return;
       }
       case 'PET_SET_VISIBILITY':
@@ -472,6 +529,10 @@ export class AppService {
           || pet.energy10 < DEPARTURE_ENERGY10) {
           return failure('BUSINESS_RULE', 'A healthy pet at home needs at least 15 energy to travel.');
         }
+        if (pet.activity === 'CHAT') return failure('BUSINESS_RULE', 'Finish the current conversation before travelling.');
+        // The visible projection is already current; recompute any fractions
+        // not yet durably saved by its preceding read-only tick before leaving.
+        const beforeDeparture = advanceHomeState(readHomeState(tx, pet, at), at);
         const snapshot = createTripSnapshot({ tripId: this.runtime.createId('trip'), petId: pet.petId,
           power: pet.power, seed: this.runtime.seed(), startAt: at, route: DEMO_ROUTE });
         tx.insertTrip({ snapshot, checkpoint: createTripCheckpoint(snapshot), status: 'TRAVELING', reportReadAt: null });
@@ -480,7 +541,10 @@ export class AppService {
         // deterministic format; only its eventual first acquisition gains a
         // separately persisted historical asset reference.
         for (const pin of freezeTripCgAssets(pet, snapshot)) tx.insertTripCgAssetPin(pin);
-        updatePet({ presence: 'AWAY', activity: null, energy10: pet.energy10 - DEPARTURE_ENERGY10 });
+        const offsite: PetRecord = { ...applyHomeState(pet, beforeDeparture), presence: 'AWAY', activity: null,
+          energy10: beforeDeparture.energy10 - DEPARTURE_ENERGY10 };
+        const awayHome = transitionHomeState(beforeDeparture, offsite, at);
+        this.persistHomeProjection(state, pet, awayHome, true);
         this.event(state, 'TripStarted', snapshot.tripId, command.commandId, at,
           { petId: pet.petId, routeId: snapshot.routeId, expectedReturnAt: snapshot.expectedReturnAt });
         return;

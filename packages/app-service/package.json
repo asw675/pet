@@ -7,6 +7,7 @@
   "imports": {
     "#gallery-service": "./src/gallery-service.ts",
     "#character-service": "./src/character-service.ts",
+    "#home-state-service": "./src/home-state-service.ts",
     "#ports": "./src/ports.ts",
     "#app-service": "./src/app-service.ts",
     "#sqlite-repository": "./src/sqlite-repository.ts",

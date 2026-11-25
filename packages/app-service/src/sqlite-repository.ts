@@ -7,13 +7,13 @@ import { advanceTrip, MAX_TRIP_FACTS, MAX_TRIP_NODES } from '@pet-desktop/domain
 import type { RewardDraft, TripCheckpoint, TripFact, TripSnapshot } from '@pet-desktop/domain';
 import type {
   AppRepository, AppTransaction, CgUnlock, CgUnlockInput, CommandOutcome, CommandReceipt, InventoryItem, OutboxRecord,
-  PetAcquisitionRecord, PetRecord, PreferencesRecord, RewardLine, SettlementRecord, SqliteConnection, TripCgAssetPin, TripRecord,
+  HomeScheduleRecord, PetAcquisitionRecord, PetRecord, PreferencesRecord, RewardLine, SettlementRecord, SqliteConnection, TripCgAssetPin, TripRecord,
 } from './ports.js';
 
 const MAX_SAFE = Number.MAX_SAFE_INTEGER;
 const UINT32_MAX = 0xffff_ffff;
 const BUSY_TIMEOUT_MS = 5_000;
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
 const JSON_SCHEMA_VERSION = 1;
 const MIGRATION_001_JSON_SCHEMA_VERSION = 1;
 const MIGRATION_001_MAX_TRIP_FACTS = 14;
@@ -298,7 +298,7 @@ const migration003AcquisitionReceiptMatches = (receipt: string, acquisition: str
   AND EXISTS (SELECT 1 FROM json_each(${receipt}.outcome_json,'$.snapshot.pets') instance
     WHERE json_extract(instance.value,'$.petId')=${acquisition}.pet_id
       AND json_extract(instance.value,'$.characterId')=${pet}.character_id)`;
-const MIGRATION_003 = `
+export const MIGRATION_003 = `
 CREATE TABLE pet_acquisitions (
   pet_id TEXT PRIMARY KEY NOT NULL REFERENCES pets(pet_id) CHECK (${idCheck('pet_id')}),
   acquired_at INTEGER NOT NULL CHECK (${unsigned('acquired_at')}),
@@ -345,10 +345,62 @@ WHEN EXISTS (SELECT 1 FROM pet_acquisitions a JOIN pets p USING(pet_id)
 BEGIN SELECT RAISE(ABORT, 'acquired pet character is immutable'); END;
 `;
 
+// Persist fractional deterministic home simulation and rewarded-interaction
+// history without guessing when old pets last advanced. These limits belong
+// to the immutable numbered migration, independent of future balance tuning.
+const MIGRATION_004_HOUR_MS = 3_600_000;
+const MIGRATION_004_DAY_MS = 86_400_000;
+const MIGRATION_004_DAILY_LIMIT = 10;
+const migration004ClockRegresses = (previous: string, next: string) => `
+  ${next}.last_sim_at < ${previous}.last_sim_at
+  OR ${next}.interaction_day < ${previous}.interaction_day
+  OR (${next}.interaction_day = ${previous}.interaction_day AND ${next}.interaction_count < ${previous}.interaction_count)
+  OR (${previous}.last_interaction_at IS NOT NULL AND (${next}.last_interaction_at IS NULL
+    OR ${next}.last_interaction_at < ${previous}.last_interaction_at))`;
+const MIGRATION_004 = `
+CREATE TABLE pet_home_schedules (
+  pet_id TEXT PRIMARY KEY NOT NULL REFERENCES pets(pet_id) CHECK (${idCheck('pet_id')}),
+  last_sim_at INTEGER NOT NULL CHECK (${unsigned('last_sim_at')}),
+  activity_due_at INTEGER CHECK (activity_due_at IS NULL OR (${unsigned('activity_due_at')} AND activity_due_at >= last_sim_at)),
+  energy_remainder INTEGER NOT NULL CHECK (energy_remainder BETWEEN 0 AND ${MIGRATION_004_HOUR_MS - 1}),
+  health_remainder INTEGER NOT NULL CHECK (health_remainder BETWEEN 0 AND ${MIGRATION_004_HOUR_MS - 1}),
+  mood_remainder INTEGER NOT NULL CHECK (mood_remainder BETWEEN 0 AND ${MIGRATION_004_HOUR_MS - 1}),
+  interaction_day INTEGER NOT NULL CHECK (${unsigned('interaction_day')} AND interaction_day <= last_sim_at / ${MIGRATION_004_DAY_MS}),
+  interaction_count INTEGER NOT NULL CHECK (interaction_count BETWEEN 0 AND ${MIGRATION_004_DAILY_LIMIT}),
+  last_interaction_at INTEGER CHECK (last_interaction_at IS NULL OR (${unsigned('last_interaction_at')} AND last_interaction_at <= last_sim_at)),
+  CHECK (interaction_count=0 OR (last_interaction_at IS NOT NULL AND last_interaction_at / ${MIGRATION_004_DAY_MS}=interaction_day))
+) STRICT;
+CREATE TRIGGER prevent_home_schedule_regression_insert BEFORE INSERT ON pet_home_schedules
+WHEN EXISTS (SELECT 1 FROM pet_home_schedules previous WHERE previous.pet_id=NEW.pet_id
+  AND (${migration004ClockRegresses('previous','NEW')}))
+BEGIN SELECT RAISE(ABORT, 'home schedule clock cannot regress'); END;
+CREATE TRIGGER prevent_home_schedule_regression_update BEFORE UPDATE ON pet_home_schedules
+WHEN OLD.pet_id IS NOT NEW.pet_id OR ${migration004ClockRegresses('OLD','NEW')}
+BEGIN SELECT RAISE(ABORT, 'home schedule clock cannot regress or change pet'); END;
+CREATE TRIGGER preserve_home_schedule BEFORE DELETE ON pet_home_schedules
+BEGIN SELECT RAISE(ABORT, 'home schedule cannot be deleted'); END;
+CREATE TRIGGER constrain_home_schedule_logical_time_insert BEFORE INSERT ON pet_home_schedules
+WHEN EXISTS (SELECT 1 FROM preferences p WHERE p.singleton=1 AND NEW.last_sim_at>p.logical_time)
+BEGIN SELECT RAISE(ABORT, 'home schedule exceeds application logical time'); END;
+CREATE TRIGGER constrain_home_schedule_logical_time_update BEFORE UPDATE ON pet_home_schedules
+WHEN EXISTS (SELECT 1 FROM preferences p WHERE p.singleton=1 AND NEW.last_sim_at>p.logical_time)
+BEGIN SELECT RAISE(ABORT, 'home schedule exceeds application logical time'); END;
+CREATE TRIGGER constrain_preferences_home_clocks_insert BEFORE INSERT ON preferences
+WHEN EXISTS (SELECT 1 FROM pet_home_schedules s WHERE s.last_sim_at>NEW.logical_time)
+BEGIN SELECT RAISE(ABORT, 'application logical time precedes home schedules'); END;
+CREATE TRIGGER constrain_preferences_home_clocks_update BEFORE UPDATE ON preferences
+WHEN EXISTS (SELECT 1 FROM pet_home_schedules s WHERE s.last_sim_at>NEW.logical_time)
+BEGIN SELECT RAISE(ABORT, 'application logical time precedes home schedules'); END;
+CREATE TRIGGER preserve_preferences_with_home_clocks BEFORE DELETE ON preferences
+WHEN EXISTS (SELECT 1 FROM pet_home_schedules)
+BEGIN SELECT RAISE(ABORT, 'application logical clock cannot be deleted'); END;
+`;
+
 const MIGRATIONS = Object.freeze([
   { version: 1, sql: MIGRATION_001 },
   { version: 2, sql: MIGRATION_002 },
   { version: 3, sql: MIGRATION_003 },
+  { version: 4, sql: MIGRATION_004 },
 ]);
 
 /** FNV-1a is a migration-change detector, not a security signature. */
@@ -630,6 +682,44 @@ function petAcquisitionFromRow(value: unknown): PetAcquisitionRecord {
     coinCost: integer(row.coin_cost, 'pet acquisition cost'), commandId: row.command_id });
 }
 
+function validateHomeSchedule(value: unknown): HomeScheduleRecord {
+  const data = closed(value, 'home schedule', ['petId', 'lastSimAt', 'activityDueAt', 'energyRemainder', 'healthRemainder',
+    'moodRemainder', 'interactionDay', 'interactionCount', 'lastInteractionAt']);
+  const lastSimAt = integer(data.lastSimAt, 'home simulation time');
+  const day = (at: number) => Math.floor(at / MIGRATION_004_DAY_MS);
+  const schedule: HomeScheduleRecord = {
+    petId: id(data.petId), lastSimAt,
+    activityDueAt: nullableInteger(data.activityDueAt, 'home activity due time'),
+    energyRemainder: integer(data.energyRemainder, 'home energy remainder', 0, MIGRATION_004_HOUR_MS - 1),
+    healthRemainder: integer(data.healthRemainder, 'home health remainder', 0, MIGRATION_004_HOUR_MS - 1),
+    moodRemainder: integer(data.moodRemainder, 'home mood remainder', 0, MIGRATION_004_HOUR_MS - 1),
+    interactionDay: integer(data.interactionDay, 'home interaction UTC day', 0, day(lastSimAt)),
+    interactionCount: integer(data.interactionCount, 'home interaction count', 0, MIGRATION_004_DAILY_LIMIT),
+    lastInteractionAt: nullableInteger(data.lastInteractionAt, 'last home interaction time'),
+  };
+  if (schedule.activityDueAt !== null && schedule.activityDueAt < lastSimAt) throw new Error('Home activity due time precedes its clock');
+  if (schedule.lastInteractionAt !== null && schedule.lastInteractionAt > lastSimAt) throw new Error('Last home interaction exceeds its clock');
+  if (schedule.interactionCount > 0 && (schedule.lastInteractionAt === null || day(schedule.lastInteractionAt) !== schedule.interactionDay)) {
+    throw new Error('Rewarded home interactions require an interaction timestamp in their UTC day');
+  }
+  return schedule;
+}
+
+function homeScheduleFromRow(value: unknown): HomeScheduleRecord {
+  const row = object(value, 'home schedule row');
+  return validateHomeSchedule({ petId: row.pet_id, lastSimAt: integer(row.last_sim_at, 'home simulation time'),
+    activityDueAt: nullableInteger(row.activity_due_at, 'home activity due time'),
+    energyRemainder: integer(row.energy_remainder, 'home energy remainder'), healthRemainder: integer(row.health_remainder, 'home health remainder'),
+    moodRemainder: integer(row.mood_remainder, 'home mood remainder'), interactionDay: integer(row.interaction_day, 'home interaction UTC day'),
+    interactionCount: integer(row.interaction_count, 'home interaction count'), lastInteractionAt: nullableInteger(row.last_interaction_at, 'last home interaction time') });
+}
+
+function homeScheduleRegresses(previous: HomeScheduleRecord, next: HomeScheduleRecord): boolean {
+  return next.lastSimAt < previous.lastSimAt || next.interactionDay < previous.interactionDay
+    || (next.interactionDay === previous.interactionDay && next.interactionCount < previous.interactionCount)
+    || (previous.lastInteractionAt !== null && (next.lastInteractionAt === null || next.lastInteractionAt < previous.lastInteractionAt));
+}
+
 const PET_SELECT = `SELECT p.*, s.presence, s.activity, s.mood, s.health_status, s.visibility,
   s.mood_score10, s.health_points10, s.energy10, s.bond10, g.power, g.xp
   FROM pets p LEFT JOIN pet_states s USING(pet_id) LEFT JOIN pet_progression g USING(pet_id)`;
@@ -834,6 +924,29 @@ class SQLiteTransaction implements AppTransaction {
     db.prepare(`INSERT INTO pet_acquisitions (pet_id,acquired_at,origin,catalog_version,coin_cost,command_id)
       VALUES (?, ?, ?, ?, ?, ?)`).run(acquisition.petId, acquisition.acquiredAt, acquisition.origin,
         acquisition.catalogVersion, acquisition.coinCost, acquisition.commandId);
+  }
+
+  getHomeSchedule(petId: string): HomeScheduleRecord | null {
+    const value = this.db.prepare('SELECT * FROM pet_home_schedules WHERE pet_id=?').get(id(petId));
+    if (value === undefined || value === null) return null;
+    const schedule = homeScheduleFromRow(value);
+    const preferences = this.getPreferences();
+    if (preferences !== null && schedule.lastSimAt > preferences.logicalTime) throw new Error('Home schedule exceeds application logical time');
+    return schedule;
+  }
+
+  saveHomeSchedule(record: HomeScheduleRecord): void {
+    const db = this.db, schedule = validateHomeSchedule(record);
+    const previous = this.getHomeSchedule(schedule.petId), preferences = this.getPreferences();
+    if (previous !== null && homeScheduleRegresses(previous, schedule)) throw new Error('Home schedule clock cannot regress');
+    if (preferences !== null && schedule.lastSimAt > preferences.logicalTime) throw new Error('Home schedule exceeds application logical time');
+    db.prepare(`INSERT INTO pet_home_schedules (pet_id,last_sim_at,activity_due_at,energy_remainder,health_remainder,mood_remainder,
+      interaction_day,interaction_count,last_interaction_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(pet_id) DO UPDATE SET last_sim_at=excluded.last_sim_at,activity_due_at=excluded.activity_due_at,
+        energy_remainder=excluded.energy_remainder,health_remainder=excluded.health_remainder,mood_remainder=excluded.mood_remainder,
+        interaction_day=excluded.interaction_day,interaction_count=excluded.interaction_count,last_interaction_at=excluded.last_interaction_at`)
+      .run(schedule.petId, schedule.lastSimAt, schedule.activityDueAt, schedule.energyRemainder, schedule.healthRemainder,
+        schedule.moodRemainder, schedule.interactionDay, schedule.interactionCount, schedule.lastInteractionAt);
   }
 
   listTrips(): TripRecord[] {
@@ -1252,6 +1365,7 @@ function migrate(db: SqliteConnection, persistent: boolean, beforeMigration?: (f
         unlocks: rowCount(db, 'SELECT count(*) AS count FROM cg_unlocks'),
       } : null;
       const oldPetCount = migration.version === 3 ? rowCount(db, 'SELECT count(*) AS count FROM pets') : null;
+      const oldHomePetCount = migration.version === 4 ? rowCount(db, 'SELECT count(*) AS count FROM pets') : null;
       db.exec(migration.sql);
       if (oldCounts !== null && (oldCounts.trips !== rowCount(db, 'SELECT count(*) AS count FROM trips')
         || oldCounts.unlocks !== rowCount(db, 'SELECT count(*) AS count FROM cg_unlocks')
@@ -1262,6 +1376,10 @@ function migrate(db: SqliteConnection, persistent: boolean, beforeMigration?: (f
       if (oldPetCount !== null && (oldPetCount !== rowCount(db, 'SELECT count(*) AS count FROM pets')
         || rowCount(db, 'SELECT count(*) AS count FROM pet_acquisitions') !== 0)) {
         throw new Error('Pet acquisition migration changed legacy pets or invented acquisition history');
+      }
+      if (oldHomePetCount !== null && (oldHomePetCount !== rowCount(db, 'SELECT count(*) AS count FROM pets')
+        || rowCount(db, 'SELECT count(*) AS count FROM pet_home_schedules') !== 0)) {
+        throw new Error('Home schedule migration changed legacy pets or invented simulation clocks');
       }
       db.prepare('INSERT INTO schema_migrations (version, checksum, applied_at) VALUES (?, ?, ?)')
         .run(migration.version, migrationChecksum(migration.sql), Date.now());
